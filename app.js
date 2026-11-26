@@ -206,6 +206,8 @@
 
       // ================= TELEGRAM BOT ONLY ENGINE (v23) =================
       // Весь поиск и вся загрузка аудио идут СТРОГО через ваш Telegram-бот!
+      const DEFAULT_TG_BOT_URL = 'https://bot-1795701331-3932-awuro.bothost.tech';
+
       let tgBotBaseUrl = (() => {
         try {
           const sp = new URLSearchParams(location.search);
@@ -215,7 +217,11 @@
             return paramApi;
           }
         } catch (e) {}
-        return String(store.get('tgBotBaseUrl', '') || '').trim().replace(/\/+$/, '');
+        // If opened directly from the bot's own domain, use same-origin relative /api/tg/*
+        if (location.origin === DEFAULT_TG_BOT_URL) return '';
+        const saved = String(store.get('tgBotBaseUrl', '') || '').trim().replace(/\/+$/, '');
+        if (saved && /^https?:\/\//i.test(saved)) return saved;
+        return DEFAULT_TG_BOT_URL;
       })();
 
       let tgBotConnected = false;
@@ -330,7 +336,7 @@
             tgSearchCache.delete(tgSearchCache.keys().next().value);
           }
           if (!q) {
-            store.set('lastTgLibraryV24', { tracks: tracks.slice(0, 30), sources });
+            store.set('lastTgLibraryV27', { tracks: tracks.slice(0, 30), sources });
           }
         }
         return result;
@@ -524,7 +530,7 @@
 
         // Instant cached library preview on startup while live bot library loads
         if (!q) {
-          const cachedLib = store.get('lastTgLibraryV24', null);
+          const cachedLib = store.get('lastTgLibraryV27', null);
           if (cachedLib && Array.isArray(cachedLib.tracks) && cachedLib.tracks.length) {
             state.searchResults = cachedLib.tracks;
             renderSearchResultsList();
@@ -557,7 +563,7 @@
           const q = searchInput.value.trim();
           let msg = '';
           if (botOffline) {
-            msg = 'Telegram-бот ещё не подключён.<br/>Откройте плеер через кнопку <b>«Открыть плеер APATHY»</b> внутри вашего бота (или добавьте <code>?api=https://адрес-бота</code> к ссылке).';
+            msg = 'Сервер бота <code>bot-1795701331-3932-awuro.bothost.tech</code> сейчас не отвечает.<br/>Проверьте, что бот запущен в панели Bothost и домен включён (порт 8080).';
           } else if (q) {
             msg = `Бот не нашёл «${escapeHtml(q)}». Попробуйте другое название или перешлите трек прямо в Telegram-бота.`;
           } else {

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APATHY v26 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
+APATHY v27 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
 ===========================================================================================================
-Исправлено в v26 (обход блокировок YouTube на Docker/VPS-серверах):
+Исправлено в v27 (обход блокировок YouTube на Docker/VPS-серверах):
   1. Мульти-поиск строго по аудиоисточникам одновременно:
        • SoundCloud API v2 (полные треки, прогрессивный MP3 без блокировок дата-центров — идеально для ру-рэпа/андерграунда)
        • Прямые РФ MP3-порталы (Hitmo, Hitmotop, Muzofond, Mp3Party, LightAudio — мгновенный MP3, 0% CPU)
@@ -51,10 +51,11 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 DEFAULT_SITE_URL = "https://awuro.sergeyhownan.workers.dev"
+DEFAULT_BOT_API_URL = "https://bot-1795701331-3932-awuro.bothost.tech"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SITE_URL = (os.getenv("WEBAPP_URL", DEFAULT_SITE_URL) or DEFAULT_SITE_URL).strip().rstrip("/")
-BOT_API_URL_ENV = os.getenv("BOT_API_URL", "").strip().rstrip("/")
+BOT_API_URL_ENV = (os.getenv("BOT_API_URL", DEFAULT_BOT_API_URL) or DEFAULT_BOT_API_URL).strip().rstrip("/")
 STORAGE_CHAT_ID_ENV = os.getenv("STORAGE_CHAT_ID", "").strip()
 ADMIN_ID_ENV = os.getenv("ADMIN_ID", "").strip()
 AUTO_CACHE_TO_TG = os.getenv("AUTO_CACHE_TO_TG", "0").strip().lower() in ("1", "true", "yes")
@@ -206,7 +207,7 @@ def get_bot_api_url() -> str:
 
 def get_webapp_link() -> str:
     api_base = get_bot_api_url()
-    if api_base and api_base != SITE_URL:
+    if api_base and api_base != SITE_URL and api_base != DEFAULT_BOT_API_URL:
         return f"{SITE_URL}/?api={quote(api_base, safe=':/')}"
     return f"{SITE_URL}/"
 
@@ -1456,7 +1457,7 @@ def build_webapp_keyboard() -> InlineKeyboardMarkup:
 async def cmd_start(message: Message):
     total = DB.execute("SELECT COUNT(*) AS c FROM tracks WHERE tg_file_id != ''").fetchone()["c"]
     text = (
-        "<b>APATHY v26 · Музыкальный бот (только аудио)</b>\n\n"
+        "<b>APATHY v27 · Музыкальный бот (только аудио)</b>\n\n"
         f"🌐 Сайт плеера: {SITE_URL}/\n"
         f"💾 Сохранённых треков: <b>{total}</b>\n\n"
         "• <b>Напиши название трека</b> — ищу по SoundCloud, РФ MP3-порталам и YouTube, скачиваю строго чистое аудио.\n"
@@ -1497,7 +1498,7 @@ async def cmd_test_sources(message: Message):
     cookies_st = "✅ подключён" if (COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 20) else "не загружен"
     ff_st = "✅ активен (выход строго .mp3)" if HAS_FFMPEG else "⚠️ не установлен (нужен ffmpeg в Dockerfile)"
     await m.edit_text(
-        "<b>Диагностика источников сервера (v26):</b>\n\n"
+        "<b>Диагностика источников сервера (v27):</b>\n\n"
         + "\n".join(lines)
         + f"\n\n🎛 ffmpeg: {ff_st}\n🍪 cookies.txt: {cookies_st}",
         parse_mode="HTML",
@@ -1779,8 +1780,8 @@ async def api_ping(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "service": "apathy-tg-audio-v26",
-            "version": "v26",
+            "service": "apathy-tg-audio-v27",
+            "version": "v27",
             "bot": BOT_USERNAME_CACHE,
             "siteUrl": SITE_URL,
             "tracksCount": total,
@@ -2025,7 +2026,7 @@ async def main():
 
     me = await bot.get_me()
     BOT_USERNAME_CACHE = f"@{me.username}" if me.username else str(me.id)
-    log.info("APATHY v26 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s", BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG)
+    log.info("APATHY v27 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s", BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG)
 
     connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=300)
     http_session = aiohttp.ClientSession(connector=connector)
@@ -2035,6 +2036,7 @@ async def main():
     app["bot"] = bot
     app["http_session"] = http_session
 
+    app.router.add_get("/health", api_ping)
     app.router.add_get("/api/tg/ping", api_ping)
     app.router.add_get("/api/tg/library", api_library)
     app.router.add_get("/api/tg/search", api_search)
@@ -2049,9 +2051,26 @@ async def main():
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, HOST, PORT)
-    await site.start()
-    log.info("APATHY Audio API listening on http://%s:%d", HOST, PORT)
+
+    ports_to_bind = [PORT]
+    # Если хостинг не передал PORT явно — слушаем и 8080, и 8000, чтобы Traefik Bothost подключился в любом случае
+    if not os.getenv("PORT", "").strip():
+        for extra_p in (8000, 3000):
+            if extra_p not in ports_to_bind:
+                ports_to_bind.append(extra_p)
+
+    bound_ports = []
+    for p in ports_to_bind:
+        try:
+            site = web.TCPSite(runner, HOST, p)
+            await site.start()
+            bound_ports.append(p)
+        except OSError as e:
+            if p == PORT:
+                raise
+            log.warning("Optional port %d skipped: %s", p, e)
+
+    log.info("APATHY Audio API listening on %s ports=%s | Public: %s", HOST, bound_ports, get_bot_api_url())
 
     try:
         await bot.delete_webhook(drop_pending_updates=False)
