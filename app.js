@@ -123,35 +123,44 @@
         chrome: {
           label: 'Тёмный хром',
           color: '#06070a',
-          hi: '#f2f6ff',
-          mid: '#9aa7bc',
-          rim: '#d4dfef',
-          dark: '#141822',
-          deep: '#0a0c12',
-          mist: 'rgba(184, 202, 228, 0.14)',
-          glow: 'rgba(218, 232, 255, 0.34)'
+          hi: '#a4b0c2',
+          mid: '#566070',
+          rim: 'rgba(175, 188, 208, 0.22)',
+          dark: '#090b10',
+          midTree: '#0e1118',
+          backTree: '#151923',
+          deep: '#040508',
+          mist: 'rgba(130, 144, 164, 0.11)',
+          glow: 'rgba(154, 168, 188, 0.16)',
+          leaf: 'rgba(116, 102, 86, 0.36)'
         },
         purple: {
           label: 'Тёмно-фиолетовый',
           color: '#08050f',
-          hi: '#f2e8ff',
-          mid: '#9f82d8',
-          rim: '#d5beff',
-          dark: '#181028',
-          deep: '#0b0714',
-          mist: 'rgba(176, 132, 245, 0.15)',
-          glow: 'rgba(202, 166, 255, 0.34)'
+          hi: '#a896c8',
+          mid: '#5a4a78',
+          rim: 'rgba(168, 144, 212, 0.20)',
+          dark: '#0a0712',
+          midTree: '#110c1d',
+          backTree: '#19122a',
+          deep: '#05030a',
+          mist: 'rgba(132, 106, 178, 0.11)',
+          glow: 'rgba(148, 122, 198, 0.15)',
+          leaf: 'rgba(110, 86, 134, 0.34)'
         },
         red: {
           label: 'Красно-тёмный',
           color: '#0b0406',
-          hi: '#ffe8ec',
-          mid: '#c96878',
-          rim: '#f5b8c2',
-          dark: '#220e14',
-          deep: '#100609',
-          mist: 'rgba(235, 92, 114, 0.14)',
-          glow: 'rgba(255, 130, 148, 0.32)'
+          hi: '#b8848e',
+          mid: '#6e3f48',
+          rim: 'rgba(192, 124, 136, 0.20)',
+          dark: '#0d0507',
+          midTree: '#16090c',
+          backTree: '#200d12',
+          deep: '#060204',
+          mist: 'rgba(166, 86, 100, 0.10)',
+          glow: 'rgba(182, 98, 112, 0.14)',
+          leaf: 'rgba(128, 72, 68, 0.34)'
         }
       };
       let activeVizPalette = THEME_META.chrome;
@@ -2156,11 +2165,10 @@
         const ctx = canvas.getContext('2d', { alpha: true });
         let cw = 0, ch = 0, dpr = 1;
         let windTime = 0;
-        let windSpeedCur = 0.14;
-        let windAmpCur = 0.22;
+        let windSpeedCur = 0.12;
+        let windAmpCur = 0.18;
         let pulseCur = 0;
 
-        // Deterministic PRNG so the chrome forest silhouette stays elegant and stable across resizes
         function mulberry32(seed) {
           let a = seed >>> 0;
           return function() {
@@ -2171,101 +2179,237 @@
           };
         }
 
-        let forestLayers = [[], [], []];
+        // Pre-built bare gnarled branching trees (flat node arrays for 60fps zero-GC traversal)
+        let treesBack = [];
+        let treesMid = [];
+        let treesFore = [];
         let standingCrosses = [];
-        let floatingCrosses = [];
+        let driftingCrosses = [];
         let windMotes = [];
+        let hillPoints = [];
+
+        function createBranchingTree(rand, opts) {
+          const nodes = [];
+          const {
+            rootX, rootY, trunkLen, trunkWidth, maxDepth,
+            baseAngle, spread, layer, phase, swayScale, hasLeaves
+          } = opts;
+
+          // Recursive builder into flat array: parentIdx, relAngle, len, width, curve, flex, depth, leafClusters
+          function grow(parentIdx, relAngle, len, width, depth) {
+            const idx = nodes.length;
+            const curve = (rand() - 0.5) * 0.42;
+            const flex = depth === 0 ? 0.08 : (depth === 1 ? 0.24 : (depth === 2 ? 0.52 : (depth === 3 ? 0.85 : 1.15)));
+            const leaves = [];
+            if (hasLeaves && depth >= maxDepth - 1 && rand() < 0.65) {
+              const lc = 2 + Math.floor(rand() * 3);
+              for (let k = 0; k < lc; k++) {
+                leaves.push({
+                  t: 0.45 + rand() * 0.55,
+                  ox: (rand() - 0.5) * 10,
+                  oy: (rand() - 0.5) * 8,
+                  rx: 1.8 + rand() * 2.4,
+                  ry: 1.0 + rand() * 1.4,
+                  rot: rand() * Math.PI
+                });
+              }
+            }
+            nodes.push({
+              parentIdx,
+              relAngle,
+              len,
+              width,
+              curve,
+              flex,
+              depth,
+              phaseOff: rand() * 1.8,
+              leaves,
+              // Runtime scratchpad (no allocations per frame!)
+              x0: 0, y0: 0, x1: 0, y1: 0, cx: 0, cy: 0, absAng: 0
+            });
+
+            if (depth >= maxDepth) return;
+
+            // Main fork count (organic bare winter tree silhouette like reference photo)
+            const children = depth === 0
+              ? (2 + (rand() < 0.72 ? 1 : 0))
+              : (depth === 1 ? (2 + (rand() < 0.55 ? 1 : 0)) : 2);
+
+            for (let c = 0; c < children; c++) {
+              const tSlot = children === 1 ? 0 : (c / (children - 1) - 0.5);
+              // Spread outward naturally with crooked natural jitter
+              const fan = spread * (depth === 0 ? 1.15 : (depth === 1 ? 1.0 : 0.86));
+              const childRel = tSlot * fan + (rand() - 0.5) * 0.34;
+              const lenScale = depth === 0
+                ? (0.58 + rand() * 0.22)
+                : (0.64 + rand() * 0.22);
+              const childLen = len * lenScale;
+              const childW = Math.max(0.55, width * (0.58 + rand() * 0.14));
+              if (childLen < 0.012) continue;
+              grow(idx, childRel, childLen, childW, depth + 1);
+            }
+
+            // Extra subtle side twig emerging mid-limb on primary/secondary branches
+            if (depth <= 1 && rand() < 0.65 && nodes.length < 72) {
+              const sideSign = rand() < 0.5 ? -1 : 1;
+              grow(idx, sideSign * (0.48 + rand() * 0.38), len * (0.42 + rand() * 0.16), Math.max(0.55, width * 0.48), depth + 2);
+            }
+          }
+
+          grow(-1, baseAngle, trunkLen, trunkWidth, 0);
+          return { rootX, rootY, layer, phase, swayScale, nodes };
+        }
 
         function buildChromeForestScene() {
-          const rand = mulberry32(20261126);
-          forestLayers = [[], [], []];
+          const rand = mulberry32(20261134);
+          treesBack = [];
+          treesMid = [];
+          treesFore = [];
           standingCrosses = [];
-          floatingCrosses = [];
+          driftingCrosses = [];
           windMotes = [];
 
-          // 3 parallax depth layers of gothic chrome conifers / pines
-          const layerSpecs = [
-            { count: 22, minH: 0.26, maxH: 0.44, minW: 0.045, maxW: 0.082, tiersMin: 5, tiersMax: 7, swayScale: 0.55 }, // Back mist treeline
-            { count: 15, minH: 0.34, maxH: 0.56, minW: 0.062, maxW: 0.105, tiersMin: 6, tiersMax: 8, swayScale: 0.85 }, // Mid metallic chrome pines
-            { count: 10, minH: 0.42, maxH: 0.68, minW: 0.080, maxW: 0.135, tiersMin: 6, tiersMax: 9, swayScale: 1.15 }  // Foreground sculpted chrome trees
-          ];
+          // Subtle rolling dark hill silhouette along bottom 14%
+          hillPoints = [];
+          for (let i = 0; i <= 16; i++) {
+            const xn = i / 16;
+            const yn = 0.885 - 0.032 * Math.sin(xn * Math.PI * 2.1 + 0.4) - 0.018 * Math.cos(xn * Math.PI * 4.3);
+            hillPoints.push({ xn, yn });
+          }
 
-          layerSpecs.forEach((spec, layerIdx) => {
-            for (let i = 0; i < spec.count; i++) {
-              const frac = (i + 0.15 + rand() * 0.7) / spec.count;
-              // Foreground trees frame left & right edges more densely so center UI stays airy
-              let xNorm = frac;
-              if (layerIdx === 2) {
-                const side = i % 2 === 0 ? 0 : 1;
-                const localF = Math.floor(i / 2) / Math.max(1, Math.floor(spec.count / 2));
-                xNorm = side === 0 ? (0.02 + localF * 0.34 + rand() * 0.05) : (0.98 - localF * 0.34 - rand() * 0.05);
-              }
-              const hNorm = spec.minH + rand() * (spec.maxH - spec.minH);
-              const wNorm = spec.minW + rand() * (spec.maxW - spec.minW);
-              const tiers = spec.tiersMin + Math.floor(rand() * (spec.tiersMax - spec.tiersMin + 1));
-              forestLayers[layerIdx].push({
-                xNorm,
-                hNorm,
-                wNorm,
-                tiers,
-                lean: (rand() - 0.5) * 0.18,
-                phase: rand() * Math.PI * 2,
-                freq: 0.78 + rand() * 0.55,
-                swayScale: spec.swayScale * (0.82 + rand() * 0.36),
-                hasTopCross: rand() < (layerIdx === 1 ? 0.24 : 0.14),
-                rimAlpha: layerIdx === 0 ? 0.22 : (layerIdx === 1 ? 0.42 : 0.62)
-              });
-            }
+          // 1) Distant misty bare silhouettes (smaller, softer, deeper in fog)
+          const backXs = [0.06, 0.17, 0.29, 0.41, 0.54, 0.67, 0.79, 0.91];
+          backXs.forEach((bx) => {
+            const xNorm = bx + (rand() - 0.5) * 0.05;
+            treesBack.push(createBranchingTree(rand, {
+              rootX: xNorm,
+              rootY: 0.92 + rand() * 0.04,
+              trunkLen: 0.13 + rand() * 0.06,
+              trunkWidth: 2.2 + rand() * 1.4,
+              maxDepth: 3,
+              baseAngle: -Math.PI / 2 + (rand() - 0.5) * 0.16,
+              spread: 0.92 + rand() * 0.3,
+              layer: 0,
+              phase: rand() * Math.PI * 2,
+              swayScale: 0.52,
+              hasLeaves: false
+            }));
           });
 
-          // Standing APATHY gothic chrome crosses rising through the misty forest floor
-          const crossPositions = [0.11, 0.26, 0.42, 0.58, 0.74, 0.89];
-          crossPositions.forEach((xp, idx) => {
+          // 2) Main mid-ground gnarled leafless trees (center-right & left-mid, matching reference silhouettes)
+          const midSpecs = [
+            { x: 0.14, len: 0.20, w: 4.2, spread: 1.05, leaves: true },
+            { x: 0.34, len: 0.18, w: 3.6, spread: 1.12, leaves: false },
+            { x: 0.52, len: 0.22, w: 4.0, spread: 1.00, leaves: false },
+            { x: 0.69, len: 0.24, w: 4.3, spread: 0.98, leaves: false },
+            { x: 0.85, len: 0.20, w: 4.0, spread: 1.10, leaves: false },
+            { x: 0.96, len: 0.19, w: 3.8, spread: 1.02, leaves: false }
+          ];
+          midSpecs.forEach((sp) => {
+            treesMid.push(createBranchingTree(rand, {
+              rootX: sp.x + (rand() - 0.5) * 0.03,
+              rootY: 0.95 + rand() * 0.03,
+              trunkLen: sp.len + (rand() - 0.5) * 0.03,
+              trunkWidth: sp.w,
+              maxDepth: 4,
+              baseAngle: -Math.PI / 2 + (rand() - 0.5) * 0.14,
+              spread: sp.spread,
+              layer: 1,
+              phase: rand() * Math.PI * 2,
+              swayScale: 0.85,
+              hasLeaves: sp.leaves
+            }));
+          });
+
+          // 3) Foreground framing gnarled dark branches (left tree with dark sparse autumn leaves + upper-left & right overhanging limbs)
+          treesFore.push(createBranchingTree(rand, {
+            rootX: 0.03,
+            rootY: 1.01,
+            trunkLen: 0.28,
+            trunkWidth: 6.2,
+            maxDepth: 4,
+            baseAngle: -Math.PI / 2 + 0.12,
+            spread: 1.18,
+            layer: 2,
+            phase: rand() * Math.PI * 2,
+            swayScale: 1.05,
+            hasLeaves: true
+          }));
+          // Overhanging bare bough entering from top-left edge (just like the reference photo!)
+          treesFore.push(createBranchingTree(rand, {
+            rootX: -0.04,
+            rootY: 0.16,
+            trunkLen: 0.17,
+            trunkWidth: 4.6,
+            maxDepth: 3,
+            baseAngle: -0.06,
+            spread: 0.82,
+            layer: 2,
+            phase: rand() * Math.PI * 2,
+            swayScale: 1.1,
+            hasLeaves: false
+          }));
+          // Subtle right-edge dark bare branches
+          treesFore.push(createBranchingTree(rand, {
+            rootX: 1.02,
+            rootY: 0.96,
+            trunkLen: 0.24,
+            trunkWidth: 5.2,
+            maxDepth: 4,
+            baseAngle: -Math.PI / 2 - 0.18,
+            spread: 1.08,
+            layer: 2,
+            phase: rand() * Math.PI * 2,
+            swayScale: 1.0,
+            hasLeaves: false
+          }));
+
+          // Subtle darkened gothic chrome crosses standing quietly in the dark mist
+          [0.21, 0.44, 0.62, 0.78].forEach((xp, idx) => {
             standingCrosses.push({
-              xNorm: xp + (rand() - 0.5) * 0.04,
-              hNorm: 0.13 + rand() * 0.12,
+              xNorm: xp + (rand() - 0.5) * 0.03,
+              hNorm: 0.10 + rand() * 0.07,
               layer: idx % 2 === 0 ? 1 : 2,
               phase: rand() * Math.PI * 2,
-              tiltBase: (rand() - 0.5) * 0.06,
+              tiltBase: (rand() - 0.5) * 0.05,
               shimmerPhase: rand() * Math.PI * 2
             });
           });
 
-          // Ethereal drifting chrome crosses & diamond glints carried by the wind
-          for (let i = 0; i < 12; i++) {
-            floatingCrosses.push({
+          // Very subtle tiny dark-chrome drifting crosses in the fog
+          for (let i = 0; i < 6; i++) {
+            driftingCrosses.push({
               x: rand(),
-              y: 0.12 + rand() * 0.66,
-              size: 7 + rand() * 11,
-              speedX: 0.018 + rand() * 0.032,
-              speedY: -0.005 - rand() * 0.01,
+              y: 0.14 + rand() * 0.58,
+              size: 6 + rand() * 7,
+              speedX: 0.014 + rand() * 0.022,
+              speedY: -0.003 - rand() * 0.006,
               phase: rand() * Math.PI * 2,
-              rot: (rand() - 0.5) * 0.45,
-              rotSpeed: (rand() - 0.5) * 0.5,
-              alpha: 0.18 + rand() * 0.34
+              rot: (rand() - 0.5) * 0.4,
+              alpha: 0.10 + rand() * 0.16
             });
           }
 
-          // Fine chrome wind motes / mist needles
-          for (let i = 0; i < 36; i++) {
+          // Subtle dark mist / wind dust motes
+          for (let i = 0; i < 24; i++) {
             windMotes.push({
               x: rand(),
-              y: 0.18 + rand() * 0.8,
-              len: 5 + rand() * 16,
-              speed: 0.055 + rand() * 0.11,
+              y: 0.15 + rand() * 0.78,
+              len: 4 + rand() * 11,
+              speed: 0.04 + rand() * 0.08,
               phase: rand() * Math.PI * 2,
-              alpha: 0.09 + rand() * 0.22
+              alpha: 0.05 + rand() * 0.10
             });
           }
         }
 
-        function drawGothicChromeCross(cx, cy, hPx, tiltRad, alpha, pal, shimmer) {
-          const wPx = hPx * 0.66;
+        function drawDarkChromeCross(cx, cy, hPx, tiltRad, alpha, pal, shimmer) {
+          const wPx = hPx * 0.64;
           const armY = -hPx * 0.66;
           const topY = -hPx;
-          const neckW = Math.max(1.2, hPx * 0.055);
+          const neckW = Math.max(1.0, hPx * 0.05);
           const armHalf = wPx * 0.5;
-          const coreHalf = Math.max(2.2, hPx * 0.095);
+          const coreHalf = Math.max(1.8, hPx * 0.088);
 
           ctx.save();
           ctx.translate(cx, cy);
@@ -2273,13 +2417,11 @@
           ctx.globalAlpha = alpha;
 
           const grad = ctx.createLinearGradient(-armHalf, topY, armHalf, 0);
-          grad.addColorStop(0, pal.hi);
-          grad.addColorStop(0.28, pal.mid);
-          grad.addColorStop(0.52, pal.dark);
-          grad.addColorStop(0.78, pal.rim);
-          grad.addColorStop(1, pal.hi);
+          grad.addColorStop(0, pal.mid);
+          grad.addColorStop(0.35, pal.dark);
+          grad.addColorStop(0.7, pal.midTree);
+          grad.addColorStop(1, pal.deep);
 
-          // Pointed APATHY diamond-flare cross silhouette
           ctx.beginPath();
           ctx.moveTo(0, topY);
           ctx.lineTo(neckW, armY - neckW * 1.4);
@@ -2298,130 +2440,124 @@
           ctx.fillStyle = grad;
           ctx.fill();
 
-          // Sharp metallic chrome bevel highlight
+          // Very soft muted metallic rim (never bright or glaring)
           ctx.strokeStyle = pal.hi;
-          ctx.globalAlpha = alpha * (0.45 + shimmer * 0.45);
-          ctx.lineWidth = Math.max(0.8, dpr * 0.9);
+          ctx.globalAlpha = alpha * (0.22 + shimmer * 0.24);
+          ctx.lineWidth = Math.max(0.7, dpr * 0.75);
           ctx.stroke();
-
-          // Center diamond specular glint
-          ctx.fillStyle = '#ffffff';
-          ctx.globalAlpha = alpha * (0.55 + shimmer * 0.4);
-          const dSize = Math.max(1.4, hPx * 0.052);
-          ctx.beginPath();
-          ctx.moveTo(0, armY - dSize);
-          ctx.lineTo(dSize, armY);
-          ctx.lineTo(0, armY + dSize);
-          ctx.lineTo(-dSize, armY);
-          ctx.closePath();
-          ctx.fill();
 
           ctx.restore();
         }
 
-        function drawChromePineTree(tree, layerIdx, baseY, windT, windAmp, pal) {
-          const bx = tree.xNorm * cw;
-          const hPx = tree.hNorm * ch;
-          const wPx = tree.wNorm * cw;
+        function drawBranchingTree(tree, windT, windAmp, pal) {
+          const nodes = tree.nodes;
+          if (!nodes.length) return;
 
-          // Traveling wind gust wave sweeping across the forest (left -> right)
-          const gust = Math.sin(windT * 1.35 - tree.xNorm * 5.2 + tree.phase)
-            + 0.48 * Math.sin(windT * 2.55 - tree.xNorm * 8.4 + tree.phase * 1.4)
-            + 0.25 * Math.cos(windT * 0.62 + tree.phase);
+          const scaleH = ch;
+          const gustBase = Math.sin(windT * 1.25 - tree.rootX * 4.8 + tree.phase)
+            + 0.45 * Math.sin(windT * 2.35 - tree.rootX * 8.1 + tree.phase * 1.3)
+            + 0.25 * Math.cos(windT * 0.58 + tree.phase);
 
-          // Base stays rooted; canopy bends smoothly with wind
-          const topShift = (tree.lean * wPx * 0.45) + gust * (14 * dpr + hPx * 0.072) * windAmp * tree.swayScale;
-          const midShift = topShift * 0.36;
+          // 1) Forward-kinematics pass: root -> twigs with cumulative wind bend
+          for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            const twigFlutter = n.depth >= 2
+              ? Math.sin(windT * 2.6 + n.phaseOff + tree.phase) * 0.045 * windAmp * tree.swayScale
+              : 0;
+            const bendAngle = gustBase * 0.085 * n.flex * windAmp * tree.swayScale + twigFlutter;
 
-          const topX = bx + topShift;
-          const topY = baseY - hPx;
+            if (n.parentIdx < 0) {
+              n.x0 = tree.rootX * cw;
+              n.y0 = tree.rootY * ch;
+              n.absAng = n.relAngle + bendAngle;
+            } else {
+              const p = nodes[n.parentIdx];
+              n.x0 = p.x1;
+              n.y0 = p.y1;
+              n.absAng = p.absAng + n.relAngle + bendAngle;
+            }
 
-          // 1) Chrome curved trunk
-          const trunkW = Math.max(1.4 * dpr, wPx * (layerIdx === 2 ? 0.095 : 0.075));
-          ctx.beginPath();
-          ctx.moveTo(bx - trunkW * 0.55, baseY + 4 * dpr);
-          ctx.quadraticCurveTo(bx + midShift - trunkW * 0.22, baseY - hPx * 0.5, topX, topY);
-          ctx.quadraticCurveTo(bx + midShift + trunkW * 0.22, baseY - hPx * 0.5, bx + trunkW * 0.55, baseY + 4 * dpr);
-          ctx.closePath();
-          ctx.fillStyle = layerIdx === 0 ? pal.deep : pal.dark;
-          ctx.fill();
+            const segPx = n.len * scaleH;
+            n.x1 = n.x0 + Math.cos(n.absAng) * segPx;
+            n.y1 = n.y0 + Math.sin(n.absAng) * segPx;
 
-          // 2) Layered gothic chrome pine boughs (quadratic bend + windward silver rim)
-          const tiers = tree.tiers;
-          const canopyGrad = ctx.createLinearGradient(bx - wPx, topY, bx + wPx, baseY);
-          if (layerIdx === 0) {
-            canopyGrad.addColorStop(0, pal.mid);
-            canopyGrad.addColorStop(0.45, pal.dark);
-            canopyGrad.addColorStop(1, pal.deep);
-          } else if (layerIdx === 1) {
-            canopyGrad.addColorStop(0, pal.rim);
-            canopyGrad.addColorStop(0.28, pal.dark);
-            canopyGrad.addColorStop(0.68, pal.mid);
-            canopyGrad.addColorStop(1, pal.deep);
-          } else {
-            canopyGrad.addColorStop(0, pal.hi);
-            canopyGrad.addColorStop(0.22, pal.dark);
-            canopyGrad.addColorStop(0.55, pal.deep);
-            canopyGrad.addColorStop(0.85, pal.mid);
-            canopyGrad.addColorStop(1, '#040508');
+            // Organic crooked midpoint control point perpendicular to branch direction
+            const perpX = -Math.sin(n.absAng);
+            const perpY = Math.cos(n.absAng);
+            const crook = n.curve * segPx * 0.28;
+            n.cx = (n.x0 + n.x1) * 0.5 + perpX * crook;
+            n.cy = (n.y0 + n.y1) * 0.5 + perpY * crook;
           }
 
-          for (let t = 0; t < tiers; t++) {
-            const p = t / tiers; // 0 = top spire, ~1 = bottom bough
-            const pNext = Math.min(1, (t + 1.28) / tiers);
-            const yTip = topY + p * hPx * 0.84;
-            const yBot = topY + pNext * hPx * 0.88;
+          // 2) Draw dark silhouette limbs & intricate bare twigs
+          const strokeCol = tree.layer === 0 ? pal.backTree : (tree.layer === 1 ? pal.midTree : pal.dark);
+          const baseAlpha = tree.layer === 0 ? 0.56 : (tree.layer === 1 ? 0.84 : 0.94);
 
-            // Quadratic trunk spine offset at yTip and yBot
-            const kTip = Math.pow(1 - p * 0.84, 1.65);
-            const kBot = Math.pow(1 - pNext * 0.88, 1.65);
-            const cxTip = bx + topShift * kTip;
-            const cxBot = bx + topShift * kBot;
+          ctx.lineCap = 'round';
+          ctx.lineJoin = 'round';
 
-            // Extra flutter on outer branch tips during wind gusts
-            const tierGust = Math.sin(windT * 2.1 - tree.xNorm * 6.0 + t * 0.65 + tree.phase) * 3.8 * dpr * windAmp * tree.swayScale;
-            const halfSpread = wPx * (0.16 + p * 0.86);
-            const droop = (4 + p * 11) * dpr;
+          // Subtle muted chrome edge shimmer behind main trunks/boughs only (depth <= 1)
+          if (tree.layer >= 1) {
+            ctx.strokeStyle = pal.rim;
+            ctx.globalAlpha = tree.layer === 2 ? 0.42 : 0.28;
+            for (let i = 0; i < nodes.length; i++) {
+              const n = nodes[i];
+              if (n.depth > 1) continue;
+              ctx.lineWidth = Math.max(0.8, n.width * dpr * 0.95);
+              ctx.beginPath();
+              ctx.moveTo(n.x0 - 0.8 * dpr, n.y0);
+              ctx.quadraticCurveTo(n.cx - 0.8 * dpr, n.cy, n.x1 - 0.6 * dpr, n.y1);
+              ctx.stroke();
+            }
+          }
 
-            const leftX = cxBot - halfSpread + tierGust * 0.7;
-            const rightX = cxBot + halfSpread + tierGust * 1.15;
-
+          // Dark shadowed branches (all depths)
+          ctx.strokeStyle = strokeCol;
+          ctx.globalAlpha = baseAlpha;
+          for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            ctx.lineWidth = Math.max(0.55 * dpr, n.width * dpr);
             ctx.beginPath();
-            ctx.moveTo(cxTip, yTip);
-            ctx.quadraticCurveTo(cxTip - halfSpread * 0.45, (yTip + yBot) * 0.52, leftX, yBot + droop * 0.45);
-            ctx.lineTo(cxBot - halfSpread * 0.24, yBot - droop * 0.15);
-            ctx.lineTo(cxBot, yBot + droop * 0.22);
-            ctx.lineTo(cxBot + halfSpread * 0.24, yBot - droop * 0.15);
-            ctx.lineTo(rightX, yBot + droop * 0.45);
-            ctx.quadraticCurveTo(cxTip + halfSpread * 0.45, (yTip + yBot) * 0.52, cxTip, yTip);
-            ctx.closePath();
-
-            ctx.globalAlpha = layerIdx === 0 ? 0.52 : (layerIdx === 1 ? 0.78 : 0.92);
-            ctx.fillStyle = canopyGrad;
-            ctx.fill();
-
-            // Liquid-chrome highlight along top-left windward silhouette edge
-            ctx.beginPath();
-            ctx.moveTo(cxTip, yTip);
-            ctx.quadraticCurveTo(cxTip - halfSpread * 0.42, (yTip + yBot) * 0.5, leftX, yBot + droop * 0.42);
-            ctx.moveTo(cxTip, yTip);
-            ctx.quadraticCurveTo(cxTip + halfSpread * 0.42, (yTip + yBot) * 0.5, rightX, yBot + droop * 0.42);
-            ctx.strokeStyle = pal.hi;
-            ctx.globalAlpha = tree.rimAlpha * (0.55 + 0.45 * (1 - p));
-            ctx.lineWidth = (layerIdx === 2 ? 1.15 : 0.8) * dpr;
+            ctx.moveTo(n.x0, n.y0);
+            ctx.quadraticCurveTo(n.cx, n.cy, n.x1, n.y1);
             ctx.stroke();
           }
 
-          // Optional small gothic spire cross crowning select chrome trees
-          if (tree.hasTopCross) {
-            const spireTilt = (topShift / Math.max(hPx, 1)) * 0.85;
-            drawGothicChromeCross(topX, topY + 2 * dpr, 15 * dpr, spireTilt, layerIdx === 1 ? 0.48 : 0.62, pal, 0.5 + 0.5 * Math.sin(windT * 1.8 + tree.phase));
+          // Sparse dark shadowed autumn leaf specks on foreground left tree (matching image_35b842.jpg!)
+          ctx.fillStyle = pal.leaf;
+          for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            if (!n.leaves.length) continue;
+            for (let k = 0; k < n.leaves.length; k++) {
+              const lf = n.leaves[k];
+              const lx = n.x0 + (n.x1 - n.x0) * lf.t + lf.ox * dpr;
+              const ly = n.y0 + (n.y1 - n.y0) * lf.t + lf.oy * dpr;
+              ctx.globalAlpha = baseAlpha * 0.72;
+              ctx.beginPath();
+              ctx.ellipse(lx, ly, lf.rx * dpr, lf.ry * dpr, lf.rot + gustBase * 0.25 * windAmp, 0, Math.PI * 2);
+              ctx.fill();
+            }
           }
+        }
+
+        function drawHillSilhouette(pal) {
+          if (!hillPoints.length) return;
+          ctx.beginPath();
+          ctx.moveTo(0, ch);
+          for (let i = 0; i < hillPoints.length; i++) {
+            const pt = hillPoints[i];
+            ctx.lineTo(pt.xn * cw, pt.yn * ch);
+          }
+          ctx.lineTo(cw, ch);
+          ctx.closePath();
+          ctx.globalAlpha = 0.88;
+          ctx.fillStyle = pal.deep;
+          ctx.fill();
         }
 
         function resize() {
           const rect = playerOverlay.getBoundingClientRect();
-          dpr = Math.min(window.devicePixelRatio || 1, 1.75);
+          dpr = Math.min(window.devicePixelRatio || 1, 1.5);
           cw = canvas.width = Math.max(1, Math.round(rect.width * dpr));
           ch = canvas.height = Math.max(1, Math.round(rect.height * dpr));
           buildChromeForestScene();
@@ -2462,114 +2598,116 @@
           if (playerOverlay.classList.contains('open') && !document.hidden && cw > 1 && ch > 1) {
             const pal = activeVizPalette;
 
-            // Smooth wind transition: lively wind when playing, ultra-slow breathing drift when paused!
-            const targetSpeed = state.isPlaying ? 1.55 : 0.16;
-            const targetAmp = state.isPlaying ? 1.05 : 0.24;
-            const easeRate = Math.min(1, dt * 3.2);
+            // Smooth wind speed: natural swaying wind when playing, ultra-slow breathing drift when paused
+            const targetSpeed = state.isPlaying ? 1.38 : 0.14;
+            const targetAmp = state.isPlaying ? 1.0 : 0.18;
+            const easeRate = Math.min(1, dt * 3.0);
             windSpeedCur += (targetSpeed - windSpeedCur) * easeRate;
             windAmpCur += (targetAmp - windAmpCur) * easeRate;
             windTime += dt * windSpeedCur;
 
-            // Optional subtle beat pulse from analyser (synth) or gentle harmonic breathing (stream)
             let beatBoost = 0;
             if (state.isPlaying) {
               if (analyser && currentAudioMode === 'synth') {
                 const bins = new Uint8Array(analyser.frequencyBinCount);
                 analyser.getByteFrequencyData(bins);
-                beatBoost = ((bins[1] + bins[2] + bins[3]) / (3 * 255)) * 0.35;
+                beatBoost = ((bins[1] + bins[2] + bins[3]) / (3 * 255)) * 0.28;
               } else {
-                beatBoost = 0.14 * Math.abs(Math.sin(windTime * 1.9));
+                beatBoost = 0.11 * Math.abs(Math.sin(windTime * 1.7));
               }
             }
-            pulseCur += (beatBoost - pulseCur) * Math.min(1, dt * 6);
+            pulseCur += (beatBoost - pulseCur) * Math.min(1, dt * 5.5);
             const effAmp = windAmpCur + pulseCur;
 
             ctx.clearRect(0, 0, cw, ch);
 
-            // 1) Atmospheric chrome horizon glow behind the forest
-            const horizonGrad = ctx.createRadialGradient(cw * 0.5, ch * 0.84, cw * 0.04, cw * 0.5, ch * 0.78, cw * 0.72);
-            horizonGrad.addColorStop(0, pal.glow);
-            horizonGrad.addColorStop(0.42, pal.mist);
-            horizonGrad.addColorStop(1, 'rgba(0,0,0,0)');
-            ctx.fillStyle = horizonGrad;
+            // 1) Dim smoky overcast fog glow behind the bare trees (low-contrast, dark-toned)
+            const fogGlow = ctx.createRadialGradient(cw * 0.58, ch * 0.54, cw * 0.05, cw * 0.55, ch * 0.56, cw * 0.78);
+            fogGlow.addColorStop(0, pal.glow);
+            fogGlow.addColorStop(0.5, pal.mist);
+            fogGlow.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = fogGlow;
             ctx.fillRect(0, 0, cw, ch);
 
-            // 2) Floating chrome crosses carried slowly across the sky in the wind
-            for (let i = 0; i < floatingCrosses.length; i++) {
-              const fc = floatingCrosses[i];
-              fc.x += fc.speedX * dt * windSpeedCur;
-              fc.y += fc.speedY * dt * (0.4 + windSpeedCur * 0.5) + Math.sin(windTime + fc.phase) * 0.00025;
-              if (fc.x > 1.08) { fc.x = -0.08; fc.y = 0.14 + ((i * 0.17) % 0.64); }
-              if (fc.y < 0.06) fc.y = 0.74;
-              const tilt = fc.rot + Math.sin(windTime * 0.9 + fc.phase) * 0.18 * effAmp;
-              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 2.1 + fc.phase);
-              drawGothicChromeCross(fc.x * cw, fc.y * ch, fc.size * dpr, tilt, fc.alpha, pal, shimmer);
+            // 2) Subtle drifting dark-chrome crosses high in the mist
+            for (let i = 0; i < driftingCrosses.length; i++) {
+              const dc = driftingCrosses[i];
+              dc.x += dc.speedX * dt * windSpeedCur;
+              dc.y += dc.speedY * dt * (0.35 + windSpeedCur * 0.45) + Math.sin(windTime + dc.phase) * 0.0002;
+              if (dc.x > 1.06) { dc.x = -0.06; dc.y = 0.16 + ((i * 0.19) % 0.55); }
+              if (dc.y < 0.08) dc.y = 0.68;
+              const tilt = dc.rot + Math.sin(windTime * 0.8 + dc.phase) * 0.14 * effAmp;
+              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 1.9 + dc.phase);
+              drawDarkChromeCross(dc.x * cw, dc.y * ch, dc.size * dpr, tilt, dc.alpha, pal, shimmer);
             }
 
-            // 3) Back layer chrome forest + misty band
-            const baseY = ch + 6 * dpr;
-            for (let i = 0; i < forestLayers[0].length; i++) {
-              drawChromePineTree(forestLayers[0][i], 0, baseY, windTime, effAmp, pal);
+            // 3) Back distant bare trees in heavy mist
+            for (let i = 0; i < treesBack.length; i++) {
+              drawBranchingTree(treesBack[i], windTime, effAmp, pal);
             }
 
-            // Ground mist between back & mid forest
-            const mistBand1 = ctx.createLinearGradient(0, ch * 0.64, 0, ch);
-            mistBand1.addColorStop(0, 'rgba(0,0,0,0)');
-            mistBand1.addColorStop(0.55, pal.mist);
-            mistBand1.addColorStop(1, 'rgba(4,5,8,0.82)');
-            ctx.globalAlpha = 0.9;
-            ctx.fillStyle = mistBand1;
-            ctx.fillRect(0, ch * 0.62, cw, ch * 0.38);
+            // Soft fog veil separating back & mid treeline
+            const midFog = ctx.createLinearGradient(0, ch * 0.52, 0, ch);
+            midFog.addColorStop(0, 'rgba(0,0,0,0)');
+            midFog.addColorStop(0.58, pal.mist);
+            midFog.addColorStop(1, 'rgba(3,4,6,0.72)');
+            ctx.globalAlpha = 0.85;
+            ctx.fillStyle = midFog;
+            ctx.fillRect(0, ch * 0.50, cw, ch * 0.50);
 
-            // 4) Mid layer chrome forest + mid standing chrome crosses
-            for (let i = 0; i < forestLayers[1].length; i++) {
-              drawChromePineTree(forestLayers[1][i], 1, baseY, windTime, effAmp, pal);
+            // 4) Mid-ground bare branching trees + mid standing dark-chrome crosses
+            for (let i = 0; i < treesMid.length; i++) {
+              drawBranchingTree(treesMid[i], windTime, effAmp, pal);
             }
             for (let i = 0; i < standingCrosses.length; i++) {
               const sc = standingCrosses[i];
               if (sc.layer !== 1) continue;
-              const swayTilt = sc.tiltBase + Math.sin(windTime * 1.15 - sc.xNorm * 4 + sc.phase) * 0.055 * effAmp;
-              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 2.2 + sc.shimmerPhase);
-              drawGothicChromeCross(sc.xNorm * cw, ch * 0.99, sc.hNorm * ch, swayTilt, 0.58, pal, shimmer);
+              const swayTilt = sc.tiltBase + Math.sin(windTime * 1.05 - sc.xNorm * 4 + sc.phase) * 0.04 * effAmp;
+              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 1.8 + sc.shimmerPhase);
+              drawDarkChromeCross(sc.xNorm * cw, ch * 0.94, sc.hNorm * ch, swayTilt, 0.42, pal, shimmer);
             }
 
-            // 5) Diagonal chrome wind needles / mist streaks
+            // 5) Whisper-thin mist wind streaks
             ctx.strokeStyle = pal.hi;
-            ctx.lineWidth = Math.max(0.8, 0.95 * dpr);
+            ctx.lineWidth = Math.max(0.7, 0.8 * dpr);
             for (let i = 0; i < windMotes.length; i++) {
               const m = windMotes[i];
               m.x += m.speed * dt * windSpeedCur;
-              m.y += Math.sin(windTime * 1.4 + m.phase) * 0.00045;
-              if (m.x > 1.06) m.x = -0.06;
+              m.y += Math.sin(windTime * 1.2 + m.phase) * 0.00035;
+              if (m.x > 1.05) m.x = -0.05;
               const mx = m.x * cw;
               const my = m.y * ch;
-              const streakLen = m.len * dpr * (0.45 + effAmp * 0.9);
-              ctx.globalAlpha = m.alpha * (state.isPlaying ? 0.95 : 0.45);
+              const sLen = m.len * dpr * (0.4 + effAmp * 0.85);
+              ctx.globalAlpha = m.alpha * (state.isPlaying ? 0.85 : 0.35);
               ctx.beginPath();
               ctx.moveTo(mx, my);
-              ctx.lineTo(mx + streakLen, my - streakLen * 0.14);
+              ctx.lineTo(mx + sLen, my - sLen * 0.12);
               ctx.stroke();
             }
 
-            // 6) Foreground sculpted chrome forest + foreground gothic chrome crosses
-            for (let i = 0; i < forestLayers[2].length; i++) {
-              drawChromePineTree(forestLayers[2][i], 2, baseY, windTime, effAmp, pal);
+            // 6) Foreground dark hillside, gnarled framing branches & dark-chrome crosses
+            drawHillSilhouette(pal);
+            for (let i = 0; i < treesFore.length; i++) {
+              drawBranchingTree(treesFore[i], windTime, effAmp, pal);
             }
             for (let i = 0; i < standingCrosses.length; i++) {
               const sc = standingCrosses[i];
               if (sc.layer !== 2) continue;
-              const swayTilt = sc.tiltBase + Math.sin(windTime * 1.3 - sc.xNorm * 5 + sc.phase) * 0.075 * effAmp;
-              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 2.6 + sc.shimmerPhase);
-              drawGothicChromeCross(sc.xNorm * cw, ch * 1.01, sc.hNorm * ch * 1.15, swayTilt, 0.78, pal, shimmer);
+              const swayTilt = sc.tiltBase + Math.sin(windTime * 1.15 - sc.xNorm * 4.5 + sc.phase) * 0.05 * effAmp;
+              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 2.0 + sc.shimmerPhase);
+              drawDarkChromeCross(sc.xNorm * cw, ch * 0.97, sc.hNorm * ch * 1.1, swayTilt, 0.52, pal, shimmer);
             }
 
-            // Subtle dark floor vignette so scrubber & controls remain super crisp
-            const floorGrad = ctx.createLinearGradient(0, ch * 0.82, 0, ch);
-            floorGrad.addColorStop(0, 'rgba(0,0,0,0)');
-            floorGrad.addColorStop(1, 'rgba(3,4,7,0.78)');
+            // 7) Dark atmospheric vignette veil so the forest stays shadowed and never distracts from lyrics/controls
+            const veil = ctx.createLinearGradient(0, 0, 0, ch);
+            veil.addColorStop(0, 'rgba(3, 4, 7, 0.52)');
+            veil.addColorStop(0.45, 'rgba(3, 4, 7, 0.28)');
+            veil.addColorStop(0.84, 'rgba(3, 4, 7, 0.48)');
+            veil.addColorStop(1, 'rgba(2, 3, 5, 0.84)');
             ctx.globalAlpha = 1;
-            ctx.fillStyle = floorGrad;
-            ctx.fillRect(0, ch * 0.82, cw, ch * 0.18);
+            ctx.fillStyle = veil;
+            ctx.fillRect(0, 0, cw, ch);
           }
 
           requestAnimationFrame(tick);
