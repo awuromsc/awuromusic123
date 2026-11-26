@@ -844,7 +844,7 @@
       }
 
       function unlockFromSplash() {
-        playUnlockChime();
+        try { playUnlockChime(); } catch (e) {}
         triggerChromeFlash();
         splashScreen.classList.add('hidden');
         mainApp.classList.add('visible');
@@ -894,6 +894,11 @@
         cross.addEventListener('touchstart', onStart, { passive: true });
         window.addEventListener('touchmove', onMove, { passive: false });
         window.addEventListener('touchend', onEnd);
+        const pill = splashScreen.querySelector('.swipe-pill');
+        if (pill) {
+          pill.style.cursor = 'pointer';
+          pill.addEventListener('click', () => { unlockAudioForIos(); unlockFromSplash(); });
+        }
       }
 
       // ================= NAVIGATION =================

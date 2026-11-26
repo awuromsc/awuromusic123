@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APATHY v25 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
+APATHY v26 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
 ===========================================================================================================
-Исправлено в v25 (обход блокировок YouTube на Docker/VPS-серверах):
+Исправлено в v26 (обход блокировок YouTube на Docker/VPS-серверах):
   1. Мульти-поиск строго по аудиоисточникам одновременно:
        • SoundCloud API v2 (полные треки, прогрессивный MP3 без блокировок дата-центров — идеально для ру-рэпа/андерграунда)
        • Прямые РФ MP3-порталы (Hitmo, Hitmotop, Muzofond, Mp3Party, LightAudio — мгновенный MP3, 0% CPU)
@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -64,6 +65,12 @@ COOKIES_PATH = BASE_DIR / os.getenv("COOKIES_FILE", "cookies.txt")
 WEB_DIR = BASE_DIR / "web"
 
 ADMIN_ID: Optional[int] = int(ADMIN_ID_ENV) if ADMIN_ID_ENV.lstrip("-").isdigit() else None
+FFMPEG_BIN: Optional[str] = shutil.which("ffmpeg")
+HAS_FFMPEG: bool = bool(FFMPEG_BIN)
+MP3_CACHE_DIR = Path(tempfile.gettempdir()) / "apathy_mp3_cache"
+MP3_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MP3_CACHE_MAX_FILES = 18
+MP3_CONVERT_LOCKS: Dict[str, asyncio.Lock] = {}
 
 # Ограничители нагрузки для лёгких контейнеров
 YTDLP_SEMAPHORE = asyncio.Semaphore(2)
@@ -1105,6 +1112,107 @@ async def resolve_audio_stream_url(session: aiohttp.ClientSession, track: Dict[s
     return res
 
 
+def is_valid_mp3_file(file_path: str) -> bool:
+    """Проверяет по магическим байтам, что файл является настоящим MP3 (ID3 или MPEG sync frame)."""
+    try:
+        if not os.path.exists(file_path) or os.path.getsize(file_path) < 12_000:
+            return False
+        with open(file_path, "rb") as f:
+            head = f.read(64)
+        if head.startswith(b"ID3"):
+            return True
+        # Ищем MPEG audio frame sync (0xFF 0xE0..0xFF) в начале файла, исключая MP4/ftyp/WebM
+        if b"ftyp" in head[:24] or head.startswith(b"\x1a\x45\xdf\xa3") or head.startswith(b"OggS"):
+            return False
+        for i in range(min(len(head) - 1, 16)):
+            if head[i] == 0xFF and (head[i + 1] & 0xE0) == 0xE0:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+async def convert_audio_to_mp3(src_path: str, dst_path: str) -> bool:
+    """Конвертирует любой m4a/DASH/webm/opus в 100% совместимый стандартный MP3 (160k, 44.1kHz, 1 поток CPU)."""
+    if not FFMPEG_BIN or not os.path.exists(src_path):
+        return False
+    cmd = [
+        FFMPEG_BIN,
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", src_path,
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", "160k",
+        "-ar", "44100",
+        "-ac", "2",
+        "-threads", "1",
+        "-f", "mp3",
+        dst_path,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=55)
+        if proc.returncode == 0 and os.path.exists(dst_path) and os.path.getsize(dst_path) > 12_000:
+            return True
+        err_txt = (stderr_bytes or b"").decode("utf-8", errors="ignore").strip()[:160]
+        log.warning("ffmpeg mp3 convert failed (rc=%s): %s", proc.returncode, err_txt)
+    except Exception as e:
+        log.warning("ffmpeg exception: %s", e)
+    try:
+        if os.path.exists(dst_path):
+            os.remove(dst_path)
+    except OSError:
+        pass
+    return False
+
+
+def prune_mp3_cache() -> None:
+    try:
+        files = sorted(
+            [p for p in MP3_CACHE_DIR.glob("*.mp3") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old_f in files[MP3_CACHE_MAX_FILES:]:
+            try:
+                old_f.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+async def _ensure_mp3_output(raw_path: str, out_dir: str, track_id: str, duration: int) -> Optional[Dict[str, Any]]:
+    """Гарантирует на выходе стандартный рабочий .mp3 (если файл уже MP3 — не тратит CPU, иначе конвертирует через ffmpeg)."""
+    if is_valid_mp3_file(raw_path):
+        mp3_path = os.path.join(out_dir, f"{track_id}.mp3")
+        if os.path.abspath(raw_path) != os.path.abspath(mp3_path):
+            shutil.move(raw_path, mp3_path)
+        return {"path": mp3_path, "ext": "mp3", "mime": "audio/mpeg", "duration": duration}
+
+    if HAS_FFMPEG:
+        mp3_path = os.path.join(out_dir, f"{track_id}_conv.mp3")
+        ok = await convert_audio_to_mp3(raw_path, mp3_path)
+        try:
+            if os.path.exists(raw_path):
+                os.remove(raw_path)
+        except OSError:
+            pass
+        if ok and os.path.getsize(mp3_path) <= MAX_AUDIO_BYTES:
+            return {"path": mp3_path, "ext": "mp3", "mime": "audio/mpeg", "duration": duration}
+        return None
+
+    # Без ffmpeg не отдаём сломанный DASH m4a как рабочий трек
+    log.warning("File %s is not MP3 and ffmpeg is not installed", raw_path)
+    return None
+
+
 async def _download_http_audio(session: aiohttp.ClientSession, url: str, out_path: str) -> Optional[Tuple[str, str]]:
     """Скачивает аудиопоток по HTTP и проверяет, что сервер отдал реальное аудио, а не HTML-заглушку."""
     try:
@@ -1172,17 +1280,20 @@ async def _download_http_audio(session: aiohttp.ClientSession, url: str, out_pat
 async def download_audio_only_to_file(
     session: aiohttp.ClientSession, track: Dict[str, Any], out_dir: str
 ) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Возвращает (file_info_dict | None, error_reason)."""
-    # 1) Пробуем скачать по найденному прямому аудио-URL
+    """Скачивает трек и ГАРАНТИРУЕТ стандартный .mp3 на выходе (работает в Telegram и Safari 100%)."""
+    # 1) Пробуем прямой аудиопоток (для SoundCloud / РФ MP3 это уже готовый MP3, для YouTube — m4a -> ffmpeg -> mp3)
     res = await resolve_audio_stream_url(session, track)
     if res:
         direct_url, mime, dur = res
-        ext = "mp3" if "mpeg" in mime else ("m4a" if "mp4" in mime else "webm")
-        out_path = os.path.join(out_dir, f"{track['id']}.{ext}")
-        dl = await _download_http_audio(session, direct_url, out_path)
+        raw_ext = "mp3" if "mpeg" in mime else ("m4a" if "mp4" in mime else "webm")
+        raw_path = os.path.join(out_dir, f"raw_{track['id']}.{raw_ext}")
+        dl = await _download_http_audio(session, direct_url, raw_path)
         if dl:
-            return ({"path": dl[0], "ext": ext, "mime": dl[1], "duration": dur or track.get("duration") or 180}, "")
-        # Прямая ссылка (например с YouTube или конкретного MP3) не скачалась -> пробуем автоспасение с другой площадки!
+            ensured = await _ensure_mp3_output(dl[0], out_dir, track["id"], dur or track.get("duration") or 180)
+            if ensured:
+                return ensured, ""
+
+        # Если прямой файл не прошёл (например, сломанный DASH или без ffmpeg) -> ищем готовый MP3 на других площадках!
         DIRECT_STREAM_CACHE._data.pop(track["id"], None)
         rescue = await cross_platform_rescue_audio(session, track)
         if rescue and rescue[0] != direct_url:
@@ -1191,9 +1302,11 @@ async def download_audio_only_to_file(
             r_path = os.path.join(out_dir, f"rescue_{track['id']}.{r_ext}")
             dl2 = await _download_http_audio(session, r_url, r_path)
             if dl2:
-                return ({"path": dl2[0], "ext": r_ext, "mime": dl2[1], "duration": r_dur or track.get("duration") or 180}, "")
+                ensured2 = await _ensure_mp3_output(dl2[0], out_dir, track["id"], r_dur or track.get("duration") or 180)
+                if ensured2:
+                    return ensured2, ""
 
-    # 2) Резервный yt-dlp (для SoundCloud HLS или с cookies.txt)
+    # 2) Резервный yt-dlp (поддерживает SoundCloud HLS + YouTube + автоконвертацию в MP3 через ffmpeg!)
     src_url = track.get("source_url") or ""
     if src_url and not src_url.lower().endswith(".mp3"):
         def _dl_sync() -> Tuple[Optional[Dict[str, Any]], str]:
@@ -1204,12 +1317,21 @@ async def download_audio_only_to_file(
                 "noplaylist": True,
                 "writethumbnail": False,
                 "writesubtitles": False,
-                "format": "bestaudio[vcodec=none][ext=m4a][filesize<19M]/bestaudio[vcodec=none][ext=mp3][filesize<19M]/bestaudio[vcodec=none][ext=m4a]/bestaudio[vcodec=none]",
+                "format": "bestaudio[vcodec=none][ext=mp3][filesize<19M]/bestaudio[vcodec=none][ext=m4a][filesize<19M]/bestaudio[vcodec=none]/bestaudio",
                 "outtmpl": out_tmpl,
                 "max_filesize": MAX_AUDIO_BYTES,
                 "socket_timeout": 12,
                 "extractor_args": {"youtube": {"player_client": ["android_vr", "ios", "tv_embedded"]}},
             }
+            if HAS_FFMPEG:
+                opts["postprocessors"] = [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "160",
+                    }
+                ]
+                opts["postprocessor_args"] = {"ffmpeg": ["-threads", "1", "-ar", "44100", "-ac", "2"]}
             if COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 20:
                 opts["cookiefile"] = str(COOKIES_PATH)
             try:
@@ -1217,18 +1339,21 @@ async def download_audio_only_to_file(
                     info = ydl.extract_info(src_url, download=True)
                     if not info:
                         return None, "empty_info"
-                    fp = ydl.prepare_filename(info)
-                    if not os.path.exists(fp):
+                    mp3_cand = None
+                    for fn in os.listdir(out_dir):
+                        cand = os.path.join(out_dir, fn)
+                        if os.path.isfile(cand) and cand.lower().endswith(".mp3") and os.path.getsize(cand) > 12_000:
+                            mp3_cand = cand
+                            break
+                    if not mp3_cand:
                         for fn in os.listdir(out_dir):
                             cand = os.path.join(out_dir, fn)
                             if os.path.isfile(cand) and os.path.getsize(cand) > 12_000:
-                                fp = cand
+                                mp3_cand = cand
                                 break
-                    if not os.path.exists(fp):
+                    if not mp3_cand:
                         return None, "file_missing"
-                    ext = Path(fp).suffix.lstrip(".").lower() or "m4a"
-                    mime = "audio/mpeg" if ext == "mp3" else ("audio/mp4" if ext in ("m4a", "mp4") else "audio/webm")
-                    return {"path": fp, "ext": ext, "mime": mime, "duration": int(info.get("duration") or 0)}, ""
+                    return {"path": mp3_cand, "duration": int(info.get("duration") or 0)}, ""
             except Exception as e:
                 err = str(e)
                 if "confirm you’re not a bot" in err or "not a bot" in err or "Sign in" in err:
@@ -1238,10 +1363,13 @@ async def download_audio_only_to_file(
         async with YTDLP_SEMAPHORE:
             dl_res, err_msg = await asyncio.to_thread(_dl_sync)
             if dl_res:
-                return dl_res, ""
+                ensured3 = await _ensure_mp3_output(dl_res["path"], out_dir, track["id"], dl_res["duration"] or track.get("duration") or 180)
+                if ensured3:
+                    return ensured3, ""
+                return None, "ffmpeg_required"
             return None, err_msg
 
-    return None, "no_audio_found"
+    return None, ("ffmpeg_required" if not HAS_FFMPEG else "no_audio_found")
 
 
 async def upload_audio_to_telegram(
@@ -1328,7 +1456,7 @@ def build_webapp_keyboard() -> InlineKeyboardMarkup:
 async def cmd_start(message: Message):
     total = DB.execute("SELECT COUNT(*) AS c FROM tracks WHERE tg_file_id != ''").fetchone()["c"]
     text = (
-        "<b>APATHY v25 · Музыкальный бот (только аудио)</b>\n\n"
+        "<b>APATHY v26 · Музыкальный бот (только аудио)</b>\n\n"
         f"🌐 Сайт плеера: {SITE_URL}/\n"
         f"💾 Сохранённых треков: <b>{total}</b>\n\n"
         "• <b>Напиши название трека</b> — ищу по SoundCloud, РФ MP3-порталам и YouTube, скачиваю строго чистое аудио.\n"
@@ -1367,10 +1495,11 @@ async def cmd_test_sources(message: Message):
         chk("Piped/Invidious Аудио", piped_invidious_extract_audio(HTTP_SESSION_REF, "dQw4w9WgXcQ")),
     )
     cookies_st = "✅ подключён" if (COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 20) else "не загружен"
+    ff_st = "✅ активен (выход строго .mp3)" if HAS_FFMPEG else "⚠️ не установлен (нужен ffmpeg в Dockerfile)"
     await m.edit_text(
-        "<b>Диагностика источников сервера (v25):</b>\n\n"
+        "<b>Диагностика источников сервера (v26):</b>\n\n"
         + "\n".join(lines)
-        + f"\n\n🍪 cookies.txt: {cookies_st}",
+        + f"\n\n🎛 ffmpeg: {ff_st}\n🍪 cookies.txt: {cookies_st}",
         parse_mode="HTML",
     )
 
@@ -1650,8 +1779,8 @@ async def api_ping(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "service": "apathy-tg-audio-v25",
-            "version": "v25",
+            "service": "apathy-tg-audio-v26",
+            "version": "v26",
             "bot": BOT_USERNAME_CACHE,
             "siteUrl": SITE_URL,
             "tracksCount": total,
@@ -1793,7 +1922,7 @@ async def api_stream(request: web.Request) -> web.StreamResponse:
                 "source_id": vid,
                 "source_url": f"https://www.youtube.com/watch?v={vid}",
                 "tg_file_id": "",
-                "mime_type": "audio/mp4",
+                "mime_type": "audio/mpeg",
             }
         else:
             return web.Response(status=404, text="Track not found")
@@ -1802,22 +1931,57 @@ async def api_stream(request: web.Request) -> web.StreamResponse:
     session: aiohttp.ClientSession = request.app["http_session"]
     default_mime = rec.get("mime_type") or "audio/mpeg"
 
+    # 1) Трек уже сохранён в Telegram (как MP3) -> стримим напрямую с Telegram CDN!
     if rec.get("tg_file_id"):
         tg_url = await get_tg_file_url(bot, rec["tg_file_id"])
         if tg_url:
             return await proxy_audio_stream(request, tg_url, default_mime=default_mime)
 
+    # 2) Проверяем локальный кэш готовых MP3 (мгновенный старт и перемотка Range 206 на iPhone!)
+    safe_tid = re.sub(r"[^A-Za-z0-9_-]", "_", track_id)[:60]
+    cached_mp3 = MP3_CACHE_DIR / f"{safe_tid}.mp3"
+    if cached_mp3.exists() and cached_mp3.stat().st_size > 12_000:
+        return web.FileResponse(
+            cached_mp3,
+            headers={"Content-Type": "audio/mpeg", "Cache-Control": "public, max-age=3600"},
+        )
+
+    # 3) Если источник отдаёт чистый прямой MP3 (Hitmo / Muzofond / Mp3Party / LightAudio / SoundCloud progressive MP3) -> стримим напрямую!
     res = await resolve_audio_stream_url(session, rec)
-    if not res:
-        return web.Response(status=502, text="Audio stream unavailable")
-    direct_url, mime, _ = res
+    if res:
+        direct_url, mime, _ = res
+        is_direct_mp3 = ("mpeg" in mime) or direct_url.lower().split("?")[0].endswith(".mp3")
+        if is_direct_mp3:
+            if AUTO_CACHE_TO_TG:
+                st_id = get_storage_chat_id()
+                if st_id and not rec.get("tg_file_id") and track_id not in BG_CACHE_INFLIGHT:
+                    asyncio.create_task(upload_audio_to_telegram(bot, session, rec, st_id))
+            return await proxy_audio_stream(request, direct_url, default_mime="audio/mpeg")
 
-    if AUTO_CACHE_TO_TG:
-        st_id = get_storage_chat_id()
-        if st_id and not rec.get("tg_file_id") and track_id not in BG_CACHE_INFLIGHT:
-            asyncio.create_task(upload_audio_to_telegram(bot, session, rec, st_id))
+    # 4) YouTube DASH m4a / SoundCloud HLS -> конвертируем в чистый .mp3 (1-2 сек) и отдаём как стандартный MP3 с Range 206!
+    if HAS_FFMPEG:
+        lock = MP3_CONVERT_LOCKS.setdefault(safe_tid, asyncio.Lock())
+        async with lock:
+            if not (cached_mp3.exists() and cached_mp3.stat().st_size > 12_000):
+                with tempfile.TemporaryDirectory(prefix="apathy_s_") as tmpdir:
+                    dl, _ = await download_audio_only_to_file(session, rec, tmpdir)
+                    if dl and os.path.exists(dl["path"]):
+                        shutil.move(dl["path"], str(cached_mp3))
+                        prune_mp3_cache()
+        if cached_mp3.exists() and cached_mp3.stat().st_size > 12_000:
+            if AUTO_CACHE_TO_TG:
+                st_id = get_storage_chat_id()
+                if st_id and not rec.get("tg_file_id") and track_id not in BG_CACHE_INFLIGHT:
+                    asyncio.create_task(upload_audio_to_telegram(bot, session, rec, st_id))
+            return web.FileResponse(
+                cached_mp3,
+                headers={"Content-Type": "audio/mpeg", "Cache-Control": "public, max-age=3600"},
+            )
 
-    return await proxy_audio_stream(request, direct_url, default_mime=mime)
+    # 5) Крайний резерв без ffmpeg
+    if res:
+        return await proxy_audio_stream(request, res[0], default_mime=res[1])
+    return web.Response(status=502, text="Audio stream unavailable")
 
 
 async def api_thumb(request: web.Request) -> web.StreamResponse:
@@ -1861,7 +2025,7 @@ async def main():
 
     me = await bot.get_me()
     BOT_USERNAME_CACHE = f"@{me.username}" if me.username else str(me.id)
-    log.info("APATHY v25 Audio-Only Bot started: %s | Site: %s", BOT_USERNAME_CACHE, SITE_URL)
+    log.info("APATHY v26 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s", BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG)
 
     connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=300)
     http_session = aiohttp.ClientSession(connector=connector)
