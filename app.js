@@ -1478,6 +1478,15 @@
       }
       document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
       topProfileBtn.addEventListener('click', () => switchTab('viewProfile'));
+      const topBrandBtn = $('topBrandBtn');
+      if (topBrandBtn) {
+        topBrandBtn.addEventListener('click', () => {
+          closePlayerOverlay();
+          closePlaylistModal();
+          switchTab('viewSearch');
+          if (viewSearch) viewSearch.scrollTo({ top: 0, behavior: 'smooth' });
+        });
+      }
 
       // ================= HELPERS =================
       function fmtTime(sec) {
@@ -1511,6 +1520,7 @@
           : `<span>${trackInitials(track.title)}</span>`;
 
         const showRemoveFromPl = (context === 'playlist' && state.selectedPlaylistId);
+        const showDeleteFromLib = (context === 'library');
 
         div.innerHTML = `
           <div class="track-art" style="background:${track.coverGrad || '#181b22'};">
@@ -1550,6 +1560,16 @@
                 <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
               </svg>
             </button>
+            ${showDeleteFromLib
+              ? `<button class="min-icon-btn del-lib-btn" data-delete-lib="${escapeHtml(track.id)}" title="Удалить трек из «Ваших треков»" aria-label="Удалить трек">
+                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                     <polyline points="3 6 5 6 21 6"/>
+                     <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+                     <path d="M10 11v6M14 11v6"/>
+                   </svg>
+                 </button>`
+              : ''
+            }
           </div>
         `;
 
@@ -1559,6 +1579,7 @@
           if (e.target.closest('[data-offline]')) { e.stopPropagation(); toggleTrackOffline(track); return; }
           if (e.target.closest('[data-add-pl]')) { e.stopPropagation(); openPlaylistModal(track); return; }
           if (e.target.closest('[data-remove-pl]')) { e.stopPropagation(); removeTrackFromPlaylist(state.selectedPlaylistId, track.id); return; }
+          if (e.target.closest('[data-delete-lib]')) { e.stopPropagation(); deleteTrackFromLibrary(track); return; }
           if (e.target.closest('[data-like]')) { e.stopPropagation(); toggleLike(track); return; }
           if (context === 'search') state.activeQueue = [...state.searchResults];
           else state.activeQueue = getVisibleLibraryTracks();
@@ -1732,6 +1753,50 @@
         renderLibrary();
         renderSearchResultsList();
         showToast(`Убрано из «${pl.name}»`);
+      }
+
+      async function deleteTrackFromLibrary(track) {
+        if (!track || !track.id) return;
+        const tid = track.id;
+
+        // 1) Remove from library, queue, likes and every user playlist
+        state.libraryTracks = state.libraryTracks.filter(t => t && t.id !== tid);
+        state.activeQueue = (state.activeQueue || []).filter(t => t && t.id !== tid);
+        state.likedIds.delete(tid);
+        state.playlists.forEach(pl => {
+          if (pl && Array.isArray(pl.trackIds)) {
+            pl.trackIds = pl.trackIds.filter(id => id !== tid);
+          }
+        });
+
+        // 2) Clean up offline IndexedDB blob & local object URL if any
+        if (state.offlineIds.has(tid)) {
+          await removeTrackOffline(track, true);
+        }
+        if (track.isLocal && track.audioUrl && String(track.audioUrl).startsWith('blob:')) {
+          try { URL.revokeObjectURL(track.audioUrl); } catch (e) {}
+        }
+
+        // 3) If deleted track is currently playing, pause cleanly
+        if (state.currentTrack && state.currentTrack.id === tid) {
+          pausePlayback();
+          try { htmlAudio.removeAttribute('src'); htmlAudio.load(); } catch (e) {}
+          state.currentTrack = null;
+          miniPlayer.classList.remove('show');
+          closePlayerOverlay();
+        }
+
+        // 4) Persist locally and push immediately to Telegram cloud account
+        store.set('liked', Array.from(state.likedIds));
+        store.set('playlists', state.playlists);
+        store.set('savedCatalogTracks', getSerializableSavedTracks());
+        pushCloudSyncNow(false);
+
+        renderLibrary();
+        renderSearchResultsList();
+        renderProfile();
+        updateOfflineUI();
+        showToast(`Трек удалён: ${track.title}`);
       }
 
       $('createPlBtn').addEventListener('click', () => {
