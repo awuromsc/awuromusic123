@@ -13,71 +13,6 @@
         }
       };
 
-      // ================= PLATFORM IMPORT PACKS =================
-      const PLATFORM_PACKS = {
-        yandex: {
-          label: 'Яндекс',
-          tracks: [
-            {
-              id: 'imp_ya_1', title: 'Ночной Проспект', artist: 'Serebrov', album: 'APATHY Import', duration: 64, source: 'Яндекс', imported: true,
-              coverGrad: 'linear-gradient(145deg, #4a3f1d 0%, #0d0b06 60%, #7a662b 100%)',
-              synth: { bpm: 120, root: 45, scale: [0, 2, 3, 7, 8, 12], wave: 'triangle', arp: [0, 3, 4, 2, 5, 3, 1, 0], pad: true },
-              lyrics: [{ t: 0, text: 'Мокрый асфальт отражает огни' }, { t: 8, text: 'Мы по проспекту едем одни' }, { t: 18, text: 'Перенесено прямо в тёмный поток' }, { t: 30, text: 'Ветер в окно, прохладная ночь' }, { t: 45, text: 'Музыка держит невидимый мост' }]
-            },
-            {
-              id: 'imp_ya_2', title: 'Пепел и Неон', artist: 'Kholod', album: 'APATHY Import', duration: 62, source: 'Яндекс', imported: true,
-              coverGrad: 'linear-gradient(145deg, #3c3a47 0%, #09090d 60%, #635e78 100%)',
-              synth: { bpm: 114, root: 43, scale: [0, 3, 5, 7, 10, 12], wave: 'sawtooth', arp: [0, 2, 3, 5, 4, 3, 1, 0], pad: true },
-              lyrics: [{ t: 0, text: 'Пепел ложится на чёрный бетон' }, { t: 9, text: 'В окнах высоток мигает неон' }, { t: 20, text: 'Твой силуэт растворился в дыму' }, { t: 35, text: 'Тяжёлый синт накрывает волной' }, { t: 50, text: 'Пепел и неон до рассвета горят' }]
-            }
-          ]
-        },
-        spotify: {
-          label: 'Spotify',
-          tracks: [
-            {
-              id: 'imp_sp_1', title: 'Velvet Abyss', artist: 'Nyx Static', album: 'APATHY Import', duration: 66, source: 'Spotify', imported: true,
-              coverGrad: 'linear-gradient(145deg, #173d29 0%, #060d09 60%, #276645 100%)',
-              synth: { bpm: 126, root: 47, scale: [0, 3, 5, 7, 10, 12], wave: 'sawtooth', arp: [0, 4, 2, 5, 3, 2, 1, 0], pad: true },
-              lyrics: [{ t: 0, text: 'Falling through the velvet dark' }, { t: 10, text: 'Chrome horizon leaves a spark' }, { t: 22, text: 'Echoes bouncing off the glass' }, { t: 36, text: 'Sync the heartbeat to the wire' }, { t: 50, text: 'Lost inside the velvet abyss' }]
-            }
-          ]
-        },
-        apple: {
-          label: 'Apple Music',
-          tracks: [
-            {
-              id: 'imp_ap_1', title: 'Scarlet Mirror', artist: 'Vespera', album: 'APATHY Import', duration: 68, source: 'Apple', imported: true,
-              coverGrad: 'linear-gradient(145deg, #591b27 0%, #0c0507 60%, #8f293d 100%)',
-              synth: { bpm: 98, root: 44, scale: [0, 3, 7, 10, 12, 15], wave: 'sine', arp: [0, 2, 3, 5, 4, 2, 1, 0], pad: true },
-              lyrics: [{ t: 0, text: 'Алое зеркало держит секрет' }, { t: 12, text: 'В нём отражается призрачный свет' }, { t: 26, text: 'Мягкий поток обнимает пространство' }, { t: 44, text: 'Scarlet mirror — покой внутри' }]
-            }
-          ]
-        },
-        vk: {
-          label: 'VK Музыка',
-          tracks: [
-            {
-              id: 'imp_vk_1', title: 'Холодный Пульс', artist: 'MRAK', album: 'APATHY Import', duration: 62, source: 'VK', imported: true,
-              coverGrad: 'linear-gradient(145deg, #21344d 0%, #070a0f 60%, #375780 100%)',
-              synth: { bpm: 134, root: 43, scale: [0, 1, 5, 7, 8, 12], wave: 'square', arp: [0, 2, 0, 4, 3, 2, 1, 0], pad: false },
-              lyrics: [{ t: 0, text: 'Холодный пульс на экране горит' }, { t: 12, text: 'Город уснул, но динамик не спит' }, { t: 28, text: 'Плотный удар и холодный металл' }, { t: 46, text: 'Холодный пульс — не сбавляем ход' }]
-            }
-          ]
-        },
-        soundcloud: {
-          label: 'SoundCloud',
-          tracks: [
-            {
-              id: 'imp_sc_1', title: 'Static Cathedral', artist: 'XEN0', album: 'APATHY Import', duration: 65, source: 'SoundCloud', imported: true,
-              coverGrad: 'linear-gradient(145deg, #542d18 0%, #0d0805 60%, #874725 100%)',
-              synth: { bpm: 128, root: 40, scale: [0, 3, 5, 6, 7, 10], wave: 'sawtooth', arp: [0, 5, 3, 4, 2, 3, 1, 0], pad: true },
-              lyrics: [{ t: 0, text: 'Underground signal cuts the air' }, { t: 14, text: 'Chrome cathedral standing bare' }, { t: 30, text: 'Heavy sub beneath our feet' }, { t: 48, text: 'Static cathedral never sleeps' }]
-            }
-          ]
-        }
-      };
-
       // ================= STATE =================
       const savedCatalogTracks = store.get('savedCatalogTracks', []);
       const defaultPlaylists = [
@@ -91,7 +26,6 @@
         activeQueue: [],
         playlists: store.get('playlists', defaultPlaylists),
         likedIds: new Set(store.get('liked', [])),
-        importedPlatforms: store.get('importedPlatforms', []),
         user: store.get('user', null),
         tgToken: store.get('tgAuthToken', ''),
         theme: store.get('theme', 'chrome'),
@@ -104,7 +38,8 @@
         lyricsOffset: 0,
         shuffle: false,
         repeat: false,
-        selectedPlatform: 'yandex',
+        volume: Math.max(0, Math.min(1, Number(store.get('volume', 1)))),
+        prevVolume: 1,
         lyricsExpanded: false,
         modalTrack: null
       };
@@ -112,13 +47,7 @@
       savedCatalogTracks.forEach(t => {
         if (!state.libraryTracks.some(x => x.id === t.id)) state.libraryTracks.push(t);
       });
-      state.importedPlatforms.forEach(p => {
-        if (PLATFORM_PACKS[p]) {
-          PLATFORM_PACKS[p].tracks.forEach(t => {
-            if (!state.libraryTracks.some(x => x.id === t.id)) state.libraryTracks.push({ ...t });
-          });
-        }
-      });
+
 
       function persistSavedCatalogTracks() {
         const toSave = state.libraryTracks
@@ -142,7 +71,7 @@
         store.set('savedCatalogTracks', toSave);
         scheduleCloudSync();
       }
-      function persistPlaylists() { store.set('playlists', state.playlists); scheduleCloudSync(); }
+      function persistPlaylists(immediate = false) { store.set('playlists', state.playlists); if (immediate) pushCloudSyncNow(false); else scheduleCloudSync(); }
 
       function ensureTrackInLibrary(track) {
         if (!track) return;
@@ -593,7 +522,7 @@
       htmlAudio.playsInline = true;
       try { htmlAudio.referrerPolicy = 'no-referrer'; } catch (e) {}
       htmlAudio.muted = false;
-      htmlAudio.volume = 1.0;
+      htmlAudio.volume = isFinite(state.volume) ? state.volume : 1.0;
 
       let iosHtmlAudioUnlocked = false;
       let synthTimer = null, synthStep = 0, lastTickTime = 0;
@@ -638,7 +567,7 @@
           if (!AC) return null;
           audioCtx = new AC();
           masterGain = audioCtx.createGain();
-          masterGain.gain.value = 0.28;
+          masterGain.gain.value = 0.28 * (isFinite(state.volume) ? state.volume : 1);
           analyser = audioCtx.createAnalyser();
           analyser.fftSize = 128;
           masterGain.connect(analyser);
@@ -646,6 +575,40 @@
         }
         if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
         return audioCtx;
+      }
+
+      function applyAudioVolume(vol, save = true) {
+        const v = Math.max(0, Math.min(1, isFinite(vol) ? vol : 1));
+        state.volume = v;
+        if (v > 0.01) state.prevVolume = v;
+        try {
+          htmlAudio.volume = v;
+          htmlAudio.muted = (v === 0);
+        } catch (e) {}
+        if (masterGain) {
+          try { masterGain.gain.value = 0.28 * v; } catch (e) {}
+        }
+        const pct = Math.round(v * 100);
+        const sl = $('volumeSlider');
+        if (sl) {
+          sl.value = String(pct);
+          sl.style.background = `linear-gradient(90deg, var(--accent) ${pct}%, rgba(255,255,255,0.14) ${pct}%)`;
+        }
+        const lbl = $('volumePct');
+        if (lbl) lbl.textContent = pct + '%';
+        const btn = $('btnMuteToggle');
+        const ico = $('volumeIcon');
+        if (btn) btn.classList.toggle('muted', pct === 0);
+        if (ico) {
+          if (pct === 0) {
+            ico.innerHTML = `<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/>`;
+          } else if (pct < 50) {
+            ico.innerHTML = `<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>`;
+          } else {
+            ico.innerHTML = `<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>`;
+          }
+        }
+        if (save) store.set('volume', v);
       }
 
       function playUnlockChime() {
@@ -912,7 +875,7 @@
         state.activeTab = tabId;
         document.querySelectorAll('.tab-view').forEach(v => v.classList.toggle('active', v.id === tabId));
         document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
-        if (tabId === 'viewTracks') renderLibrary();
+        if (tabId === 'viewTracks') { renderLibrary(); refreshCloudAccountState(false); }
         if (tabId === 'viewProfile') renderProfile();
       }
       document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
@@ -1005,7 +968,6 @@
         return state.libraryTracks.filter(t => {
           if (state.libFilter === 'liked') return state.likedIds.has(t.id);
           if (state.libFilter === 'telegram') return !!(t.fromTelegramBot || t.fromCatalog);
-          if (state.libFilter === 'imported') return !!t.imported;
           if (state.libFilter === 'local') return !!t.isLocal;
           return true;
         });
@@ -1067,7 +1029,7 @@
           libraryTrackList.innerHTML = `<div style="text-align:center;padding:30px 12px;color:var(--text-dim);font-size:13px;">
             ${state.selectedPlaylistId
               ? 'В этом плейлисте пока нет треков — найдите музыку в «Поиске» и нажмите «+»'
-              : 'Здесь пока пусто — добавьте треки из поиска, площадок или свои MP3'}
+              : 'Здесь пока пусто — добавьте треки из поиска, через Telegram-бота или загрузите свои MP3'}
           </div>`;
           return;
         }
@@ -1080,7 +1042,12 @@
 
       function openPlaylistModal(track) {
         state.modalTrack = track || null;
-        $('plModalHeading').textContent = track ? 'Добавить в плейлист' : 'Новый плейлист';
+        const isAuth = Boolean(state.user && state.user.tgId && state.tgToken);
+        $('plModalHeading').textContent = track
+          ? (isAuth ? 'В личный плейлист аккаунта' : 'Добавить в плейлист')
+          : 'Новый плейлист';
+        const hint = $('plAuthHint');
+        if (hint) hint.classList.toggle('show', !isAuth);
         const box = $('plModalTrackBox');
         if (track) {
           box.style.display = 'flex';
@@ -1134,9 +1101,9 @@
             } else {
               ensureTrackInLibrary(track);
               pl.trackIds.unshift(track.id);
-              showToast(`Добавлено в «${pl.name}»`);
+              showToast(state.user && state.user.tgId ? `Добавлено в «${pl.name}» (аккаунт)` : `Добавлено в «${pl.name}»`);
             }
-            persistPlaylists();
+            persistPlaylists(true);
             renderPlaylistModalOptions();
             renderSearchResultsList();
             renderLibrary();
@@ -1151,7 +1118,7 @@
         const pl = state.playlists.find(p => p.id === plId);
         if (!pl) return;
         pl.trackIds = pl.trackIds.filter(id => id !== trackId);
-        persistPlaylists();
+        persistPlaylists(true);
         renderLibrary();
         renderSearchResultsList();
         showToast(`Убрано из «${pl.name}»`);
@@ -1166,7 +1133,7 @@
           newPl.trackIds.push(state.modalTrack.id);
         }
         state.playlists.unshift(newPl);
-        persistPlaylists();
+        persistPlaylists(true);
         $('newPlNameInput').value = '';
         renderPlaylistModalOptions();
         renderLibrary();
@@ -1198,7 +1165,7 @@
         const pl = state.playlists.find(p => p.id === state.selectedPlaylistId);
         state.playlists = state.playlists.filter(p => p.id !== state.selectedPlaylistId);
         state.selectedPlaylistId = null;
-        persistPlaylists();
+        persistPlaylists(true);
         renderLibrary();
         renderProfile();
         if (pl) showToast(`Плейлист «${pl.name}» удалён`);
@@ -1238,8 +1205,7 @@
           // Local uploaded file
           if (track.audioUrl) {
             currentAudioMode = 'stream';
-            htmlAudio.muted = false;
-            htmlAudio.volume = 1.0;
+            applyAudioVolume(state.volume, false);
             htmlAudio.src = track.audioUrl;
             try { htmlAudio.currentTime = 0; } catch (e) {}
             htmlAudio.play().catch(() => showToast('Нажмите Play для запуска звука'));
@@ -1252,8 +1218,7 @@
             let streamUrl = track.tgStreamUrl || (track.tgTrackId ? tgApiUrl(`/api/tg/stream/${encodeURIComponent(track.tgTrackId)}`) : '');
             if (streamUrl) {
               currentAudioMode = 'stream';
-              htmlAudio.muted = false;
-              htmlAudio.volume = 1.0;
+              applyAudioVolume(state.volume, false);
               htmlAudio.src = streamUrl;
               try { htmlAudio.currentTime = 0; } catch (e) {}
               armStreamWatchdog(track.id, 12000);
@@ -1284,8 +1249,7 @@
                 if (res.id) track.tgTrackId = String(res.id);
                 if (res.duration > 0) track.duration = res.duration;
                 currentAudioMode = 'stream';
-                htmlAudio.muted = false;
-                htmlAudio.volume = 1.0;
+                applyAudioVolume(state.volume, false);
                 htmlAudio.src = fullUrl;
                 try { htmlAudio.currentTime = 0; } catch (e) {}
                 armStreamWatchdog(track.id, 12000);
@@ -1603,16 +1567,25 @@
         requestAnimationFrame(tick);
       }
 
-      // ================= PROFILE, TELEGRAM ACCOUNT & CLOUD SYNC (v29) =================
+      // ================= PROFILE, TELEGRAM ACCOUNT, AVATAR & CLOUD SYNC (v30) =================
       let authPollTimer = null;
       let syncDebounceTimer = null;
       let isApplyingCloudState = false;
+      let lastCloudUpdatedAt = 0;
 
       function setSyncStatus(text, isSyncing = false) {
         const badge = $('syncStatusBadge');
         const lbl = $('syncStatusText');
         if (badge) badge.classList.toggle('syncing', !!isSyncing);
         if (lbl) lbl.textContent = text;
+      }
+
+      function resolveUserPhotoUrl(u) {
+        if (!u || !u.photoUrl) return '';
+        const p = String(u.photoUrl).trim();
+        if (!p) return '';
+        if (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('data:')) return p;
+        return tgApiUrl(p);
       }
 
       function getSerializableSavedTracks() {
@@ -1644,26 +1617,30 @@
           const displayName = [u.firstName, u.lastName].filter(Boolean).join(' ').trim() || (u.username ? '@' + u.username : 'Telegram');
           const subHandle = u.username ? ('@' + u.username) : ('ID ' + u.tgId);
           const ini = (displayName.replace(/[^A-Za-zА-Яа-яЁё0-9]/g, '').slice(0, 2) || 'TG').toUpperCase();
+          const avatarSrc = resolveUserPhotoUrl(u);
 
           $('profileDisplayName').textContent = displayName;
           $('profileUsername').textContent = subHandle;
 
           const avLg = $('profileAvatarLg');
-          if (u.photoUrl) {
-            avLg.innerHTML = `<img src="${escapeHtml(u.photoUrl)}" alt="" />`;
+          if (avatarSrc) {
+            avLg.innerHTML = `<img src="${escapeHtml(avatarSrc)}" alt="" />`;
             const img = avLg.querySelector('img');
             if (img) img.addEventListener('error', () => { avLg.textContent = ini; });
           } else {
             avLg.textContent = ini;
           }
 
+          const resetBtn = $('resetAvatarBtn');
+          if (resetBtn) resetBtn.style.display = u.hasCustomAvatar ? 'inline-flex' : 'none';
+
           $('statTracks').textContent = state.libraryTracks.length;
           $('statLiked').textContent = state.likedIds.size;
           $('statPlaylists').textContent = state.playlists.length;
 
           topProfileBtn.classList.add('logged-in');
-          if (u.photoUrl) {
-            topProfileBtn.innerHTML = `<img src="${escapeHtml(u.photoUrl)}" alt="" />`;
+          if (avatarSrc) {
+            topProfileBtn.innerHTML = `<img src="${escapeHtml(avatarSrc)}" alt="" />`;
             const tImg = topProfileBtn.querySelector('img');
             if (tImg) tImg.addEventListener('error', () => { topProfileBtn.textContent = ini; });
           } else {
@@ -1701,8 +1678,12 @@
         };
       }
 
-      function mergeAndApplyCloudState(cloudState, pushMergedBack = false) {
+      // mode: 'login_merge' (first sign-in: combine guest local + cloud) | 'pull' (authoritative refresh from cloud/bot)
+      function applyCloudState(cloudState, mode = 'pull') {
         if (!cloudState || typeof cloudState !== 'object') return;
+        const cloudTs = Number(cloudState.updatedAt || 0);
+        if (mode === 'pull' && cloudTs > 0 && cloudTs <= lastCloudUpdatedAt) return;
+
         isApplyingCloudState = true;
         try {
           const cloudTracks = Array.isArray(cloudState.savedTracks)
@@ -1713,8 +1694,25 @@
 
           const cloudHasData = cloudTracks.length > 0 || cloudLikes.length > 0 || cloudPlaylists.some(p => p && Array.isArray(p.trackIds) && p.trackIds.length > 0);
 
-          if (cloudHasData) {
-            // Merge cloud tracks + keep any local tracks not yet in cloud
+          if (mode === 'pull' && cloudHasData) {
+            // Keep local uploaded files + authoritative cloud tracks (picks up new tracks added via Telegram bot!)
+            const localFiles = state.libraryTracks.filter(t => t && t.isLocal);
+            state.libraryTracks = [...localFiles, ...cloudTracks];
+
+            if (cloudPlaylists.length > 0) {
+              state.playlists = cloudPlaylists
+                .filter(p => p && p.id && p.name)
+                .map(p => ({
+                  id: String(p.id),
+                  name: String(p.name),
+                  trackIds: Array.isArray(p.trackIds) ? Array.from(new Set(p.trackIds.map(String))) : []
+                }));
+            }
+            state.likedIds = new Set(cloudLikes.map(String));
+            if (cloudState.theme && THEME_META[cloudState.theme] && cloudState.theme !== state.theme) {
+              applyTheme(cloudState.theme, false);
+            }
+          } else if (mode === 'login_merge' && cloudHasData) {
             const byId = new Map();
             cloudTracks.forEach(t => byId.set(t.id, t));
             state.libraryTracks.forEach(t => {
@@ -1722,7 +1720,6 @@
             });
             state.libraryTracks = Array.from(byId.values());
 
-            // Merge playlists by id (cloud wins order, local-only trackIds appended)
             const plMap = new Map();
             cloudPlaylists.forEach(p => {
               if (p && p.id && p.name) {
@@ -1745,15 +1742,13 @@
               }
             });
             if (plMap.size > 0) state.playlists = Array.from(plMap.values());
-
-            // Merge likes
             cloudLikes.forEach(id => state.likedIds.add(String(id)));
-
-            // Apply saved cloud theme if valid
             if (cloudState.theme && THEME_META[cloudState.theme] && cloudState.theme !== state.theme) {
               applyTheme(cloudState.theme, false);
             }
           }
+
+          if (cloudTs > 0) lastCloudUpdatedAt = cloudTs;
 
           store.set('playlists', state.playlists);
           store.set('liked', Array.from(state.likedIds));
@@ -1768,14 +1763,15 @@
           isApplyingCloudState = false;
         }
 
-        if (pushMergedBack) {
+        if (mode === 'login_merge') {
           pushCloudSyncNow(false);
         }
       }
 
       async function pushCloudSyncNow(notify = false) {
         if (!state.tgToken || !state.user || !state.user.tgId) return false;
-        setSyncStatus('Сохранение в облако...', true);
+        clearTimeout(syncDebounceTimer);
+        setSyncStatus('Сохранение в аккаунт...', true);
         try {
           const payload = {
             playlists: state.playlists.slice(0, 50),
@@ -1797,9 +1793,10 @@
           }
           const data = resp.ok ? await resp.json() : null;
           if (data && data.ok) {
+            if (data.syncedAt) lastCloudUpdatedAt = Number(data.syncedAt);
             const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
             setSyncStatus(`Синхронизировано · ${nowStr}`, false);
-            if (notify) showToast('Плейлисты и избранное сохранены в Telegram-аккаунте');
+            if (notify) showToast('Плейлисты и избранное синхронизированы');
             return true;
           }
         } catch (e) {}
@@ -1808,11 +1805,34 @@
         return false;
       }
 
+      async function refreshCloudAccountState(notify = false) {
+        if (!state.tgToken) return false;
+        try {
+          const resp = await fetch(`${tgApiUrl('/api/user/me')}?_=${Date.now()}`, {
+            headers: { 'Authorization': 'Bearer ' + state.tgToken }
+          });
+          if (resp.status === 401) {
+            clearTgSession(false);
+            return false;
+          }
+          const data = resp.ok ? await resp.json() : null;
+          if (data && data.ok && data.user) {
+            state.user = data.user;
+            store.set('user', data.user);
+            renderProfile();
+            applyCloudState(data.state || {}, 'pull');
+            if (notify) showToast('Медиатека аккаунта обновлена');
+            return true;
+          }
+        } catch (e) {}
+        return false;
+      }
+
       function scheduleCloudSync() {
         if (isApplyingCloudState || !state.tgToken || !state.user || !state.user.tgId) return;
         setSyncStatus('Сохранение...', true);
         clearTimeout(syncDebounceTimer);
-        syncDebounceTimer = setTimeout(() => pushCloudSyncNow(false), 750);
+        syncDebounceTimer = setTimeout(() => pushCloudSyncNow(false), 650);
       }
 
       function stopAuthPolling() {
@@ -1829,13 +1849,14 @@
       function applyAuthorizedSession(data, notify = true) {
         if (!data || !data.token || !data.user) return;
         stopAuthPolling();
+        lastCloudUpdatedAt = 0;
         state.tgToken = data.token;
         state.user = data.user;
         store.set('tgAuthToken', data.token);
         store.set('user', data.user);
         $('authMsg').textContent = '';
         renderProfile();
-        mergeAndApplyCloudState(data.state || {}, true);
+        applyCloudState(data.state || {}, 'login_merge');
         if (notify) {
           const uname = data.user.username ? ('@' + data.user.username) : (data.user.firstName || 'Telegram');
           showToast('Вход через Telegram выполнен: ' + uname);
@@ -1845,6 +1866,7 @@
       function clearTgSession(notify = true) {
         const oldToken = state.tgToken;
         stopAuthPolling();
+        lastCloudUpdatedAt = 0;
         state.tgToken = '';
         state.user = null;
         store.set('tgAuthToken', '');
@@ -1860,7 +1882,7 @@
       }
 
       async function initTelegramAuth() {
-        // 1) Auto-login inside Telegram Mini App using cryptographically signed initData!
+        // 1) Auto-login inside Telegram Mini App
         try {
           const tgWebApp = window.Telegram && window.Telegram.WebApp;
           if (tgWebApp && tgWebApp.initData && tgWebApp.initData.length > 20) {
@@ -1880,27 +1902,13 @@
 
         // 2) Restore existing browser session via saved token
         if (state.tgToken) {
-          try {
-            const resp = await fetch(`${tgApiUrl('/api/user/me')}?_=${Date.now()}`, {
-              headers: { 'Authorization': 'Bearer ' + state.tgToken }
-            });
-            if (resp.status === 401) {
-              clearTgSession(false);
-              return;
-            }
-            const data = resp.ok ? await resp.json() : null;
-            if (data && data.ok && data.user) {
-              state.user = data.user;
-              store.set('user', data.user);
-              renderProfile();
-              mergeAndApplyCloudState(data.state || {}, false);
-              setSyncStatus('Синхронизировано с Telegram', false);
-              return;
-            }
-          } catch (e) {}
+          const ok = await refreshCloudAccountState(false);
+          if (ok) {
+            setSyncStatus('Синхронизировано с Telegram', false);
+            return;
+          }
         }
 
-        // If stale local non-Telegram user existed from older versions, reset cleanly
         if (state.user && !state.user.tgId) {
           state.user = null;
           store.set('user', null);
@@ -1908,11 +1916,114 @@
         }
       }
 
+      // ---- Custom Avatar Crop & Upload (320x320 JPEG, fast & crisp) ----
+      function cropImageFileToDataUrl(file, size = 320) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(new Error('read_error'));
+          reader.onload = () => {
+            const img = new Image();
+            img.onerror = () => reject(new Error('image_error'));
+            img.onload = () => {
+              try {
+                const canvas = document.createElement('canvas');
+                canvas.width = size;
+                canvas.height = size;
+                const ctx = canvas.getContext('2d');
+                const minSide = Math.min(img.width, img.height);
+                const sx = Math.floor((img.width - minSide) / 2);
+                const sy = Math.floor((img.height - minSide) / 2);
+                ctx.drawImage(img, sx, sy, minSide, minSide, 0, 0, size, size);
+                resolve(canvas.toDataURL('image/jpeg', 0.86));
+              } catch (e) {
+                reject(e);
+              }
+            };
+            img.src = reader.result;
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+
+      function triggerAvatarPicker() {
+        if (!state.tgToken || !state.user || !state.user.tgId) {
+          showToast('Сначала войдите через Telegram');
+          return;
+        }
+        $('avatarFileInput').click();
+      }
+
+      $('avatarUploadBtn').addEventListener('click', triggerAvatarPicker);
+      $('changeAvatarTextBtn').addEventListener('click', triggerAvatarPicker);
+
+      $('avatarFileInput').addEventListener('change', async (e) => {
+        const file = e.target.files && e.target.files[0];
+        e.target.value = '';
+        if (!file || !state.tgToken) return;
+        if (!file.type.startsWith('image/')) {
+          showToast('Выберите изображение (JPG, PNG или WebP)');
+          return;
+        }
+        setSyncStatus('Загрузка нового фото...', true);
+        try {
+          const dataUrl = await cropImageFileToDataUrl(file, 320);
+          const resp = await fetch(`${tgApiUrl('/api/user/avatar')}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + state.tgToken
+            },
+            body: JSON.stringify({ imageData: dataUrl })
+          });
+          const data = resp.ok ? await resp.json() : null;
+          if (data && data.ok && data.photoUrl) {
+            state.user.photoUrl = data.photoUrl;
+            state.user.hasCustomAvatar = true;
+            store.set('user', state.user);
+            renderProfile();
+            setSyncStatus('Фото профиля обновлено', false);
+            showToast('Аватарка профиля сохранена');
+          } else {
+            setSyncStatus('Ошибка загрузки фото', false);
+            showToast('Не удалось сохранить изображение');
+          }
+        } catch (err) {
+          setSyncStatus('Ошибка загрузки фото', false);
+          showToast('Не удалось обработать изображение');
+        }
+      });
+
+      $('resetAvatarBtn').addEventListener('click', async () => {
+        if (!state.tgToken) return;
+        setSyncStatus('Возврат фото Telegram...', true);
+        try {
+          const resp = await fetch(`${tgApiUrl('/api/user/avatar')}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': 'Bearer ' + state.tgToken }
+          });
+          const data = resp.ok ? await resp.json() : null;
+          if (data && data.ok) {
+            state.user.photoUrl = data.photoUrl || '';
+            state.user.hasCustomAvatar = false;
+            store.set('user', state.user);
+            renderProfile();
+            setSyncStatus('Восстановлено фото из Telegram', false);
+            showToast('Аватарка Telegram восстановлена');
+          }
+        } catch (e) {
+          showToast('Не удалось сбросить фото');
+        }
+      });
+
+      $('plGoLoginBtn').addEventListener('click', () => {
+        closePlaylistModal();
+        switchTab('viewProfile');
+      });
+
       $('tgLoginBtn').addEventListener('click', async () => {
         const msg = $('authMsg');
         msg.textContent = '';
 
-        // If inside Telegram Mini App, try instant initData auth first
         const tgWebApp = window.Telegram && window.Telegram.WebApp;
         if (tgWebApp && tgWebApp.initData && tgWebApp.initData.length > 20) {
           $('tgLoginBtn').disabled = true;
@@ -1931,7 +2042,6 @@
           $('tgLoginBtn').disabled = false;
         }
 
-        // Browser 1-tap Deep-Link Auth via your Telegram Bot
         $('tgLoginBtn').disabled = true;
         try {
           const resp = await fetch(`${tgApiUrl('/api/auth/start')}`, { method: 'POST' });
@@ -1946,10 +2056,8 @@
           openLink.href = data.botUrl;
           $('tgAuthPendingBox').classList.add('show');
 
-          // Try opening Telegram immediately inside the click gesture
           try { window.open(data.botUrl, '_blank', 'noopener'); } catch (e) {}
 
-          // Poll every 1.6s until user taps Start in Telegram (up to 5 minutes)
           const startedAt = Date.now();
           const authCode = data.code;
           if (authPollTimer) clearInterval(authPollTimer);
@@ -1979,64 +2087,19 @@
         $('authMsg').textContent = '';
       });
 
-      $('manualSyncBtn').addEventListener('click', () => {
-        pushCloudSyncNow(true);
+      $('manualSyncBtn').addEventListener('click', async () => {
+        await refreshCloudAccountState(false);
+        await pushCloudSyncNow(true);
       });
 
       $('logoutBtn').addEventListener('click', () => {
         clearTgSession(true);
       });
 
-      // ================= IMPORT FROM PLATFORMS =================
-      const importModal = $('importModal');
-      $('openImportBtn').addEventListener('click', () => importModal.classList.add('open'));
-      $('closeImportBtn').addEventListener('click', () => importModal.classList.remove('open'));
-      importModal.addEventListener('click', (e) => { if (e.target === importModal) importModal.classList.remove('open'); });
-
-      const PLATFORM_PLACEHOLDERS = {
-        yandex: 'https://music.yandex.ru/users/.../playlists/...',
-        spotify: 'https://open.spotify.com/playlist/...',
-        apple: 'https://music.apple.com/ru/playlist/...',
-        vk: 'https://vk.com/music/playlist/...',
-        soundcloud: 'https://soundcloud.com/...'
-      };
-      document.querySelectorAll('.platform-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-          state.selectedPlatform = btn.dataset.platform;
-          document.querySelectorAll('.platform-btn').forEach(b => b.classList.toggle('selected', b === btn));
-          $('importLinkInput').placeholder = PLATFORM_PLACEHOLDERS[state.selectedPlatform] || '';
-        });
-      });
-
-      $('startImportBtn').addEventListener('click', () => {
-        const p = state.selectedPlatform, pack = PLATFORM_PACKS[p];
-        if (!pack) return;
-        const wrap = $('importProgressWrap'), fill = $('importBarFill'), pctEl = $('importPercent'), statusEl = $('importStatusText'), startBtn = $('startImportBtn');
-        startBtn.disabled = true; wrap.classList.add('show');
-        let progress = 0; fill.style.width = '0%'; statusEl.textContent = `Подключение к ${pack.label}...`;
-        const timer = setInterval(() => {
-          progress += Math.floor(Math.random() * 18) + 14;
-          if (progress >= 100) {
-            progress = 100; clearInterval(timer);
-            fill.style.width = '100%'; pctEl.textContent = '100%'; statusEl.textContent = 'Треки успешно перенесены!';
-            let added = 0;
-            pack.tracks.forEach(t => {
-              if (!state.libraryTracks.some(x => x.id === t.id)) { state.libraryTracks.unshift({ ...t }); added++; }
-            });
-            if (!state.importedPlatforms.includes(p)) {
-              state.importedPlatforms.push(p); store.set('importedPlatforms', state.importedPlatforms);
-            }
-            renderLibrary(); renderProfile();
-            setTimeout(() => {
-              startBtn.disabled = false; wrap.classList.remove('show');
-              $('importLinkInput').value = ''; importModal.classList.remove('open');
-              showToast(added > 0 ? `Перенесено ${added} трек(а) из ${pack.label}` : `Треки из ${pack.label} уже в медиатеке`);
-            }, 600);
-          } else {
-            fill.style.width = progress + '%'; pctEl.textContent = progress + '%';
-            if (progress > 40) statusEl.textContent = 'Загрузка метаданных и текстов...';
-          }
-        }, 200);
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && state.tgToken) {
+          refreshCloudAccountState(false);
+        }
       });
 
       // ================= UPLOAD LOCAL MP3 / M4A =================
@@ -2151,6 +2214,18 @@
       $('playerLikeBtn').addEventListener('click', () => { if (state.currentTrack) toggleLike(state.currentTrack); });
       $('playerAddPlBtn').addEventListener('click', () => { if (state.currentTrack) openPlaylistModal(state.currentTrack); });
       $('playerScrubber').addEventListener('input', (e) => seekTo(parseFloat(e.target.value)));
+      $('volumeSlider').addEventListener('input', (e) => {
+        const val = parseInt(e.target.value, 10);
+        applyAudioVolume(isFinite(val) ? val / 100 : 1, true);
+      });
+      $('btnMuteToggle').addEventListener('click', () => {
+        if (state.volume > 0) {
+          state.prevVolume = state.volume;
+          applyAudioVolume(0, true);
+        } else {
+          applyAudioVolume(state.prevVolume > 0.05 ? state.prevVolume : 1, true);
+        }
+      });
       $('toggleLyricsFullBtn').addEventListener('click', () => {
         state.lyricsExpanded = !state.lyricsExpanded;
         playerSplit.classList.toggle('lyrics-expanded', state.lyricsExpanded);
@@ -2176,6 +2251,7 @@
 
       // ================= INIT =================
       applyTheme(state.theme, false);
+      applyAudioVolume(state.volume, false);
       renderLibrary();
       renderProfile();
       initSplashParticles();

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APATHY v29 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
+APATHY v30 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
 ===========================================================================================================
-Исправлено в v29 (обход блокировок YouTube на Docker/VPS-серверах):
+Исправлено в v30 (обход блокировок YouTube на Docker/VPS-серверах):
   1. Мульти-поиск строго по аудиоисточникам одновременно:
        • SoundCloud API v2 (полные треки, прогрессивный MP3 без блокировок дата-центров — идеально для ру-рэпа/андерграунда)
        • Прямые РФ MP3-порталы (Hitmo, Hitmotop, Muzofond, Mp3Party, LightAudio — мгновенный MP3, 0% CPU)
@@ -17,6 +17,7 @@ APATHY v29 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУ�
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import secrets
@@ -208,6 +209,15 @@ def init_db() -> sqlite3.Connection:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_token ON users(session_token);")
+    existing_user_cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+    if "tg_avatar_file_id" not in existing_user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN tg_avatar_file_id TEXT DEFAULT ''")
+    if "custom_avatar" not in existing_user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN custom_avatar BLOB DEFAULT NULL")
+    if "custom_avatar_mime" not in existing_user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN custom_avatar_mime TEXT DEFAULT ''")
+    if "avatar_version" not in existing_user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN avatar_version INTEGER DEFAULT 0")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS user_state (
@@ -483,16 +493,109 @@ def lookup_track_record(track_id: str) -> Optional[Dict[str, Any]]:
 
 
 
-# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v29) ====================
+# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v30) ====================
 def _user_row_to_public(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    tg_id = int(d["tg_id"])
+    has_custom = bool(d.get("custom_avatar"))
+    has_tg_file = bool(d.get("tg_avatar_file_id"))
+    ver = int(d.get("avatar_version") or d.get("updated_at") or 1)
+    if has_custom or has_tg_file:
+        photo_url = f"/api/user/avatar/{tg_id}?v={ver}"
+    else:
+        photo_url = d.get("photo_url") or ""
     return {
-        "tgId": int(row["tg_id"]),
-        "username": row["username"] or "",
-        "firstName": row["first_name"] or "",
-        "lastName": row["last_name"] or "",
-        "photoUrl": row["photo_url"] or "",
-        "theme": row["theme"] or "chrome",
+        "tgId": tg_id,
+        "username": d.get("username") or "",
+        "firstName": d.get("first_name") or "",
+        "lastName": d.get("last_name") or "",
+        "photoUrl": photo_url,
+        "hasCustomAvatar": has_custom,
+        "theme": d.get("theme") or "chrome",
     }
+
+
+async def sync_tg_profile_photo(bot: Bot, tg_id: int, force: bool = False) -> str:
+    """Подгружает file_id актуальной аватарки Telegram-аккаунта пользователя через Bot API."""
+    row = DB.execute("SELECT tg_avatar_file_id FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
+    if not force and row and row["tg_avatar_file_id"]:
+        return str(row["tg_avatar_file_id"])
+    try:
+        photos = await bot.get_user_profile_photos(user_id=int(tg_id), limit=1)
+        if photos and photos.photos and photos.photos[0]:
+            sizes = photos.photos[0]
+            # Берём оптимальный средний/крупный размер (до ~640px)
+            chosen = sizes[-1] if len(sizes) <= 2 else sizes[min(1, len(sizes) - 1)]
+            fid = chosen.file_id
+            now = int(time.time())
+            DB.execute(
+                "UPDATE users SET tg_avatar_file_id = ?, avatar_version = CASE WHEN avatar_version = 0 THEN ? ELSE avatar_version END, updated_at = ? WHERE tg_id = ?",
+                (fid, now, now, int(tg_id)),
+            )
+            DB.commit()
+            return fid
+    except Exception as e:
+        log.warning("get_user_profile_photos failed for %s: %s", tg_id, e)
+    return ""
+
+
+def add_track_to_user_playlist(tg_id: int, track_api: Dict[str, Any], tg_user: Any = None) -> str:
+    """Автоматически добавляет трек в личную учётную запись пользователя и его основной плейлист на сайте."""
+    if not tg_id or not track_api or not track_api.get("id"):
+        return ""
+    if tg_user is not None:
+        upsert_telegram_user(
+            tg_id=int(tg_id),
+            username=getattr(tg_user, "username", "") or "",
+            first_name=getattr(tg_user, "first_name", "") or "",
+            last_name=getattr(tg_user, "last_name", "") or "",
+        )
+    else:
+        exists = DB.execute("SELECT tg_id FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
+        if not exists:
+            upsert_telegram_user(tg_id=int(tg_id))
+
+    cloud = load_user_cloud_state(int(tg_id))
+    playlists = cloud.get("playlists") or []
+    liked_ids = cloud.get("likedIds") or []
+    saved_tracks = cloud.get("savedTracks") or []
+
+    if not playlists:
+        playlists = [
+            {"id": "pl_main", "name": "Мой плейлист", "trackIds": []},
+            {"id": "pl_night", "name": "Ночной вайб", "trackIds": []},
+        ]
+
+    target_pl = next((p for p in playlists if p and p.get("id") == "pl_main"), playlists[0])
+    if not isinstance(target_pl.get("trackIds"), list):
+        target_pl["trackIds"] = []
+
+    raw_id = str(track_api["id"])
+    web_id = raw_id if raw_id.startswith("tg_") else f"tg_{raw_id}"
+
+    web_track = {
+        "id": web_id,
+        "tgTrackId": raw_id,
+        "tgStreamUrl": track_api.get("streamUrl") or f"/api/tg/stream/{quote(raw_id, safe='')}",
+        "title": track_api.get("title") or "Без названия",
+        "artist": track_api.get("artist") or "Исполнитель",
+        "album": "Telegram Бот",
+        "duration": int(track_api.get("duration") or 180),
+        "artwork": track_api.get("artwork") or "",
+        "coverGrad": "linear-gradient(145deg, #163b5c 0%, #070c14 60%, #2468a3 100%)",
+        "source": "Telegram",
+        "inTelegram": True,
+        "fromTelegramBot": True,
+        "fromCatalog": True,
+    }
+
+    if not any(isinstance(t, dict) and str(t.get("id")) == web_id for t in saved_tracks):
+        saved_tracks.insert(0, web_track)
+    if web_id not in target_pl["trackIds"]:
+        target_pl["trackIds"].insert(0, web_id)
+
+    save_user_cloud_state(int(tg_id), playlists, liked_ids, saved_tracks)
+    return str(target_pl.get("name") or "Мой плейлист")
 
 
 def upsert_telegram_user(
@@ -1771,7 +1874,7 @@ def build_webapp_keyboard() -> InlineKeyboardMarkup:
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, bot: Bot):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) == 2 and parts[1].strip().startswith("auth_"):
         code = parts[1].strip()[5:]
@@ -1792,6 +1895,7 @@ async def cmd_start(message: Message):
             first_name=u.first_name or "",
             last_name=u.last_name or "",
         )
+        await sync_tg_profile_photo(bot, u.id, force=True)
         PENDING_AUTH_CODES.set(code, {"status": "authorized", "tg_id": u.id, "token": token}, ttl=180)
         display = f"@{u.username}" if u.username else (u.first_name or f"ID {u.id}")
         await message.answer(
@@ -1805,7 +1909,7 @@ async def cmd_start(message: Message):
 
     total = DB.execute("SELECT COUNT(*) AS c FROM tracks WHERE tg_file_id != ''").fetchone()["c"]
     text = (
-        "<b>APATHY v29 · Музыкальный бот и личные плейлисты</b>\n\n"
+        "<b>APATHY v30 · Музыкальный бот и личные плейлисты</b>\n\n"
         f"🌐 Сайт плеера: {SITE_URL}/\n"
         f"💾 Общих треков в базе: <b>{total}</b>\n\n"
         "• <b>Напиши название трека</b> — ищу по SoundCloud, РФ MP3-порталам и YouTube (строго .mp3).\n"
@@ -1876,7 +1980,7 @@ async def cmd_test_sources(message: Message):
     cookies_st = "✅ подключён" if (COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 20) else "не загружен"
     ff_st = f"✅ активен ({FFMPEG_SOURCE} · выход строго .mp3)" if HAS_FFMPEG else "⚠️ не установлен — добавьте imageio-ffmpeg в requirements.txt"
     await m.edit_text(
-        "<b>Диагностика источников сервера (v29):</b>\n\n"
+        "<b>Диагностика источников сервера (v30):</b>\n\n"
         + "\n".join(lines)
         + f"\n\n🎛 ffmpeg: {ff_st}\n🍪 cookies.txt: {cookies_st}",
         parse_mode="HTML",
@@ -2003,7 +2107,7 @@ async def handle_uploaded_audio(message: Message, bot: Bot):
     if not meta:
         return
     uid = message.from_user.id if message.from_user else 0
-    save_telegram_track(
+    saved_api = save_telegram_track(
         track_id=meta["id"],
         title=meta["title"],
         artist=meta["artist"],
@@ -2015,8 +2119,13 @@ async def handle_uploaded_audio(message: Message, bot: Bot):
         mime_type=meta["mime_type"],
         added_by=uid,
     )
+    pl_name = ""
+    if uid:
+        pl_name = add_track_to_user_playlist(uid, saved_api, message.from_user)
+        await sync_tg_profile_photo(bot, uid, force=False)
+    where_txt = f"в ваш плейлист «<b>{pl_name}</b>» на аккаунте APATHY" if pl_name else "на сайт APATHY"
     await message.reply(
-        f"✅ <b>{meta['artist']} — {meta['title']}</b> добавлен на сайт APATHY!",
+        f"✅ <b>{meta['artist']} — {meta['title']}</b> добавлен {where_txt}!",
         parse_mode="HTML",
         reply_markup=build_webapp_keyboard(),
     )
@@ -2103,12 +2212,18 @@ async def handle_pick_callback(callback: CallbackQuery, bot: Bot):
         await callback.answer("Кнопка устарела — повтори поиск.", show_alert=True)
         return
 
+    u_from = callback.from_user
+    uid = u_from.id if u_from else 0
     row = DB.execute("SELECT * FROM tracks WHERE id = ?", (item["id"],)).fetchone()
     if row and row["tg_file_id"]:
-        await callback.answer("Отправляю аудио...")
+        pl_name = add_track_to_user_playlist(uid, track_dict_to_api(dict(row)), u_from) if uid else ""
+        if uid:
+            await sync_tg_profile_photo(bot, uid, force=False)
+        await callback.answer("Добавлено в ваш плейлист!")
+        pl_note = f"Добавлено в ваш плейлист «{pl_name}» в APATHY" if pl_name else "Уже доступно в плеере APATHY"
         await callback.message.answer_audio(
             audio=row["tg_file_id"],
-            caption=f"⚡ <b>{row['artist']} — {row['title']}</b>\nУже доступно в плеере APATHY",
+            caption=f"⚡ <b>{row['artist']} — {row['title']}</b>\n{pl_note}",
             parse_mode="HTML",
             reply_markup=build_webapp_keyboard(),
         )
@@ -2124,6 +2239,11 @@ async def handle_pick_callback(callback: CallbackQuery, bot: Bot):
         pass
 
     if fid:
+        if uid:
+            saved_row = DB.execute("SELECT * FROM tracks WHERE id = ?", (item["id"],)).fetchone()
+            if saved_row:
+                add_track_to_user_playlist(uid, track_dict_to_api(dict(saved_row)), u_from)
+            await sync_tg_profile_photo(bot, uid, force=False)
         st_id = get_storage_chat_id()
         if st_id and st_id != callback.message.chat.id:
             try:
@@ -2169,6 +2289,11 @@ async def api_auth_webapp(request: web.Request) -> web.Response:
         last_name=str(tg_user.get("last_name") or ""),
         photo_url=str(tg_user.get("photo_url") or ""),
     )
+    bot: Bot = request.app["bot"]
+    await sync_tg_profile_photo(bot, pub_user["tgId"], force=False)
+    fresh_row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (pub_user["tgId"],)).fetchone()
+    if fresh_row:
+        pub_user = _user_row_to_public(fresh_row)
     cloud_state = load_user_cloud_state(pub_user["tgId"], pub_user["theme"])
     return web.json_response({"ok": True, "token": token, "user": pub_user, "state": cloud_state})
 
@@ -2222,9 +2347,129 @@ async def api_user_me(request: web.Request) -> web.Response:
     row = get_user_by_token(token)
     if not row:
         return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    if not row["tg_avatar_file_id"] and not row["custom_avatar"]:
+        await sync_tg_profile_photo(request.app["bot"], int(row["tg_id"]), force=False)
+        row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(row["tg_id"]),)).fetchone() or row
     pub_user = _user_row_to_public(row)
     cloud_state = load_user_cloud_state(pub_user["tgId"], pub_user["theme"])
     return web.json_response({"ok": True, "user": pub_user, "state": cloud_state})
+
+
+async def api_user_avatar_get(request: web.Request) -> web.StreamResponse:
+    tg_id_str = request.match_info.get("tg_id", "").strip()
+    if not tg_id_str.isdigit():
+        return web.Response(status=400)
+    tg_id = int(tg_id_str)
+    row = DB.execute("SELECT custom_avatar, custom_avatar_mime, tg_avatar_file_id FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+    if not row:
+        return web.Response(status=404)
+
+    # 1) Пользовательская аватарка, загруженная с сайта
+    if row["custom_avatar"]:
+        return web.Response(
+            body=bytes(row["custom_avatar"]),
+            headers={
+                "Content-Type": row["custom_avatar_mime"] or "image/jpeg",
+                "Cache-Control": "public, max-age=86400",
+            },
+        )
+
+    # 2) Аватарка из Telegram-аккаунта пользователя
+    bot: Bot = request.app["bot"]
+    fid = row["tg_avatar_file_id"] or await sync_tg_profile_photo(bot, tg_id, force=False)
+    if not fid:
+        return web.Response(status=404)
+
+    tg_url = await get_tg_file_url(bot, fid)
+    if not tg_url:
+        return web.Response(status=404)
+    session: aiohttp.ClientSession = request.app["http_session"]
+    try:
+        async with session.get(tg_url, timeout=aiohttp.ClientTimeout(total=8)) as up:
+            if up.status != 200:
+                return web.Response(status=404)
+            body = await up.read()
+            return web.Response(
+                body=body,
+                headers={
+                    "Content-Type": up.headers.get("Content-Type", "image/jpeg"),
+                    "Cache-Control": "public, max-age=86400",
+                },
+            )
+    except Exception:
+        return web.Response(status=404)
+
+
+def _detect_image_mime(raw: bytes) -> Optional[str]:
+    if len(raw) < 12:
+        return None
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    return None
+
+
+async def api_user_avatar_upload(request: web.Request) -> web.Response:
+    token = extract_bearer_token(request)
+    row = get_user_by_token(token)
+    if not row:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+    data_uri = str((body or {}).get("imageData") or "").strip()
+    if "," in data_uri and data_uri.startswith("data:"):
+        b64_part = data_uri.split(",", 1)[1]
+    else:
+        b64_part = data_uri
+    try:
+        raw_bytes = base64.b64decode(b64_part, validate=True)
+    except Exception:
+        return web.json_response({"ok": False, "error": "bad_base64"}, status=400)
+    if not raw_bytes or len(raw_bytes) > 1_500_000:
+        return web.json_response({"ok": False, "error": "image_too_large"}, status=400)
+    mime = _detect_image_mime(raw_bytes)
+    if not mime:
+        return web.json_response({"ok": False, "error": "unsupported_image"}, status=400)
+
+    now = int(time.time())
+    tg_id = int(row["tg_id"])
+    DB.execute(
+        "UPDATE users SET custom_avatar = ?, custom_avatar_mime = ?, avatar_version = ?, updated_at = ? WHERE tg_id = ?",
+        (sqlite3.Binary(raw_bytes), mime, now, now, tg_id),
+    )
+    DB.commit()
+    return web.json_response(
+        {
+            "ok": True,
+            "photoUrl": f"/api/user/avatar/{tg_id}?v={now}",
+            "hasCustomAvatar": True,
+        }
+    )
+
+
+async def api_user_avatar_delete(request: web.Request) -> web.Response:
+    token = extract_bearer_token(request)
+    row = get_user_by_token(token)
+    if not row:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    tg_id = int(row["tg_id"])
+    now = int(time.time())
+    DB.execute(
+        "UPDATE users SET custom_avatar = NULL, custom_avatar_mime = '', avatar_version = ?, updated_at = ? WHERE tg_id = ?",
+        (now, now, tg_id),
+    )
+    DB.commit()
+    await sync_tg_profile_photo(request.app["bot"], tg_id, force=True)
+    fresh = DB.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
+    pub = _user_row_to_public(fresh) if fresh else {"photoUrl": "", "hasCustomAvatar": False}
+    return web.json_response({"ok": True, "photoUrl": pub.get("photoUrl", ""), "hasCustomAvatar": False})
 
 
 async def api_user_sync(request: web.Request) -> web.Response:
@@ -2269,8 +2514,8 @@ async def api_ping(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "service": "apathy-tg-audio-v29",
-            "version": "v29",
+            "service": "apathy-tg-audio-v30",
+            "version": "v30",
             "bot": BOT_USERNAME_CACHE,
             "siteUrl": SITE_URL,
             "tracksCount": total,
@@ -2529,13 +2774,13 @@ async def main():
 
     me = await bot.get_me()
     BOT_USERNAME_CACHE = f"@{me.username}" if me.username else str(me.id)
-    log.info("APATHY v29 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s", BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG)
+    log.info("APATHY v30 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s", BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG)
 
     connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=300)
     http_session = aiohttp.ClientSession(connector=connector)
     HTTP_SESSION_REF = http_session
 
-    app = web.Application(middlewares=[cors_middleware])
+    app = web.Application(middlewares=[cors_middleware], client_max_size=3 * 1024 * 1024)
     app["bot"] = bot
     app["http_session"] = http_session
 
@@ -2546,6 +2791,9 @@ async def main():
     app.router.add_get("/api/user/me", api_user_me)
     app.router.add_post("/api/user/sync", api_user_sync)
     app.router.add_post("/api/user/logout", api_user_logout)
+    app.router.add_get("/api/user/avatar/{tg_id}", api_user_avatar_get)
+    app.router.add_post("/api/user/avatar", api_user_avatar_upload)
+    app.router.add_delete("/api/user/avatar", api_user_avatar_delete)
     app.router.add_get("/api/tg/ping", api_ping)
     app.router.add_get("/api/tg/library", api_library)
     app.router.add_get("/api/tg/search", api_search)

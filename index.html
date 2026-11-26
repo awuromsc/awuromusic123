@@ -15,7 +15,7 @@
   
   <link rel="preconnect" href="https://bot-1795701331-3932-awuro.bothost.tech" crossorigin />
   <link rel="dns-prefetch" href="https://lrclib.net" />
-  <link rel="stylesheet" href="./style.css?v=29" />
+  <link rel="stylesheet" href="./style.css?v=30" />
 </head>
 <body>
   <div class="app-shell">
@@ -158,17 +158,11 @@
           </div>
 
           <div class="lib-actions">
-            <button class="min-btn primary" id="openImportBtn">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-              </svg>
-              <span>Перенести треки</span>
-            </button>
             <button class="min-btn" id="uploadAudioBtn">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
               </svg>
-              <span>Свой MP3 / M4A</span>
+              <span>Загрузить свой MP3 / M4A</span>
             </button>
             <input type="file" id="audioFileInput" accept="audio/*,.mp3,.m4a,.wav,.ogg" multiple hidden />
           </div>
@@ -196,7 +190,6 @@
             <button class="chip-btn active" data-filter="all">Все треки</button>
             <button class="chip-btn" data-filter="liked">Избранное</button>
             <button class="chip-btn" data-filter="telegram">Из Telegram</button>
-            <button class="chip-btn" data-filter="imported">С площадок</button>
             <button class="chip-btn" data-filter="local">Мои файлы</button>
           </div>
 
@@ -248,7 +241,15 @@
 
             <div id="userBox" style="display:none;">
               <div class="profile-head">
-                <div class="profile-avatar-lg chrome-text" id="profileAvatarLg">AP</div>
+                <button type="button" class="avatar-edit-btn" id="avatarUploadBtn" title="Сменить фото профиля" aria-label="Сменить фото профиля">
+                  <div class="profile-avatar-lg chrome-text" id="profileAvatarLg">AP</div>
+                  <span class="avatar-cam-badge">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>
+                    </svg>
+                  </span>
+                </button>
+                <input type="file" id="avatarFileInput" accept="image/*" hidden />
                 <div style="min-width:0;flex:1;">
                   <div style="font-size:16px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" id="profileDisplayName">Пользователь</div>
                   <div style="font-size:11.5px;color:var(--text-dim);margin-top:1px;" id="profileUsername">@user</div>
@@ -257,6 +258,10 @@
                     <span id="syncStatusText">Синхронизировано с Telegram</span>
                   </div>
                 </div>
+              </div>
+              <div class="avatar-actions-row">
+                <button type="button" class="min-btn" id="changeAvatarTextBtn" style="padding:6px 11px;font-size:11px;">Сменить фото</button>
+                <button type="button" class="min-btn" id="resetAvatarBtn" style="padding:6px 11px;font-size:11px;display:none;">Вернуть из Telegram</button>
               </div>
               <div class="stats-grid">
                 <div class="stat-box">
@@ -445,6 +450,18 @@
               </svg>
             </button>
           </div>
+
+          <div class="volume-row">
+            <button type="button" class="volume-btn" id="btnMuteToggle" aria-label="Звук" title="Выключить / включить звук">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" id="volumeIcon">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+              </svg>
+            </button>
+            <input type="range" class="scrubber volume-slider" id="volumeSlider" min="0" max="100" step="1" value="100" aria-label="Громкость" />
+            <span class="volume-pct" id="volumePct">100%</span>
+          </div>
         </div>
 
         <aside class="player-right">
@@ -483,6 +500,11 @@
           </div>
         </div>
 
+        <div class="pl-auth-hint" id="plAuthHint">
+          <span>Войдите через Telegram, чтобы треки сохранялись в ваш личный аккаунт</span>
+          <button type="button" class="min-btn primary" id="plGoLoginBtn" style="padding:5px 10px;font-size:10.5px;flex-shrink:0;">Войти</button>
+        </div>
+
         <div class="pl-create-row">
           <input class="field-input" id="newPlNameInput" type="text" placeholder="Название нового плейлиста..." style="height:40px;font-size:13px;" />
           <button class="min-btn primary" id="createPlBtn" style="padding:0 14px;height:40px;flex-shrink:0;">Создать</button>
@@ -492,49 +514,9 @@
       </div>
     </div>
 
-    <!-- ================= IMPORT TRACKS MODAL ================= -->
-    <div class="modal-backdrop" id="importModal">
-      <div class="modal-sheet">
-        <div class="sheet-handle"></div>
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-          <div style="font-size:16px;font-weight:600;letter-spacing:0.04em;">Перенос треков</div>
-          <button class="min-icon-btn" id="closeImportBtn" aria-label="Закрыть">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
-          </button>
-        </div>
-        <div style="font-size:12px;color:var(--text-dim);">
-          Выберите площадку и вставьте ссылку на плейлист или профиль (можно оставить пустой для быстрого переноса подборки)
-        </div>
-
-        <div class="platform-grid" id="platformGrid">
-          <button class="platform-btn selected" data-platform="yandex"><span class="platform-dot" style="background:#fc0;"></span>Яндекс Музыка</button>
-          <button class="platform-btn" data-platform="spotify"><span class="platform-dot" style="background:#1ed760;"></span>Spotify</button>
-          <button class="platform-btn" data-platform="apple"><span class="platform-dot" style="background:#fa243c;"></span>Apple Music</button>
-          <button class="platform-btn" data-platform="vk"><span class="platform-dot" style="background:#4c75a3;"></span>VK Музыка</button>
-          <button class="platform-btn" data-platform="soundcloud" style="grid-column:span 2;"><span class="platform-dot" style="background:#ff5500;"></span>SoundCloud</button>
-        </div>
-
-        <div class="field-group">
-          <label class="field-label" for="importLinkInput">Ссылка на плейлист / аккаунт</label>
-          <input class="field-input" id="importLinkInput" type="text" placeholder="https://music.yandex.ru/users/..." />
-        </div>
-
-        <div class="import-progress-wrap" id="importProgressWrap">
-          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);">
-            <span id="importStatusText">Синхронизация треков...</span>
-            <span id="importPercent">0%</span>
-          </div>
-          <div class="import-bar-bg"><div class="import-bar-fill" id="importBarFill"></div></div>
-        </div>
-
-        <button class="min-btn primary" id="startImportBtn" style="width:100%;margin-top:6px;">
-          Начать перенос в APATHY
-        </button>
-      </div>
-    </div>
   </div>
 
   <script src="https://telegram.org/js/telegram-web-app.js" async></script>
-  <script src="./app.js?v=29"></script>
+  <script src="./app.js?v=30"></script>
 </body>
 </html>
