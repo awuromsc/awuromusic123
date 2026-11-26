@@ -41,7 +41,12 @@
         volume: Math.max(0, Math.min(1, Number(store.get('volume', 1)))),
         prevVolume: 1,
         lyricsExpanded: false,
-        modalTrack: null
+        modalTrack: null,
+        offlineIds: new Set(),
+        offlineDownloadingIds: new Set(),
+        offlineBytes: 0,
+        offlineMode: Boolean(store.get('offlineMode', false)),
+        autoOfflineCache: store.get('autoOfflineCache', true) !== false
       };
 
       savedCatalogTracks.forEach(t => {
@@ -352,6 +357,11 @@
       async function fetchSyncedLyricsForTrack(track, ytSubtitles = []) {
         if (!track) return;
         if (track.lyrics && track.lyrics.length > 0 && !track.lyricsIsPlaceholder) return;
+        if (isOfflineEffective()) {
+          $('lyricsSourceTag').textContent = 'OFFLINE';
+          lyricsScroll.innerHTML = `<div class="lyric-line active">${escapeHtml(track.title)}</div><div class="lyric-line">${escapeHtml(track.artist)}</div><div class="lyric-line" style="opacity:0.65;">Оффлайн-режим</div>`;
+          return;
+        }
 
         $('lyricsSourceTag').textContent = 'ПОИСК...';
         lyricsScroll.innerHTML = `<div class="lyric-line active" style="opacity:0.65;">Ищем синхронизированный текст...</div>`;
@@ -389,6 +399,7 @@
           if (parsed.length) {
             track.lyrics = parsed;
             track.lyricsIsPlaceholder = false;
+            saveOfflineLyrics(track.id, parsed);
             if (state.currentTrack && state.currentTrack.id === track.id) {
               $('lyricsSourceTag').textContent = 'LRCLIB SYNC';
               renderLyrics(track);
@@ -405,6 +416,7 @@
             const step = totalSpan / rows.length;
             track.lyrics = rows.map((text, idx) => ({ t: idx * step + 2, text }));
             track.lyricsIsPlaceholder = false;
+            saveOfflineLyrics(track.id, track.lyrics);
             if (state.currentTrack && state.currentTrack.id === track.id) {
               $('lyricsSourceTag').textContent = 'AUTO SYNC';
               renderLyrics(track);
@@ -426,6 +438,378 @@
           renderLyrics(track);
           syncTimeAndLyrics(true);
         }
+      }
+
+      // ================= OFFLINE AUDIO ENGINE (INDEXEDDB + SERVICE WORKER v32) =================
+      const OFFLINE_DB_NAME = 'apathy_offline_v1';
+      const OFFLINE_STORE = 'tracks';
+      const MAX_AUTO_OFFLINE_TRACKS = 60;
+      let offlineDbPromise = null;
+      let activeOfflineBlobUrl = '';
+      let autoCacheTimer = null;
+
+      function isOfflineEffective() {
+        return Boolean(state.offlineMode || (typeof navigator !== 'undefined' && navigator.onLine === false));
+      }
+
+      function registerServiceWorker() {
+        if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+          navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => {});
+        }
+      }
+
+      function openOfflineDb() {
+        if (offlineDbPromise) return offlineDbPromise;
+        if (typeof indexedDB === 'undefined') return Promise.resolve(null);
+        offlineDbPromise = new Promise((resolve) => {
+          try {
+            const req = indexedDB.open(OFFLINE_DB_NAME, 1);
+            req.onupgradeneeded = (ev) => {
+              const db = ev.target.result;
+              if (!db.objectStoreNames.contains(OFFLINE_STORE)) {
+                const st = db.createObjectStore(OFFLINE_STORE, { keyPath: 'id' });
+                st.createIndex('savedAt', 'savedAt', { unique: false });
+              }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => resolve(null);
+          } catch (e) {
+            resolve(null);
+          }
+        });
+        return offlineDbPromise;
+      }
+
+      async function idbGetRecord(id) {
+        const db = await openOfflineDb();
+        if (!db) return null;
+        return await new Promise((resolve) => {
+          try {
+            const tx = db.transaction(OFFLINE_STORE, 'readonly');
+            const req = tx.objectStore(OFFLINE_STORE).get(String(id));
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => resolve(null);
+          } catch (e) { resolve(null); }
+        });
+      }
+
+      async function idbPutRecord(record) {
+        const db = await openOfflineDb();
+        if (!db) return false;
+        return await new Promise((resolve) => {
+          try {
+            const tx = db.transaction(OFFLINE_STORE, 'readwrite');
+            tx.objectStore(OFFLINE_STORE).put(record);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+          } catch (e) { resolve(false); }
+        });
+      }
+
+      async function idbDeleteRecord(id) {
+        const db = await openOfflineDb();
+        if (!db) return false;
+        return await new Promise((resolve) => {
+          try {
+            const tx = db.transaction(OFFLINE_STORE, 'readwrite');
+            tx.objectStore(OFFLINE_STORE).delete(String(id));
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+          } catch (e) { resolve(false); }
+        });
+      }
+
+      async function idbClearAll() {
+        const db = await openOfflineDb();
+        if (!db) return false;
+        return await new Promise((resolve) => {
+          try {
+            const tx = db.transaction(OFFLINE_STORE, 'readwrite');
+            tx.objectStore(OFFLINE_STORE).clear();
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+          } catch (e) { resolve(false); }
+        });
+      }
+
+      async function idbScanMeta() {
+        const db = await openOfflineDb();
+        if (!db) return [];
+        return await new Promise((resolve) => {
+          const items = [];
+          try {
+            const tx = db.transaction(OFFLINE_STORE, 'readonly');
+            const req = tx.objectStore(OFFLINE_STORE).openCursor();
+            req.onsuccess = (ev) => {
+              const cur = ev.target.result;
+              if (cur) {
+                const v = cur.value || {};
+                items.push({
+                  id: String(v.id || ''),
+                  size: Number(v.size || (v.blob && v.blob.size) || 0),
+                  pinned: !!v.pinned,
+                  savedAt: Number(v.savedAt || 0),
+                  meta: v.meta || null,
+                  hasLyrics: Array.isArray(v.lyrics) && v.lyrics.length > 0
+                });
+                cur.continue();
+              } else {
+                resolve(items);
+              }
+            };
+            req.onerror = () => resolve(items);
+          } catch (e) { resolve(items); }
+        });
+      }
+
+      function serializeTrackForOffline(track) {
+        return {
+          id: String(track.id),
+          tgTrackId: track.tgTrackId || '',
+          tgStreamUrl: track.tgStreamUrl || '',
+          title: track.title || 'Без названия',
+          artist: track.artist || 'Исполнитель',
+          album: track.album || 'Оффлайн',
+          duration: Number(track.duration || 180) || 180,
+          artwork: track.artwork || '',
+          coverGrad: track.coverGrad || 'linear-gradient(145deg, #163b5c 0%, #070c14 60%, #2468a3 100%)',
+          source: track.isLocal ? 'Файл' : (track.source || 'Telegram'),
+          inTelegram: !!track.inTelegram,
+          isLocal: !!track.isLocal,
+          fromTelegramBot: !!track.fromTelegramBot,
+          fromCatalog: !!track.fromCatalog
+        };
+      }
+
+      function fmtBytesMb(bytes) {
+        const mb = (Number(bytes || 0)) / (1024 * 1024);
+        return (mb < 10 ? mb.toFixed(1) : Math.round(mb)) + ' МБ';
+      }
+
+      function updateOfflineUI() {
+        const cnt = state.offlineIds.size;
+        const chip = $('offlineFilterChip');
+        if (chip) chip.textContent = `Оффлайн (${cnt})`;
+
+        const summary = $('offlineStorageSummary');
+        if (summary) summary.textContent = `Сохранено: ${cnt} трек. · ${fmtBytesMb(state.offlineBytes)}`;
+
+        const modeBtn = $('offlineModeToggleBtn');
+        if (modeBtn) {
+          modeBtn.classList.toggle('on', !!state.offlineMode);
+          modeBtn.textContent = state.offlineMode ? 'Вкл' : 'Выкл';
+        }
+
+        const autoBtn = $('autoOfflineToggleBtn');
+        if (autoBtn) {
+          autoBtn.classList.toggle('on', !!state.autoOfflineCache);
+          autoBtn.textContent = state.autoOfflineCache ? 'Вкл' : 'Выкл';
+        }
+
+        const banner = $('offlineBanner');
+        const bText = $('offlineBannerText');
+        const offlineNow = isOfflineEffective();
+        if (banner) banner.classList.toggle('show', offlineNow);
+        if (bText && offlineNow) {
+          const reason = (typeof navigator !== 'undefined' && navigator.onLine === false)
+            ? 'Нет интернета'
+            : 'Оффлайн-режим';
+          bText.textContent = `${reason} · Доступно ${cnt} трек.`;
+        }
+
+        updatePlayerOfflineBtn();
+      }
+
+      function updatePlayerOfflineBtn() {
+        const btn = $('playerOfflineBtn');
+        const track = state.currentTrack;
+        if (!btn) return;
+        if (!track) {
+          btn.classList.remove('offline-saved', 'offline-busy');
+          return;
+        }
+        const saved = state.offlineIds.has(track.id);
+        const busy = state.offlineDownloadingIds.has(track.id);
+        btn.classList.toggle('offline-saved', saved && !busy);
+        btn.classList.toggle('offline-busy', busy);
+        btn.title = saved ? 'Сохранён оффлайн (нажмите, чтобы удалить)' : 'Сохранить для оффлайн-прослушивания';
+        btn.innerHTML = busy
+          ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`
+          : (saved
+            ? `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="8.5 12.5 11 15 16 9.5"/></svg>`
+            : `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`);
+      }
+
+      async function pruneUnpinnedOfflineCache() {
+        const items = await idbScanMeta();
+        const unpinned = items.filter(it => !it.pinned).sort((a, b) => b.savedAt - a.savedAt);
+        if (unpinned.length <= MAX_AUTO_OFFLINE_TRACKS) return;
+        for (const oldItem of unpinned.slice(MAX_AUTO_OFFLINE_TRACKS)) {
+          await idbDeleteRecord(oldItem.id);
+          state.offlineIds.delete(oldItem.id);
+          state.offlineBytes = Math.max(0, state.offlineBytes - (oldItem.size || 0));
+        }
+      }
+
+      async function initOfflineStorage() {
+        registerServiceWorker();
+        const items = await idbScanMeta();
+        state.offlineIds = new Set();
+        state.offlineBytes = 0;
+
+        items.sort((a, b) => b.savedAt - a.savedAt);
+        for (const it of items) {
+          if (!it.id) continue;
+          state.offlineIds.add(it.id);
+          state.offlineBytes += (it.size || 0);
+          // Restore tracks stored in IndexedDB into libraryTracks so they're visible offline immediately
+          if (it.meta && !state.libraryTracks.some(x => x && x.id === it.id)) {
+            state.libraryTracks.push({
+              ...it.meta,
+              lyrics: null
+            });
+          }
+        }
+        updateOfflineUI();
+        renderLibrary();
+        renderSearchResultsList();
+      }
+
+      async function saveOfflineLyrics(trackId, lyrics) {
+        if (!trackId || !Array.isArray(lyrics) || !lyrics.length || !state.offlineIds.has(trackId)) return;
+        const rec = await idbGetRecord(trackId);
+        if (!rec) return;
+        rec.lyrics = lyrics;
+        await idbPutRecord(rec);
+      }
+
+      async function saveBlobOffline(track, blob, pinned = true) {
+        if (!track || !track.id || !blob || blob.size < 4096) return false;
+        const prev = await idbGetRecord(track.id);
+        const prevSize = prev ? Number(prev.size || 0) : 0;
+        const ok = await idbPutRecord({
+          id: String(track.id),
+          blob,
+          mime: blob.type || 'audio/mpeg',
+          size: blob.size,
+          meta: serializeTrackForOffline(track),
+          lyrics: (Array.isArray(track.lyrics) && !track.lyricsIsPlaceholder) ? track.lyrics : (prev && prev.lyrics ? prev.lyrics : null),
+          pinned: Boolean(pinned || (prev && prev.pinned)),
+          savedAt: Date.now()
+        });
+        if (!ok) return false;
+        state.offlineIds.add(track.id);
+        state.offlineBytes = Math.max(0, state.offlineBytes - prevSize) + blob.size;
+        if (!pinned) pruneUnpinnedOfflineCache();
+        ensureTrackInLibrary(track);
+        updateOfflineUI();
+        renderLibrary();
+        renderSearchResultsList();
+        return true;
+      }
+
+      async function cacheTrackOffline(track, { silent = false, pinned = true } = {}) {
+        if (!track || !track.id) return false;
+        if (state.offlineIds.has(track.id)) {
+          if (pinned) {
+            const rec = await idbGetRecord(track.id);
+            if (rec && !rec.pinned) {
+              rec.pinned = true;
+              await idbPutRecord(rec);
+            }
+          }
+          if (!silent) showToast('Трек уже сохранён для оффлайн-прослушивания');
+          return true;
+        }
+        if (state.offlineDownloadingIds.has(track.id)) return false;
+        if (isOfflineEffective()) {
+          if (!silent) showToast('Нет подключения к сети для скачивания трека');
+          return false;
+        }
+
+        let streamUrl = track.tgStreamUrl || (track.tgTrackId ? tgApiUrl(`/api/tg/stream/${encodeURIComponent(track.tgTrackId)}`) : '');
+        if (!streamUrl && track.audioUrl) streamUrl = track.audioUrl;
+        if (!streamUrl) {
+          if (!silent) showToast('У трека нет аудиопотока для сохранения');
+          return false;
+        }
+
+        state.offlineDownloadingIds.add(track.id);
+        updatePlayerOfflineBtn();
+        renderSearchResultsList();
+        renderLibrary();
+
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 45000);
+          const resp = await fetch(streamUrl, { signal: ctrl.signal, mode: 'cors' });
+          clearTimeout(timer);
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const blob = await resp.blob();
+          if (!blob || blob.size < 10000) throw new Error('empty_audio');
+
+          const saved = await saveBlobOffline(track, blob, pinned);
+          if (saved) {
+            // Also warm artwork cache via SW if present
+            if (track.artwork) fetch(track.artwork, { mode: 'no-cors' }).catch(() => {});
+            if (!silent) showToast(`Сохранено оффлайн: ${track.title} (${fmtBytesMb(blob.size)})`);
+            return true;
+          }
+        } catch (e) {
+          if (!silent) showToast('Не удалось сохранить трек оффлайн');
+        } finally {
+          state.offlineDownloadingIds.delete(track.id);
+          updatePlayerOfflineBtn();
+          renderSearchResultsList();
+          renderLibrary();
+        }
+        return false;
+      }
+
+      async function removeTrackOffline(track, silent = false) {
+        if (!track || !track.id || !state.offlineIds.has(track.id)) return;
+        const prev = await idbGetRecord(track.id);
+        const prevSize = prev ? Number(prev.size || 0) : 0;
+        await idbDeleteRecord(track.id);
+        state.offlineIds.delete(track.id);
+        state.offlineBytes = Math.max(0, state.offlineBytes - prevSize);
+        updateOfflineUI();
+        renderLibrary();
+        renderSearchResultsList();
+        if (!silent) showToast('Удалено из оффлайн-кэша');
+      }
+
+      async function toggleTrackOffline(track) {
+        if (!track) return;
+        if (state.offlineIds.has(track.id)) {
+          await removeTrackOffline(track, false);
+        } else {
+          await cacheTrackOffline(track, { silent: false, pinned: true });
+        }
+      }
+
+      function searchOfflineTracksLocal(query) {
+        const q = String(query || '').trim().toLowerCase().replace(/ё/g, 'е');
+        const pool = state.libraryTracks.filter(t => t && state.offlineIds.has(t.id));
+        if (!q) return pool;
+        const tokens = q.split(/\s+/).filter(Boolean);
+        return pool.filter(t => {
+          const hay = `${t.artist || ''} ${t.title || ''}`.toLowerCase().replace(/ё/g, 'е');
+          return tokens.every(tok => hay.includes(tok));
+        });
+      }
+
+      function scheduleAutoCacheCurrentTrack(track) {
+        clearTimeout(autoCacheTimer);
+        if (!track || !track.id || !state.autoOfflineCache || isOfflineEffective()) return;
+        if (state.offlineIds.has(track.id) || state.offlineDownloadingIds.has(track.id)) return;
+        if (!track.tgStreamUrl && !track.tgTrackId) return;
+        // Wait 1.6s after playback starts so buffering isn't slowed down
+        autoCacheTimer = setTimeout(() => {
+          if (state.currentTrack && state.currentTrack.id === track.id && !state.offlineIds.has(track.id)) {
+            cacheTrackOffline(track, { silent: true, pinned: false });
+          }
+        }, 1600);
       }
 
       // ================= LIVE SEARCH CONTROLLER (ONLY TELEGRAM BOT) =================
@@ -450,6 +834,18 @@
         viewSearch.classList.toggle('has-results', q.length > 0);
 
         const seq = ++searchSeq;
+
+        // Offline Mode: instant local search across all downloaded / auto-cached tracks!
+        if (isOfflineEffective()) {
+          searchLoader.classList.remove('show');
+          const localHits = searchOfflineTracksLocal(q);
+          renderSourcesLiveBar(['Оффлайн-кэш']);
+          $('searchResultTitle').textContent = q ? `Оффлайн поиск: «${q}»` : 'Загруженные оффлайн-треки';
+          state.searchResults = localHits;
+          renderSearchResultsList(false, true);
+          return;
+        }
+
         searchLoader.classList.add('show');
         $('searchLoaderText').textContent = q
           ? `Бот ищет «${q}»...`
@@ -471,9 +867,18 @@
         searchLoader.classList.remove('show');
 
         if (!res.ok) {
+          // Network/bot unreachable -> fall back cleanly to offline cached tracks if any!
+          const offlineFallback = searchOfflineTracksLocal(q);
+          if (offlineFallback.length) {
+            renderSourcesLiveBar(['Оффлайн-кэш']);
+            $('searchResultTitle').textContent = q ? `Оффлайн: «${q}»` : 'Доступно оффлайн';
+            state.searchResults = offlineFallback;
+            renderSearchResultsList(false, true);
+            return;
+          }
           state.searchResults = [];
           renderSourcesLiveBar([]);
-          renderSearchResultsList(true);
+          renderSearchResultsList(true, false);
           return;
         }
 
@@ -482,17 +887,21 @@
           ? `Найдено ботом: «${q}»`
           : (res.tracks.length ? 'Треки из Telegram-бота' : 'В боте пока нет треков');
         state.searchResults = res.tracks;
-        renderSearchResultsList(false);
+        renderSearchResultsList(false, false);
       }
 
-      function renderSearchResultsList(botOffline = false) {
+      function renderSearchResultsList(botOffline = false, offlineView = false) {
         $('searchCount').textContent = String(state.searchResults.length);
         searchTrackList.innerHTML = '';
         if (!state.searchResults.length) {
           const q = searchInput.value.trim();
           let msg = '';
-          if (botOffline) {
-            msg = 'Сервер бота <code>bot-1795701331-3932-awuro.bothost.tech</code> сейчас не отвечает.<br/>Проверьте, что бот запущен в панели Bothost и домен включён (порт 8080).';
+          if (offlineView) {
+            msg = q
+              ? `Среди оффлайн-треков нет «${escapeHtml(q)}».`
+              : 'В оффлайн-кэше пока нет треков.<br/>Включите музыку с интернетом или нажмите <b>⬇</b> на треках, чтобы слушать их без сети.';
+          } else if (botOffline) {
+            msg = 'Сервер бота <code>bot-1795701331-3932-awuro.bothost.tech</code> сейчас не отвечает.<br/>Если нет интернета — откройте вкладку <b>Ваши треки → Оффлайн</b>.';
           } else if (q) {
             msg = `Бот не нашёл «${escapeHtml(q)}». Попробуйте другое название или перешлите трек прямо в Telegram-бота.`;
           } else {
@@ -504,7 +913,7 @@
         state.searchResults.forEach(t => searchTrackList.appendChild(buildTrackRow(t, 'search')));
       }
 
-      // ================= AUDIO ENGINE (TELEGRAM BOT STREAMING + iOS SAFARI UNLOCK) =================
+            // ================= AUDIO ENGINE (TELEGRAM BOT STREAMING + iOS SAFARI UNLOCK) =================
       const SILENT_WAV_URI = (() => {
         try {
           const bytes = new Uint8Array([
@@ -723,6 +1132,7 @@
           clearStreamWatchdog();
           if (ev === 'playing' && state.currentTrack) {
             updatePlayerUI();
+            scheduleAutoCacheCurrentTrack(state.currentTrack);
           }
         });
       });
@@ -900,8 +1310,10 @@
         const isLiked = state.likedIds.has(track.id);
         const inPl = isTrackInAnyPlaylist(track.id);
 
-        let badgeLabel = track.inTelegram ? 'Telegram' : (track.source || 'Бот');
-        let badgeClass = (track.fromTelegramBot || track.fromCatalog) ? 'tg-tag' : '';
+        const isOfflineSaved = state.offlineIds.has(track.id);
+        const isOfflineBusy = state.offlineDownloadingIds.has(track.id);
+        let badgeLabel = isOfflineSaved ? 'Оффлайн' : (track.inTelegram ? 'Telegram' : (track.source || 'Бот'));
+        let badgeClass = isOfflineSaved ? 'offline-tag' : ((track.fromTelegramBot || track.fromCatalog) ? 'tg-tag' : '');
 
         const div = document.createElement('div');
         div.className = 'track-item' + (isCurrent ? ' playing' : '') + (isCurrent && state.isPlaying ? ' is-running' : '');
@@ -926,6 +1338,14 @@
           </div>
           <div class="track-right">
             <span class="track-dur">${fmtTime(track.duration)}</span>
+            <button class="min-icon-btn ${isOfflineSaved ? 'offline-saved' : ''} ${isOfflineBusy ? 'offline-busy' : ''}" data-offline="${escapeHtml(track.id)}" title="${isOfflineSaved ? 'Сохранён оффлайн (нажмите, чтобы удалить)' : 'Сохранить оффлайн'}" aria-label="Оффлайн">
+              ${isOfflineBusy
+                ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`
+                : (isOfflineSaved
+                  ? `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="8.5 12.5 11 15 16 9.5"/></svg>`
+                  : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`)
+              }
+            </button>
             ${showRemoveFromPl
               ? `<button class="min-icon-btn" data-remove-pl="${escapeHtml(track.id)}" title="Убрать из плейлиста" aria-label="Убрать из плейлиста">
                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><line x1="5" y1="12" x2="19" y2="12"/></svg>
@@ -948,6 +1368,7 @@
         const rowImg = div.querySelector('.track-art img');
         if (rowImg) rowImg.addEventListener('error', () => rowImg.remove());
         div.addEventListener('click', (e) => {
+          if (e.target.closest('[data-offline]')) { e.stopPropagation(); toggleTrackOffline(track); return; }
           if (e.target.closest('[data-add-pl]')) { e.stopPropagation(); openPlaylistModal(track); return; }
           if (e.target.closest('[data-remove-pl]')) { e.stopPropagation(); removeTrackFromPlaylist(state.selectedPlaylistId, track.id); return; }
           if (e.target.closest('[data-like]')) { e.stopPropagation(); toggleLike(track); return; }
@@ -966,6 +1387,7 @@
           return pl.trackIds.map(id => state.libraryTracks.find(t => t.id === id)).filter(Boolean);
         }
         return state.libraryTracks.filter(t => {
+          if (state.libFilter === 'offline') return state.offlineIds.has(t.id);
           if (state.libFilter === 'liked') return state.likedIds.has(t.id);
           if (state.libFilter === 'telegram') return !!(t.fromTelegramBot || t.fromCatalog);
           if (state.libFilter === 'local') return !!t.isLocal;
@@ -1160,6 +1582,30 @@
         playTrack(list[0], true);
       });
 
+      $('downloadActivePlBtn').addEventListener('click', async () => {
+        if (isOfflineEffective()) {
+          showToast('Для скачивания плейлиста нужен интернет');
+          return;
+        }
+        const list = getVisibleLibraryTracks();
+        const toDl = list.filter(t => t && !state.offlineIds.has(t.id));
+        if (!toDl.length) {
+          showToast('Все треки этого плейлиста уже доступны оффлайн');
+          return;
+        }
+        const btn = $('downloadActivePlBtn');
+        btn.disabled = true;
+        let done = 0;
+        for (let i = 0; i < toDl.length; i++) {
+          btn.textContent = `${i + 1}/${toDl.length}`;
+          const ok = await cacheTrackOffline(toDl[i], { silent: true, pinned: true });
+          if (ok) done++;
+        }
+        btn.disabled = false;
+        btn.textContent = '⬇ Оффлайн';
+        showToast(`Сохранено оффлайн: ${done} из ${toDl.length} трек.`);
+      });
+
       $('deleteActivePlBtn').addEventListener('click', () => {
         if (!state.selectedPlaylistId) return;
         const pl = state.playlists.find(p => p.id === state.selectedPlaylistId);
@@ -1196,70 +1642,109 @@
 
         if (!isSame) {
           retryCountForTrack = 0;
+          clearTimeout(autoCacheTimer);
           clearStreamWatchdog();
           state.currentTime = 0;
           state.lyricsOffset = 0;
           stopSynthLoop();
           htmlAudio.pause();
+          track._playingOffline = false;
 
-          // Local uploaded file
-          if (track.audioUrl) {
-            currentAudioMode = 'stream';
-            applyAudioVolume(state.volume, false);
-            htmlAudio.src = track.audioUrl;
-            try { htmlAudio.currentTime = 0; } catch (e) {}
-            htmlAudio.play().catch(() => showToast('Нажмите Play для запуска звука'));
-          } else if (track.synth && !track.fromTelegramBot && !track.fromCatalog) {
-            currentAudioMode = 'synth';
-            state.isPlaying = true;
-            startSynthLoop(track);
-          } else {
-            // ONLY Telegram Bot stream!
-            let streamUrl = track.tgStreamUrl || (track.tgTrackId ? tgApiUrl(`/api/tg/stream/${encodeURIComponent(track.tgTrackId)}`) : '');
-            if (streamUrl) {
+          if (activeOfflineBlobUrl) {
+            try { URL.revokeObjectURL(activeOfflineBlobUrl); } catch (e) {}
+            activeOfflineBlobUrl = '';
+          }
+
+          // 1) Check IndexedDB Offline Cache FIRST -> instant 0ms playback even in Airplane Mode!
+          let playedFromOffline = false;
+          if (state.offlineIds.has(track.id)) {
+            const offRec = await idbGetRecord(track.id);
+            if (mySeq !== playSeq) return;
+            if (offRec && offRec.blob) {
+              if (Array.isArray(offRec.lyrics) && offRec.lyrics.length && (!track.lyrics || track.lyricsIsPlaceholder)) {
+                track.lyrics = offRec.lyrics;
+                track.lyricsIsPlaceholder = false;
+              }
+              activeOfflineBlobUrl = URL.createObjectURL(offRec.blob);
+              track._playingOffline = true;
               currentAudioMode = 'stream';
               applyAudioVolume(state.volume, false);
-              htmlAudio.src = streamUrl;
+              htmlAudio.src = activeOfflineBlobUrl;
               try { htmlAudio.currentTime = 0; } catch (e) {}
-              armStreamWatchdog(track.id, 12000);
               const p = htmlAudio.play();
               if (p && typeof p.catch === 'function') {
-                p.catch(() => showToast('Нажмите кнопку Play ещё раз для старта звука'));
+                p.catch(() => showToast('Нажмите Play для запуска звука'));
               }
+              playedFromOffline = true;
             } else {
-              // Legacy track saved before v23 -> resolve strictly via Telegram Bot /api/tg/resolve
-              try {
-                htmlAudio.src = SILENT_WAV_URI;
-                htmlAudio.play().catch(() => {});
-              } catch (e) {}
+              state.offlineIds.delete(track.id);
+              updateOfflineUI();
+            }
+          }
 
+          if (!playedFromOffline) {
+            if (track.audioUrl) {
+              currentAudioMode = 'stream';
+              applyAudioVolume(state.volume, false);
+              htmlAudio.src = track.audioUrl;
+              try { htmlAudio.currentTime = 0; } catch (e) {}
+              htmlAudio.play().catch(() => showToast('Нажмите Play для запуска звука'));
+            } else if (track.synth && !track.fromTelegramBot && !track.fromCatalog) {
+              currentAudioMode = 'synth';
               state.isPlaying = true;
-              lastTickTime = performance.now();
+              startSynthLoop(track);
+            } else if (isOfflineEffective()) {
+              state.isPlaying = false;
               updatePlayerUI();
-              if (openFullscreen) openPlayerOverlay();
-              $('playerArtist').innerHTML = `<span class="stream-loading-dot"></span>Загрузка через Telegram-бота...`;
-
-              const params = new URLSearchParams({ artist: track.artist || '', title: track.title || '' });
-              const res = await fetchJsonTimeout(`${tgApiUrl('/api/tg/resolve')}?${params.toString()}`, 10000);
-              if (mySeq !== playSeq) return;
-
-              if (res && res.ok && res.streamUrl) {
-                const fullUrl = res.streamUrl.startsWith('http') ? res.streamUrl : tgApiUrl(res.streamUrl);
-                track.tgStreamUrl = fullUrl;
-                if (res.id) track.tgTrackId = String(res.id);
-                if (res.duration > 0) track.duration = res.duration;
+              showToast('Нет интернета — этот трек не загружен в оффлайн-кэш');
+              return;
+            } else {
+              // Online streaming strictly via Telegram Bot
+              let streamUrl = track.tgStreamUrl || (track.tgTrackId ? tgApiUrl(`/api/tg/stream/${encodeURIComponent(track.tgTrackId)}`) : '');
+              if (streamUrl) {
                 currentAudioMode = 'stream';
                 applyAudioVolume(state.volume, false);
-                htmlAudio.src = fullUrl;
+                htmlAudio.src = streamUrl;
                 try { htmlAudio.currentTime = 0; } catch (e) {}
                 armStreamWatchdog(track.id, 12000);
-                htmlAudio.play().catch(() => showToast('Нажмите Play для запуска звука'));
+                const p = htmlAudio.play();
+                if (p && typeof p.catch === 'function') {
+                  p.catch(() => showToast('Нажмите кнопку Play ещё раз для старта звука'));
+                }
               } else {
-                state.isPlaying = false;
-                htmlAudio.pause();
+                try {
+                  htmlAudio.src = SILENT_WAV_URI;
+                  htmlAudio.play().catch(() => {});
+                } catch (e) {}
+
+                state.isPlaying = true;
+                lastTickTime = performance.now();
                 updatePlayerUI();
-                showToast('Бот не смог найти аудио для этого трека');
-                return;
+                if (openFullscreen) openPlayerOverlay();
+                $('playerArtist').innerHTML = `<span class="stream-loading-dot"></span>Загрузка через Telegram-бота...`;
+
+                const params = new URLSearchParams({ artist: track.artist || '', title: track.title || '' });
+                const res = await fetchJsonTimeout(`${tgApiUrl('/api/tg/resolve')}?${params.toString()}`, 10000);
+                if (mySeq !== playSeq) return;
+
+                if (res && res.ok && res.streamUrl) {
+                  const fullUrl = res.streamUrl.startsWith('http') ? res.streamUrl : tgApiUrl(res.streamUrl);
+                  track.tgStreamUrl = fullUrl;
+                  if (res.id) track.tgTrackId = String(res.id);
+                  if (res.duration > 0) track.duration = res.duration;
+                  currentAudioMode = 'stream';
+                  applyAudioVolume(state.volume, false);
+                  htmlAudio.src = fullUrl;
+                  try { htmlAudio.currentTime = 0; } catch (e) {}
+                  armStreamWatchdog(track.id, 12000);
+                  htmlAudio.play().catch(() => showToast('Нажмите Play для запуска звука'));
+                } else {
+                  state.isPlaying = false;
+                  htmlAudio.pause();
+                  updatePlayerUI();
+                  showToast('Бот не смог найти аудио для этого трека');
+                  return;
+                }
               }
             }
           }
@@ -1422,7 +1907,7 @@
         }
         cover.classList.toggle('beating', state.isPlaying);
 
-        const activeSource = track.isLocal ? 'Файл' : (track.inTelegram ? 'Telegram Бот' : (track.source || 'Telegram Бот'));
+        const activeSource = track._playingOffline ? 'Оффлайн' : (track.isLocal ? 'Файл' : (track.inTelegram ? 'Telegram Бот' : (track.source || 'Telegram Бот')));
         $('playerTitle').textContent = track.title;
         $('playerArtist').textContent = `${track.artist} · ${activeSource}`;
         $('totTime').textContent = fmtTime(track.duration);
@@ -1435,6 +1920,7 @@
         $('miniPlayIcon').innerHTML = state.isPlaying ? pauseSvg : playSvg;
         updatePlayerLikeUI();
         updatePlayerPlaylistBtn();
+        updatePlayerOfflineBtn();
       }
 
       let lastActiveLyricIdx = -1;
@@ -2129,6 +2615,7 @@
             }
           });
           state.libraryTracks.unshift(track);
+          saveBlobOffline(track, file, true);
         });
         e.target.value = '';
         renderLibrary(); renderProfile();
@@ -2175,6 +2662,55 @@
         showToast('Список треков из Telegram-бота обновлён');
       });
 
+      $('offlineModeToggleBtn').addEventListener('click', () => {
+        state.offlineMode = !state.offlineMode;
+        store.set('offlineMode', state.offlineMode);
+        updateOfflineUI();
+        performSearch();
+        showToast(state.offlineMode ? 'Оффлайн-режим включён' : 'Оффлайн-режим выключен');
+      });
+
+      $('autoOfflineToggleBtn').addEventListener('click', () => {
+        state.autoOfflineCache = !state.autoOfflineCache;
+        store.set('autoOfflineCache', state.autoOfflineCache);
+        updateOfflineUI();
+        showToast(state.autoOfflineCache ? 'Прослушанные треки сохраняются для оффлайна' : 'Автосохранение для оффлайна выключено');
+      });
+
+      $('clearOfflineCacheBtn').addEventListener('click', async () => {
+        if (!state.offlineIds.size) { showToast('Оффлайн-кэш уже пуст'); return; }
+        await idbClearAll();
+        state.offlineIds.clear();
+        state.offlineBytes = 0;
+        updateOfflineUI();
+        renderLibrary();
+        renderSearchResultsList();
+        showToast('Оффлайн-кэш очищен');
+      });
+
+      $('offlineOpenLibBtn').addEventListener('click', () => {
+        state.selectedPlaylistId = null;
+        state.libFilter = 'offline';
+        $('libFilterChips').querySelectorAll('.chip-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === 'offline'));
+        switchTab('viewTracks');
+      });
+
+      window.addEventListener('offline', () => {
+        updateOfflineUI();
+        showToast(`Нет сети — включён оффлайн-режим (${state.offlineIds.size} трек.)`);
+        if (state.activeTab === 'viewSearch') performSearch();
+      });
+
+      window.addEventListener('online', () => {
+        updateOfflineUI();
+        if (!state.offlineMode) {
+          showToast('Соединение восстановлено');
+          checkTgBotStatus();
+          refreshCloudAccountState(false);
+          if (state.activeTab === 'viewSearch') performSearch();
+        }
+      });
+
       $('testSoundBtn').addEventListener('click', () => {
         unlockAudioForIos();
         playUnlockChime();
@@ -2211,6 +2747,7 @@
         $('btnRepeat').classList.toggle('toggled', state.repeat);
         showToast(state.repeat ? 'Повтор трека включён' : 'Повтор выключен');
       });
+      $('playerOfflineBtn').addEventListener('click', () => { if (state.currentTrack) toggleTrackOffline(state.currentTrack); });
       $('playerLikeBtn').addEventListener('click', () => { if (state.currentTrack) toggleLike(state.currentTrack); });
       $('playerAddPlBtn').addEventListener('click', () => { if (state.currentTrack) openPlaylistModal(state.currentTrack); });
       $('playerScrubber').addEventListener('input', (e) => seekTo(parseFloat(e.target.value)));
@@ -2258,7 +2795,12 @@
       initCrossSwipe();
       initPlayerLoopAndVisualizer();
       initTelegramMiniApp();
-      checkTgBotStatus();
-      initTelegramAuth();
-      performSearch();
+      initOfflineStorage().then(() => {
+        updateOfflineUI();
+        if (!isOfflineEffective()) {
+          checkTgBotStatus();
+          initTelegramAuth();
+        }
+        performSearch();
+      });
     })();
