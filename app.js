@@ -93,7 +93,7 @@
         likedIds: new Set(store.get('liked', [])),
         importedPlatforms: store.get('importedPlatforms', []),
         user: store.get('user', null),
-        usersDb: store.get('usersDb', {}),
+        tgToken: store.get('tgAuthToken', ''),
         theme: store.get('theme', 'chrome'),
         activeTab: 'viewSearch',
         libFilter: 'all',
@@ -105,7 +105,6 @@
         shuffle: false,
         repeat: false,
         selectedPlatform: 'yandex',
-        authMode: 'login',
         lyricsExpanded: false,
         modalTrack: null
       };
@@ -141,8 +140,9 @@
             fromCatalog: true
           }));
         store.set('savedCatalogTracks', toSave);
+        scheduleCloudSync();
       }
-      function persistPlaylists() { store.set('playlists', state.playlists); }
+      function persistPlaylists() { store.set('playlists', state.playlists); scheduleCloudSync(); }
 
       function ensureTrackInLibrary(track) {
         if (!track) return;
@@ -201,7 +201,7 @@
           btn.classList.toggle('active', btn.dataset.setTheme === themeKey);
         });
         store.set('theme', themeKey);
-        if (notify) showToast('Тема: ' + THEME_META[themeKey].label);
+        if (notify) { showToast('Тема: ' + THEME_META[themeKey].label); scheduleCloudSync(); }
       }
 
       // ================= TELEGRAM BOT ONLY ENGINE (v23) =================
@@ -1209,6 +1209,7 @@
         if (state.likedIds.has(track.id)) state.likedIds.delete(track.id);
         else { state.likedIds.add(track.id); showToast('Добавлено в избранное'); }
         store.set('liked', Array.from(state.likedIds));
+        scheduleCloudSync();
         renderSearchResultsList();
         renderLibrary();
         updatePlayerLikeUI();
@@ -1602,20 +1603,72 @@
         requestAnimationFrame(tick);
       }
 
-      // ================= PROFILE & AUTH =================
+      // ================= PROFILE, TELEGRAM ACCOUNT & CLOUD SYNC (v29) =================
+      let authPollTimer = null;
+      let syncDebounceTimer = null;
+      let isApplyingCloudState = false;
+
+      function setSyncStatus(text, isSyncing = false) {
+        const badge = $('syncStatusBadge');
+        const lbl = $('syncStatusText');
+        if (badge) badge.classList.toggle('syncing', !!isSyncing);
+        if (lbl) lbl.textContent = text;
+      }
+
+      function getSerializableSavedTracks() {
+        return state.libraryTracks
+          .filter(t => t && (t.fromTelegramBot || t.fromCatalog) && !t.isLocal)
+          .slice(0, 300)
+          .map(t => ({
+            id: t.id,
+            tgTrackId: t.tgTrackId || '',
+            tgStreamUrl: t.tgStreamUrl || '',
+            title: t.title || 'Без названия',
+            artist: t.artist || 'Исполнитель',
+            album: t.album || 'Telegram Бот',
+            duration: t.duration || 180,
+            artwork: t.artwork || '',
+            coverGrad: t.coverGrad || '',
+            source: t.source || 'Telegram',
+            inTelegram: !!t.inTelegram,
+            fromTelegramBot: true,
+            fromCatalog: true
+          }));
+      }
+
       function renderProfile() {
         const u = state.user;
-        if (u) {
+        if (u && u.tgId) {
           $('guestBox').style.display = 'none';
           $('userBox').style.display = 'block';
-          const ini = u.login.slice(0, 2).toUpperCase();
-          $('profileAvatarLg').textContent = ini;
-          $('profileUsername').textContent = '@' + u.login;
+          const displayName = [u.firstName, u.lastName].filter(Boolean).join(' ').trim() || (u.username ? '@' + u.username : 'Telegram');
+          const subHandle = u.username ? ('@' + u.username) : ('ID ' + u.tgId);
+          const ini = (displayName.replace(/[^A-Za-zА-Яа-яЁё0-9]/g, '').slice(0, 2) || 'TG').toUpperCase();
+
+          $('profileDisplayName').textContent = displayName;
+          $('profileUsername').textContent = subHandle;
+
+          const avLg = $('profileAvatarLg');
+          if (u.photoUrl) {
+            avLg.innerHTML = `<img src="${escapeHtml(u.photoUrl)}" alt="" />`;
+            const img = avLg.querySelector('img');
+            if (img) img.addEventListener('error', () => { avLg.textContent = ini; });
+          } else {
+            avLg.textContent = ini;
+          }
+
           $('statTracks').textContent = state.libraryTracks.length;
           $('statLiked').textContent = state.likedIds.size;
           $('statPlaylists').textContent = state.playlists.length;
+
           topProfileBtn.classList.add('logged-in');
-          topProfileBtn.textContent = ini;
+          if (u.photoUrl) {
+            topProfileBtn.innerHTML = `<img src="${escapeHtml(u.photoUrl)}" alt="" />`;
+            const tImg = topProfileBtn.querySelector('img');
+            if (tImg) tImg.addEventListener('error', () => { topProfileBtn.textContent = ini; });
+          } else {
+            topProfileBtn.textContent = ini;
+          }
         } else {
           $('guestBox').style.display = 'block';
           $('userBox').style.display = 'none';
@@ -1624,39 +1677,314 @@
         }
       }
 
-      document.querySelectorAll('.auth-tab').forEach(btn => {
-        btn.addEventListener('click', () => {
-          state.authMode = btn.dataset.auth;
-          document.querySelectorAll('.auth-tab').forEach(b => b.classList.toggle('active', b === btn));
-          $('authSubmitBtn').textContent = state.authMode === 'login' ? 'Войти в APATHY' : 'Создать аккаунт';
-          $('authMsg').textContent = '';
-        });
+      function normalizeCloudTrack(t) {
+        if (!t || !t.id) return null;
+        const tgId = t.tgTrackId || (String(t.id).startsWith('tg_') ? String(t.id).slice(3) : String(t.id));
+        const streamUrl = tgApiUrl(`/api/tg/stream/${encodeURIComponent(tgId)}`);
+        let art = t.artwork || '';
+        if (art && art.startsWith('/')) art = tgApiUrl(art);
+        return {
+          id: String(t.id),
+          tgTrackId: tgId,
+          tgStreamUrl: streamUrl,
+          title: t.title || 'Без названия',
+          artist: t.artist || 'Исполнитель',
+          album: t.album || 'Telegram Бот',
+          duration: Number(t.duration || 180) || 180,
+          artwork: art,
+          coverGrad: t.coverGrad || 'linear-gradient(145deg, #163b5c 0%, #070c14 60%, #2468a3 100%)',
+          source: t.source || 'Telegram',
+          inTelegram: !!t.inTelegram,
+          fromTelegramBot: true,
+          fromCatalog: true,
+          lyrics: null
+        };
+      }
+
+      function mergeAndApplyCloudState(cloudState, pushMergedBack = false) {
+        if (!cloudState || typeof cloudState !== 'object') return;
+        isApplyingCloudState = true;
+        try {
+          const cloudTracks = Array.isArray(cloudState.savedTracks)
+            ? cloudState.savedTracks.map(normalizeCloudTrack).filter(Boolean)
+            : [];
+          const cloudPlaylists = Array.isArray(cloudState.playlists) ? cloudState.playlists : [];
+          const cloudLikes = Array.isArray(cloudState.likedIds) ? cloudState.likedIds : [];
+
+          const cloudHasData = cloudTracks.length > 0 || cloudLikes.length > 0 || cloudPlaylists.some(p => p && Array.isArray(p.trackIds) && p.trackIds.length > 0);
+
+          if (cloudHasData) {
+            // Merge cloud tracks + keep any local tracks not yet in cloud
+            const byId = new Map();
+            cloudTracks.forEach(t => byId.set(t.id, t));
+            state.libraryTracks.forEach(t => {
+              if (t && t.id && !byId.has(t.id)) byId.set(t.id, t);
+            });
+            state.libraryTracks = Array.from(byId.values());
+
+            // Merge playlists by id (cloud wins order, local-only trackIds appended)
+            const plMap = new Map();
+            cloudPlaylists.forEach(p => {
+              if (p && p.id && p.name) {
+                plMap.set(p.id, {
+                  id: String(p.id),
+                  name: String(p.name),
+                  trackIds: Array.isArray(p.trackIds) ? Array.from(new Set(p.trackIds.map(String))) : []
+                });
+              }
+            });
+            state.playlists.forEach(lp => {
+              if (!lp || !lp.id) return;
+              if (plMap.has(lp.id)) {
+                const cp = plMap.get(lp.id);
+                (lp.trackIds || []).forEach(tid => {
+                  if (!cp.trackIds.includes(tid)) cp.trackIds.push(tid);
+                });
+              } else if (lp.trackIds && lp.trackIds.length > 0) {
+                plMap.set(lp.id, { id: lp.id, name: lp.name, trackIds: [...lp.trackIds] });
+              }
+            });
+            if (plMap.size > 0) state.playlists = Array.from(plMap.values());
+
+            // Merge likes
+            cloudLikes.forEach(id => state.likedIds.add(String(id)));
+
+            // Apply saved cloud theme if valid
+            if (cloudState.theme && THEME_META[cloudState.theme] && cloudState.theme !== state.theme) {
+              applyTheme(cloudState.theme, false);
+            }
+          }
+
+          store.set('playlists', state.playlists);
+          store.set('liked', Array.from(state.likedIds));
+          store.set('savedCatalogTracks', getSerializableSavedTracks());
+
+          renderLibrary();
+          renderSearchResultsList();
+          renderProfile();
+          updatePlayerLikeUI();
+          updatePlayerPlaylistBtn();
+        } finally {
+          isApplyingCloudState = false;
+        }
+
+        if (pushMergedBack) {
+          pushCloudSyncNow(false);
+        }
+      }
+
+      async function pushCloudSyncNow(notify = false) {
+        if (!state.tgToken || !state.user || !state.user.tgId) return false;
+        setSyncStatus('Сохранение в облако...', true);
+        try {
+          const payload = {
+            playlists: state.playlists.slice(0, 50),
+            likedIds: Array.from(state.likedIds).slice(0, 500),
+            savedTracks: getSerializableSavedTracks(),
+            theme: state.theme
+          };
+          const resp = await fetch(`${tgApiUrl('/api/user/sync')}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + state.tgToken
+            },
+            body: JSON.stringify(payload)
+          });
+          if (resp.status === 401) {
+            clearTgSession(false);
+            return false;
+          }
+          const data = resp.ok ? await resp.json() : null;
+          if (data && data.ok) {
+            const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+            setSyncStatus(`Синхронизировано · ${nowStr}`, false);
+            if (notify) showToast('Плейлисты и избранное сохранены в Telegram-аккаунте');
+            return true;
+          }
+        } catch (e) {}
+        setSyncStatus('Ожидание сети для синхронизации', true);
+        if (notify) showToast('Не удалось связаться с сервером бота');
+        return false;
+      }
+
+      function scheduleCloudSync() {
+        if (isApplyingCloudState || !state.tgToken || !state.user || !state.user.tgId) return;
+        setSyncStatus('Сохранение...', true);
+        clearTimeout(syncDebounceTimer);
+        syncDebounceTimer = setTimeout(() => pushCloudSyncNow(false), 750);
+      }
+
+      function stopAuthPolling() {
+        if (authPollTimer) {
+          clearInterval(authPollTimer);
+          authPollTimer = null;
+        }
+        const pBox = $('tgAuthPendingBox');
+        if (pBox) pBox.classList.remove('show');
+        const btn = $('tgLoginBtn');
+        if (btn) btn.disabled = false;
+      }
+
+      function applyAuthorizedSession(data, notify = true) {
+        if (!data || !data.token || !data.user) return;
+        stopAuthPolling();
+        state.tgToken = data.token;
+        state.user = data.user;
+        store.set('tgAuthToken', data.token);
+        store.set('user', data.user);
+        $('authMsg').textContent = '';
+        renderProfile();
+        mergeAndApplyCloudState(data.state || {}, true);
+        if (notify) {
+          const uname = data.user.username ? ('@' + data.user.username) : (data.user.firstName || 'Telegram');
+          showToast('Вход через Telegram выполнен: ' + uname);
+        }
+      }
+
+      function clearTgSession(notify = true) {
+        const oldToken = state.tgToken;
+        stopAuthPolling();
+        state.tgToken = '';
+        state.user = null;
+        store.set('tgAuthToken', '');
+        store.set('user', null);
+        renderProfile();
+        if (oldToken) {
+          fetch(`${tgApiUrl('/api/user/logout')}`, {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + oldToken }
+          }).catch(() => {});
+        }
+        if (notify) showToast('Вы вышли из аккаунта Telegram');
+      }
+
+      async function initTelegramAuth() {
+        // 1) Auto-login inside Telegram Mini App using cryptographically signed initData!
+        try {
+          const tgWebApp = window.Telegram && window.Telegram.WebApp;
+          if (tgWebApp && tgWebApp.initData && tgWebApp.initData.length > 20) {
+            const resp = await fetch(`${tgApiUrl('/api/auth/webapp')}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ initData: tgWebApp.initData })
+            });
+            const data = resp.ok ? await resp.json() : null;
+            if (data && data.ok && data.token && data.user) {
+              applyAuthorizedSession(data, false);
+              setSyncStatus('Подключено через Telegram Mini App', false);
+              return;
+            }
+          }
+        } catch (e) {}
+
+        // 2) Restore existing browser session via saved token
+        if (state.tgToken) {
+          try {
+            const resp = await fetch(`${tgApiUrl('/api/user/me')}?_=${Date.now()}`, {
+              headers: { 'Authorization': 'Bearer ' + state.tgToken }
+            });
+            if (resp.status === 401) {
+              clearTgSession(false);
+              return;
+            }
+            const data = resp.ok ? await resp.json() : null;
+            if (data && data.ok && data.user) {
+              state.user = data.user;
+              store.set('user', data.user);
+              renderProfile();
+              mergeAndApplyCloudState(data.state || {}, false);
+              setSyncStatus('Синхронизировано с Telegram', false);
+              return;
+            }
+          } catch (e) {}
+        }
+
+        // If stale local non-Telegram user existed from older versions, reset cleanly
+        if (state.user && !state.user.tgId) {
+          state.user = null;
+          store.set('user', null);
+          renderProfile();
+        }
+      }
+
+      $('tgLoginBtn').addEventListener('click', async () => {
+        const msg = $('authMsg');
+        msg.textContent = '';
+
+        // If inside Telegram Mini App, try instant initData auth first
+        const tgWebApp = window.Telegram && window.Telegram.WebApp;
+        if (tgWebApp && tgWebApp.initData && tgWebApp.initData.length > 20) {
+          $('tgLoginBtn').disabled = true;
+          try {
+            const r = await fetch(`${tgApiUrl('/api/auth/webapp')}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ initData: tgWebApp.initData })
+            });
+            const d = r.ok ? await r.json() : null;
+            if (d && d.ok && d.token) {
+              applyAuthorizedSession(d, true);
+              return;
+            }
+          } catch (e) {}
+          $('tgLoginBtn').disabled = false;
+        }
+
+        // Browser 1-tap Deep-Link Auth via your Telegram Bot
+        $('tgLoginBtn').disabled = true;
+        try {
+          const resp = await fetch(`${tgApiUrl('/api/auth/start')}`, { method: 'POST' });
+          const data = resp.ok ? await resp.json() : null;
+          if (!data || !data.ok || !data.code || !data.botUrl) {
+            msg.textContent = 'Не удалось получить ссылку от сервера бота. Проверьте, что бот запущен.';
+            $('tgLoginBtn').disabled = false;
+            return;
+          }
+
+          const openLink = $('tgOpenBotLink');
+          openLink.href = data.botUrl;
+          $('tgAuthPendingBox').classList.add('show');
+
+          // Try opening Telegram immediately inside the click gesture
+          try { window.open(data.botUrl, '_blank', 'noopener'); } catch (e) {}
+
+          // Poll every 1.6s until user taps Start in Telegram (up to 5 minutes)
+          const startedAt = Date.now();
+          const authCode = data.code;
+          if (authPollTimer) clearInterval(authPollTimer);
+          authPollTimer = setInterval(async () => {
+            if (Date.now() - startedAt > 300000) {
+              stopAuthPolling();
+              msg.textContent = 'Время ожидания истекло — нажмите «Войти через Telegram» снова.';
+              return;
+            }
+            const poll = await fetchJsonTimeout(`${tgApiUrl('/api/auth/poll')}?code=${encodeURIComponent(authCode)}&_=${Date.now()}`, 3000);
+            if (!poll) return;
+            if (poll.status === 'authorized' && poll.token && poll.user) {
+              applyAuthorizedSession(poll, true);
+            } else if (poll.status === 'expired') {
+              stopAuthPolling();
+              msg.textContent = 'Код входа истёк — попробуйте ещё раз.';
+            }
+          }, 1600);
+        } catch (e) {
+          msg.textContent = 'Ошибка соединения с сервером бота.';
+          $('tgLoginBtn').disabled = false;
+        }
       });
 
-      $('authForm').addEventListener('submit', (e) => {
-        e.preventDefault();
-        const login = $('authLogin').value.trim(), pass = $('authPass').value, msg = $('authMsg');
-        if (login.length < 3 || pass.length < 4) { msg.textContent = 'Логин от 3 символов, пароль от 4 символов'; return; }
-        const key = login.toLowerCase();
-        if (state.authMode === 'register') {
-          if (state.usersDb[key]) { msg.textContent = 'Такой логин уже занят — войдите в аккаунт'; return; }
-          state.usersDb[key] = { login, pass }; store.set('usersDb', state.usersDb);
-          state.user = { login }; store.set('user', state.user);
-          showToast('Аккаунт создан: @' + login);
-        } else {
-          const existing = state.usersDb[key];
-          if (!existing) { msg.textContent = 'Аккаунт не найден. Переключитесь на «Регистрация»'; return; }
-          if (existing.pass !== pass) { msg.textContent = 'Неверный пароль'; return; }
-          state.user = { login: existing.login }; store.set('user', state.user);
-          showToast('С возвращением, @' + existing.login);
-        }
-        $('authLogin').value = ''; $('authPass').value = ''; msg.textContent = '';
-        renderProfile();
+      $('tgCancelAuthBtn').addEventListener('click', () => {
+        stopAuthPolling();
+        $('authMsg').textContent = '';
+      });
+
+      $('manualSyncBtn').addEventListener('click', () => {
+        pushCloudSyncNow(true);
       });
 
       $('logoutBtn').addEventListener('click', () => {
-        state.user = null; store.set('user', null);
-        renderProfile(); showToast('Вы вышли из аккаунта');
+        clearTgSession(true);
       });
 
       // ================= IMPORT FROM PLATFORMS =================
@@ -1723,7 +2051,7 @@
           const track = {
             id: 'local_' + Date.now() + '_' + idx,
             title: cleanName,
-            artist: state.user ? '@' + state.user.login : 'Ваш файл',
+            artist: state.user ? (state.user.username ? '@' + state.user.username : (state.user.firstName || 'Ваш файл')) : 'Ваш файл',
             album: 'Local', duration: 180, source: 'Файл', isLocal: true, audioUrl: url,
             coverGrad: 'linear-gradient(145deg, #323946 0%, #090b0f 60%, #556175 100%)',
             lyrics: null
@@ -1855,5 +2183,6 @@
       initPlayerLoopAndVisualizer();
       initTelegramMiniApp();
       checkTgBotStatus();
+      initTelegramAuth();
       performSearch();
     })();

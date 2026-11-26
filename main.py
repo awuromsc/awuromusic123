@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APATHY v27 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
+APATHY v29 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
 ===========================================================================================================
-Исправлено в v27 (обход блокировок YouTube на Docker/VPS-серверах):
+Исправлено в v29 (обход блокировок YouTube на Docker/VPS-серверах):
   1. Мульти-поиск строго по аудиоисточникам одновременно:
        • SoundCloud API v2 (полные треки, прогрессивный MP3 без блокировок дата-центров — идеально для ру-рэпа/андерграунда)
        • Прямые РФ MP3-порталы (Hitmo, Hitmotop, Muzofond, Mp3Party, LightAudio — мгновенный MP3, 0% CPU)
@@ -18,6 +18,8 @@ APATHY v27 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУ�
 
 import asyncio
 import hashlib
+import hmac
+import secrets
 import json
 import logging
 import os
@@ -29,7 +31,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urljoin
+from urllib.parse import parse_qsl, quote, urljoin
 
 import aiohttp
 from aiohttp import web
@@ -66,7 +68,21 @@ COOKIES_PATH = BASE_DIR / os.getenv("COOKIES_FILE", "cookies.txt")
 WEB_DIR = BASE_DIR / "web"
 
 ADMIN_ID: Optional[int] = int(ADMIN_ID_ENV) if ADMIN_ID_ENV.lstrip("-").isdigit() else None
-FFMPEG_BIN: Optional[str] = shutil.which("ffmpeg")
+def _detect_ffmpeg() -> Tuple[Optional[str], str]:
+    sys_ff = shutil.which("ffmpeg")
+    if sys_ff:
+        return sys_ff, "system"
+    try:
+        import imageio_ffmpeg  # type: ignore
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and os.path.exists(bundled):
+            return bundled, "imageio-ffmpeg"
+    except Exception:
+        pass
+    return None, "none"
+
+
+FFMPEG_BIN, FFMPEG_SOURCE = _detect_ffmpeg()
 HAS_FFMPEG: bool = bool(FFMPEG_BIN)
 MP3_CACHE_DIR = Path(tempfile.gettempdir()) / "apathy_mp3_cache"
 MP3_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -138,6 +154,7 @@ TEMP_TRACKS = BoundedTTLCache(maxsize=400, default_ttl=3600)
 DIRECT_STREAM_CACHE = BoundedTTLCache(maxsize=180, default_ttl=1500)
 TG_FILE_PATH_CACHE = BoundedTTLCache(maxsize=220, default_ttl=1800)
 BOT_PICK_CACHE = BoundedTTLCache(maxsize=350, default_ttl=1800)
+PENDING_AUTH_CODES = BoundedTTLCache(maxsize=200, default_ttl=300)
 BG_CACHE_INFLIGHT: set = set()
 
 
@@ -172,6 +189,33 @@ def init_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            tg_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            last_name TEXT DEFAULT '',
+            photo_url TEXT DEFAULT '',
+            session_token TEXT UNIQUE NOT NULL,
+            theme TEXT DEFAULT 'chrome',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_token ON users(session_token);")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_state (
+            tg_id INTEGER PRIMARY KEY,
+            playlists_json TEXT DEFAULT '[]',
+            liked_ids_json TEXT DEFAULT '[]',
+            saved_tracks_json TEXT DEFAULT '[]',
+            updated_at INTEGER NOT NULL
         );
         """
     )
@@ -437,6 +481,210 @@ def lookup_track_record(track_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+
+
+# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v29) ====================
+def _user_row_to_public(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "tgId": int(row["tg_id"]),
+        "username": row["username"] or "",
+        "firstName": row["first_name"] or "",
+        "lastName": row["last_name"] or "",
+        "photoUrl": row["photo_url"] or "",
+        "theme": row["theme"] or "chrome",
+    }
+
+
+def upsert_telegram_user(
+    tg_id: int,
+    username: str = "",
+    first_name: str = "",
+    last_name: str = "",
+    photo_url: str = "",
+) -> Tuple[Dict[str, Any], str]:
+    now = int(time.time())
+    existing = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
+    if existing:
+        token = existing["session_token"] or secrets.token_urlsafe(32)
+        DB.execute(
+            """
+            UPDATE users SET
+                username = ?,
+                first_name = COALESCE(NULLIF(?, ''), first_name),
+                last_name = ?,
+                photo_url = COALESCE(NULLIF(?, ''), photo_url),
+                session_token = ?,
+                updated_at = ?
+            WHERE tg_id = ?
+            """,
+            (
+                username or "",
+                first_name or "",
+                last_name or "",
+                photo_url or "",
+                token,
+                now,
+                int(tg_id),
+            ),
+        )
+    else:
+        token = secrets.token_urlsafe(32)
+        DB.execute(
+            """
+            INSERT INTO users(tg_id, username, first_name, last_name, photo_url, session_token, theme, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'chrome', ?, ?)
+            """,
+            (int(tg_id), username or "", first_name or "", last_name or "", photo_url or "", token, now, now),
+        )
+    DB.commit()
+    row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
+    return _user_row_to_public(row), row["session_token"]
+
+
+def get_user_by_token(token: str) -> Optional[sqlite3.Row]:
+    tok = str(token or "").strip()
+    if not tok or len(tok) < 16:
+        return None
+    return DB.execute("SELECT * FROM users WHERE session_token = ?", (tok,)).fetchone()
+
+
+def extract_bearer_token(request: web.Request) -> str:
+    auth_hdr = request.headers.get("Authorization", "").strip()
+    if auth_hdr.lower().startswith("bearer "):
+        return auth_hdr[7:].strip()
+    return request.headers.get("X-Auth-Token", "").strip()
+
+
+def load_user_cloud_state(tg_id: int, theme: str = "chrome") -> Dict[str, Any]:
+    row = DB.execute("SELECT * FROM user_state WHERE tg_id = ?", (int(tg_id),)).fetchone()
+    if not row:
+        return {"playlists": [], "likedIds": [], "savedTracks": [], "theme": theme or "chrome", "updatedAt": 0}
+    try:
+        playlists = json.loads(row["playlists_json"] or "[]")
+    except Exception:
+        playlists = []
+    try:
+        liked_ids = json.loads(row["liked_ids_json"] or "[]")
+    except Exception:
+        liked_ids = []
+    try:
+        saved_tracks = json.loads(row["saved_tracks_json"] or "[]")
+    except Exception:
+        saved_tracks = []
+    return {
+        "playlists": playlists if isinstance(playlists, list) else [],
+        "likedIds": liked_ids if isinstance(liked_ids, list) else [],
+        "savedTracks": saved_tracks if isinstance(saved_tracks, list) else [],
+        "theme": theme or "chrome",
+        "updatedAt": int(row["updated_at"] or 0),
+    }
+
+
+def save_user_cloud_state(tg_id: int, playlists: list, liked_ids: list, saved_tracks: list, theme: str = "") -> int:
+    now = int(time.time())
+    clean_playlists = playlists[:50] if isinstance(playlists, list) else []
+    clean_likes = [str(x) for x in (liked_ids[:500] if isinstance(liked_ids, list) else [])]
+    clean_tracks = saved_tracks[:350] if isinstance(saved_tracks, list) else []
+
+    # Гарантируем, что все треки из личных плейлистов сохранены в таблице tracks,
+    # чтобы они продолжали играть даже после перезапуска сервера!
+    for t in clean_tracks:
+        if not isinstance(t, dict):
+            continue
+        raw_tid = str(t.get("tgTrackId") or "").strip()
+        if not raw_tid:
+            tid_str = str(t.get("id") or "")
+            raw_tid = tid_str[3:] if tid_str.startswith("tg_") else tid_str
+        if not raw_tid:
+            continue
+        exists = DB.execute("SELECT id FROM tracks WHERE id = ?", (raw_tid,)).fetchone()
+        if exists:
+            continue
+        temp = TEMP_TRACKS.get(raw_tid)
+        if temp:
+            save_telegram_track(
+                track_id=raw_tid,
+                title=temp.get("title") or t.get("title") or "Без названия",
+                artist=temp.get("artist") or t.get("artist") or "Исполнитель",
+                duration=int(temp.get("duration") or t.get("duration") or 180),
+                artwork=temp.get("artwork") or t.get("artwork") or "",
+                source=temp.get("source") or "audio",
+                source_id=str(temp.get("source_id") or ""),
+                source_url=str(temp.get("source_url") or ""),
+                tg_file_id=str(temp.get("tg_file_id") or ""),
+                tg_thumb_id=str(temp.get("tg_thumb_id") or ""),
+                mime_type=str(temp.get("mime_type") or "audio/mpeg"),
+                added_by=int(tg_id),
+            )
+        else:
+            src_name = "soundcloud" if raw_tid.startswith("sc_") else ("youtube" if raw_tid.startswith("yt_") else "audio")
+            src_id = raw_tid[3:] if raw_tid.startswith(("sc_", "yt_")) else ""
+            src_url = f"https://www.youtube.com/watch?v={src_id}" if (src_name == "youtube" and len(src_id) == 11) else ""
+            save_telegram_track(
+                track_id=raw_tid,
+                title=str(t.get("title") or "Без названия"),
+                artist=str(t.get("artist") or "Исполнитель"),
+                duration=int(t.get("duration") or 180),
+                artwork=str(t.get("artwork") or ""),
+                source=src_name,
+                source_id=src_id,
+                source_url=src_url,
+                added_by=int(tg_id),
+            )
+
+    DB.execute(
+        """
+        INSERT INTO user_state(tg_id, playlists_json, liked_ids_json, saved_tracks_json, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(tg_id) DO UPDATE SET
+            playlists_json = excluded.playlists_json,
+            liked_ids_json = excluded.liked_ids_json,
+            saved_tracks_json = excluded.saved_tracks_json,
+            updated_at = excluded.updated_at
+        """,
+        (
+            int(tg_id),
+            json.dumps(clean_playlists, ensure_ascii=False),
+            json.dumps(clean_likes, ensure_ascii=False),
+            json.dumps(clean_tracks, ensure_ascii=False),
+            now,
+        ),
+    )
+    if theme in ("chrome", "purple", "red"):
+        DB.execute("UPDATE users SET theme = ?, updated_at = ? WHERE tg_id = ?", (theme, now, int(tg_id)))
+    DB.commit()
+    return now
+
+
+def verify_telegram_webapp_init_data(init_data: str) -> Optional[Dict[str, Any]]:
+    """Криптографическая проверка Telegram.WebApp.initData через HMAC-SHA256 по стандарту Telegram."""
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = pairs.pop("hash", "")
+        if not received_hash:
+            return None
+        auth_date = int(pairs.get("auth_date") or 0)
+        if auth_date and abs(time.time() - auth_date) > 86400:
+            return None
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
+        expected_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_hash, received_hash):
+            return None
+        user_raw = pairs.get("user")
+        if not user_raw:
+            return None
+        user_obj = json.loads(user_raw)
+        if not isinstance(user_obj, dict) or not user_obj.get("id"):
+            return None
+        return user_obj
+    except Exception as e:
+        log.warning("WebApp initData verify failed: %s", e)
+        return None
+
+
 # ==================== ИСТОЧНИК 1: SOUNDCLOUD API V2 (БЕЗ YT-DLP, ПОЛНЫЕ ТРЕКИ) ====================
 SC_CLIENT_ID: str = ""
 SC_CLIENT_ID_AT: float = 0.0
@@ -583,8 +831,11 @@ async def resolve_soundcloud_direct_mp3(session: aiohttp.ClientSession, track: D
                 return None
             j = await r.json()
         media_url = j.get("url")
-        if media_url and proto == "progressive":
-            return (media_url, "audio/mpeg", int(track.get("duration") or 180))
+        if media_url:
+            if proto == "progressive":
+                return (media_url, "audio/mpeg", int(track.get("duration") or 180))
+            if proto == "hls":
+                return (media_url, "application/vnd.apple.mpegurl", int(track.get("duration") or 180))
     except Exception:
         pass
     return None
@@ -1214,6 +1465,63 @@ async def _ensure_mp3_output(raw_path: str, out_dir: str, track_id: str, duratio
     return None
 
 
+async def _download_hls_mp3(session: aiohttp.ClientSession, m3u8_url: str, out_path: str) -> Optional[Tuple[str, str]]:
+    """Собирает HLS-плейлист MP3 (SoundCloud) напрямую в чистый .mp3 без ffmpeg."""
+    try:
+        async with session.get(
+            m3u8_url,
+            headers={"User-Agent": SAFARI_UA, "Referer": smart_referer(m3u8_url)},
+            timeout=aiohttp.ClientTimeout(total=12),
+        ) as r:
+            if r.status != 200:
+                return None
+            text = await r.text(errors="ignore")
+        seg_urls = []
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            seg_urls.append(urljoin(m3u8_url, s))
+        if not seg_urls or len(seg_urls) > 260:
+            return None
+
+        written = 0
+        with open(out_path, "wb") as f:
+            for seg_u in seg_urls:
+                async with session.get(
+                    seg_u,
+                    headers={"User-Agent": SAFARI_UA, "Referer": smart_referer(seg_u)},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as sr:
+                    if sr.status != 200:
+                        return None
+                    chunk = await sr.read()
+                    written += len(chunk)
+                    if written > MAX_AUDIO_BYTES:
+                        f.close()
+                        try:
+                            os.remove(out_path)
+                        except OSError:
+                            pass
+                        return None
+                    f.write(chunk)
+        if written < 12_000:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            return None
+        return (out_path, "audio/mpeg")
+    except Exception as e:
+        log.warning("HLS MP3 download error: %s", e)
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except OSError:
+            pass
+        return None
+
+
 async def _download_http_audio(session: aiohttp.ClientSession, url: str, out_path: str) -> Optional[Tuple[str, str]]:
     """Скачивает аудиопоток по HTTP и проверяет, что сервер отдал реальное аудио, а не HTML-заглушку."""
     try:
@@ -1286,9 +1594,13 @@ async def download_audio_only_to_file(
     res = await resolve_audio_stream_url(session, track)
     if res:
         direct_url, mime, dur = res
-        raw_ext = "mp3" if "mpeg" in mime else ("m4a" if "mp4" in mime else "webm")
-        raw_path = os.path.join(out_dir, f"raw_{track['id']}.{raw_ext}")
-        dl = await _download_http_audio(session, direct_url, raw_path)
+        if "mpegurl" in mime or ".m3u8" in direct_url.lower():
+            raw_path = os.path.join(out_dir, f"hls_{track['id']}.mp3")
+            dl = await _download_hls_mp3(session, direct_url, raw_path)
+        else:
+            raw_ext = "mp3" if "mpeg" in mime else ("m4a" if "mp4" in mime else "webm")
+            raw_path = os.path.join(out_dir, f"raw_{track['id']}.{raw_ext}")
+            dl = await _download_http_audio(session, direct_url, raw_path)
         if dl:
             ensured = await _ensure_mp3_output(dl[0], out_dir, track["id"], dur or track.get("duration") or 180)
             if ensured:
@@ -1299,9 +1611,13 @@ async def download_audio_only_to_file(
         rescue = await cross_platform_rescue_audio(session, track)
         if rescue and rescue[0] != direct_url:
             r_url, r_mime, r_dur = rescue
-            r_ext = "mp3" if "mpeg" in r_mime else "m4a"
-            r_path = os.path.join(out_dir, f"rescue_{track['id']}.{r_ext}")
-            dl2 = await _download_http_audio(session, r_url, r_path)
+            if "mpegurl" in r_mime or ".m3u8" in r_url.lower():
+                r_path = os.path.join(out_dir, f"rescue_hls_{track['id']}.mp3")
+                dl2 = await _download_hls_mp3(session, r_url, r_path)
+            else:
+                r_ext = "mp3" if "mpeg" in r_mime else "m4a"
+                r_path = os.path.join(out_dir, f"rescue_{track['id']}.{r_ext}")
+                dl2 = await _download_http_audio(session, r_url, r_path)
             if dl2:
                 ensured2 = await _ensure_mp3_output(dl2[0], out_dir, track["id"], r_dur or track.get("duration") or 180)
                 if ensured2:
@@ -1324,7 +1640,8 @@ async def download_audio_only_to_file(
                 "socket_timeout": 12,
                 "extractor_args": {"youtube": {"player_client": ["android_vr", "ios", "tv_embedded"]}},
             }
-            if HAS_FFMPEG:
+            if HAS_FFMPEG and FFMPEG_BIN:
+                opts["ffmpeg_location"] = FFMPEG_BIN
                 opts["postprocessors"] = [
                     {
                         "key": "FFmpegExtractAudio",
@@ -1455,17 +1772,78 @@ def build_webapp_keyboard() -> InlineKeyboardMarkup:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip().startswith("auth_"):
+        code = parts[1].strip()[5:]
+        pending = PENDING_AUTH_CODES.get(code)
+        if not pending or pending.get("status") != "pending":
+            await message.answer(
+                "⏱ Ссылка для входа устарела. Откройте сайт APATHY и нажмите <b>«Войти через Telegram»</b> ещё раз.",
+                parse_mode="HTML",
+                reply_markup=build_webapp_keyboard(),
+            )
+            return
+        u = message.from_user
+        if not u:
+            return
+        pub_user, token = upsert_telegram_user(
+            tg_id=u.id,
+            username=u.username or "",
+            first_name=u.first_name or "",
+            last_name=u.last_name or "",
+        )
+        PENDING_AUTH_CODES.set(code, {"status": "authorized", "tg_id": u.id, "token": token}, ttl=180)
+        display = f"@{u.username}" if u.username else (u.first_name or f"ID {u.id}")
+        await message.answer(
+            f"✅ <b>Вход в APATHY выполнен!</b>\n\n"
+            f"Аккаунт <b>{display}</b> привязан к сайту.\n"
+            "Вернитесь в браузер — ваши личные плейлисты и избранное уже синхронизируются.",
+            parse_mode="HTML",
+            reply_markup=build_webapp_keyboard(),
+        )
+        return
+
     total = DB.execute("SELECT COUNT(*) AS c FROM tracks WHERE tg_file_id != ''").fetchone()["c"]
     text = (
-        "<b>APATHY v27 · Музыкальный бот (только аудио)</b>\n\n"
+        "<b>APATHY v29 · Музыкальный бот и личные плейлисты</b>\n\n"
         f"🌐 Сайт плеера: {SITE_URL}/\n"
-        f"💾 Сохранённых треков: <b>{total}</b>\n\n"
-        "• <b>Напиши название трека</b> — ищу по SoundCloud, РФ MP3-порталам и YouTube, скачиваю строго чистое аудио.\n"
+        f"💾 Общих треков в базе: <b>{total}</b>\n\n"
+        "• <b>Напиши название трека</b> — ищу по SoundCloud, РФ MP3-порталам и YouTube (строго .mp3).\n"
         "• <b>Перешли любой аудиофайл</b> — сразу появится в плеере APATHY.\n"
-        "• <b>/test</b> — проверить источники на сервере · <b>/list</b> — список треков\n"
-        "• <b>/del название</b> — удалить трек · <b>/setapi URL</b> — привязать адрес API"
+        "• <b>/playlists</b> — твои личные плейлисты и избранное\n"
+        "• <b>/test</b> — проверка источников · <b>/list</b> — последние треки"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=build_webapp_keyboard(), disable_web_page_preview=True)
+
+
+@router.message(Command("playlists", "my"))
+async def cmd_my_playlists(message: Message):
+    u = message.from_user
+    if not u:
+        return
+    cloud = load_user_cloud_state(u.id)
+    pls = cloud.get("playlists") or []
+    likes = cloud.get("likedIds") or []
+    tracks = cloud.get("savedTracks") or []
+    if not pls and not likes and not tracks:
+        await message.answer(
+            "У тебя пока нет сохранённых плейлистов.\nОткрой плеер APATHY, зайди в <b>Профиль → Войти через Telegram</b> и добавляй треки кнопкой «+»!",
+            parse_mode="HTML",
+            reply_markup=build_webapp_keyboard(),
+        )
+        return
+    lines = [
+        f"<b>Твоя медиатека APATHY:</b>",
+        f"❤️ Избранных треков: <b>{len(likes)}</b>",
+        f"🎵 Сохранено треков: <b>{len(tracks)}</b>",
+        "",
+    ]
+    if pls:
+        lines.append("<b>Плейлисты:</b>")
+        for idx, pl in enumerate(pls[:15], 1):
+            cnt = len(pl.get("trackIds") or [])
+            lines.append(f"{idx}. <b>{pl.get('name', 'Плейлист')}</b> — {cnt} трек.")
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=build_webapp_keyboard())
 
 
 @router.message(Command("test"))
@@ -1496,9 +1874,9 @@ async def cmd_test_sources(message: Message):
         chk("Piped/Invidious Аудио", piped_invidious_extract_audio(HTTP_SESSION_REF, "dQw4w9WgXcQ")),
     )
     cookies_st = "✅ подключён" if (COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 20) else "не загружен"
-    ff_st = "✅ активен (выход строго .mp3)" if HAS_FFMPEG else "⚠️ не установлен (нужен ffmpeg в Dockerfile)"
+    ff_st = f"✅ активен ({FFMPEG_SOURCE} · выход строго .mp3)" if HAS_FFMPEG else "⚠️ не установлен — добавьте imageio-ffmpeg в requirements.txt"
     await m.edit_text(
-        "<b>Диагностика источников сервера (v27):</b>\n\n"
+        "<b>Диагностика источников сервера (v29):</b>\n\n"
         + "\n".join(lines)
         + f"\n\n🎛 ffmpeg: {ff_st}\n🍪 cookies.txt: {cookies_st}",
         parse_mode="HTML",
@@ -1769,10 +2147,121 @@ async def cors_middleware(request: web.Request, handler):
             resp = ex
     origin = request.headers.get("Origin", "")
     resp.headers["Access-Control-Allow-Origin"] = origin if origin == SITE_URL else "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Range, Accept, Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, HEAD, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Range, Accept, Content-Type, Authorization, X-Auth-Token"
     resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges, Content-Type"
     return resp
+
+
+async def api_auth_webapp(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+    init_data = str((body or {}).get("initData") or "").strip()
+    tg_user = verify_telegram_webapp_init_data(init_data)
+    if not tg_user:
+        return web.json_response({"ok": False, "error": "invalid_init_data"}, status=401)
+    pub_user, token = upsert_telegram_user(
+        tg_id=int(tg_user["id"]),
+        username=str(tg_user.get("username") or ""),
+        first_name=str(tg_user.get("first_name") or ""),
+        last_name=str(tg_user.get("last_name") or ""),
+        photo_url=str(tg_user.get("photo_url") or ""),
+    )
+    cloud_state = load_user_cloud_state(pub_user["tgId"], pub_user["theme"])
+    return web.json_response({"ok": True, "token": token, "user": pub_user, "state": cloud_state})
+
+
+async def api_auth_start(request: web.Request) -> web.Response:
+    bot_uname = BOT_USERNAME_CACHE.lstrip("@")
+    if not bot_uname:
+        return web.json_response({"ok": False, "error": "bot_username_missing"}, status=503)
+    code = secrets.token_urlsafe(12).replace("-", "").replace("_", "")[:16]
+    PENDING_AUTH_CODES.set(code, {"status": "pending", "created_at": int(time.time())}, ttl=300)
+    return web.json_response(
+        {
+            "ok": True,
+            "code": code,
+            "botUsername": bot_uname,
+            "botUrl": f"https://t.me/{bot_uname}?start=auth_{code}",
+            "expiresIn": 300,
+        }
+    )
+
+
+async def api_auth_poll(request: web.Request) -> web.Response:
+    code = clean_text(request.query.get("code", ""))
+    if not code:
+        return web.json_response({"ok": False, "status": "expired"}, status=400)
+    entry = PENDING_AUTH_CODES.get(code)
+    if not entry:
+        return web.json_response({"ok": True, "status": "expired"})
+    if entry.get("status") != "authorized":
+        return web.json_response({"ok": True, "status": "pending"})
+
+    PENDING_AUTH_CODES._data.pop(code, None)
+    row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(entry["tg_id"]),)).fetchone()
+    if not row:
+        return web.json_response({"ok": True, "status": "expired"})
+    pub_user = _user_row_to_public(row)
+    cloud_state = load_user_cloud_state(pub_user["tgId"], pub_user["theme"])
+    return web.json_response(
+        {
+            "ok": True,
+            "status": "authorized",
+            "token": row["session_token"],
+            "user": pub_user,
+            "state": cloud_state,
+        }
+    )
+
+
+async def api_user_me(request: web.Request) -> web.Response:
+    token = extract_bearer_token(request)
+    row = get_user_by_token(token)
+    if not row:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    pub_user = _user_row_to_public(row)
+    cloud_state = load_user_cloud_state(pub_user["tgId"], pub_user["theme"])
+    return web.json_response({"ok": True, "user": pub_user, "state": cloud_state})
+
+
+async def api_user_sync(request: web.Request) -> web.Response:
+    token = extract_bearer_token(request)
+    row = get_user_by_token(token)
+    if not row:
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+    playlists = (body or {}).get("playlists") or []
+    liked_ids = (body or {}).get("likedIds") or []
+    saved_tracks = (body or {}).get("savedTracks") or []
+    theme = str((body or {}).get("theme") or "").strip()
+    ts = save_user_cloud_state(int(row["tg_id"]), playlists, liked_ids, saved_tracks, theme)
+    return web.json_response(
+        {
+            "ok": True,
+            "syncedAt": ts,
+            "counts": {
+                "playlists": len(playlists) if isinstance(playlists, list) else 0,
+                "liked": len(liked_ids) if isinstance(liked_ids, list) else 0,
+                "tracks": len(saved_tracks) if isinstance(saved_tracks, list) else 0,
+            },
+        }
+    )
+
+
+async def api_user_logout(request: web.Request) -> web.Response:
+    token = extract_bearer_token(request)
+    row = get_user_by_token(token)
+    if row:
+        new_tok = secrets.token_urlsafe(32)
+        DB.execute("UPDATE users SET session_token = ?, updated_at = ? WHERE tg_id = ?", (new_tok, int(time.time()), int(row["tg_id"])))
+        DB.commit()
+    return web.json_response({"ok": True})
 
 
 async def api_ping(request: web.Request) -> web.Response:
@@ -1780,8 +2269,8 @@ async def api_ping(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "service": "apathy-tg-audio-v27",
-            "version": "v27",
+            "service": "apathy-tg-audio-v29",
+            "version": "v29",
             "bot": BOT_USERNAME_CACHE,
             "siteUrl": SITE_URL,
             "tracksCount": total,
@@ -1925,6 +2414,19 @@ async def api_stream(request: web.Request) -> web.StreamResponse:
                 "tg_file_id": "",
                 "mime_type": "audio/mpeg",
             }
+        elif re.match(r"^sc_\d+$", track_id):
+            sc_id = track_id[3:]
+            rec = {
+                "id": track_id,
+                "title": "Audio",
+                "artist": "SoundCloud",
+                "duration": 180,
+                "source": "soundcloud",
+                "source_id": sc_id,
+                "source_url": "",
+                "tg_file_id": "",
+                "mime_type": "audio/mpeg",
+            }
         else:
             return web.Response(status=404, text="Track not found")
 
@@ -1951,7 +2453,8 @@ async def api_stream(request: web.Request) -> web.StreamResponse:
     res = await resolve_audio_stream_url(session, rec)
     if res:
         direct_url, mime, _ = res
-        is_direct_mp3 = ("mpeg" in mime) or direct_url.lower().split("?")[0].endswith(".mp3")
+        is_hls = ("mpegurl" in mime) or ".m3u8" in direct_url.lower()
+        is_direct_mp3 = (not is_hls) and (("mpeg" in mime) or direct_url.lower().split("?")[0].endswith(".mp3"))
         if is_direct_mp3:
             if AUTO_CACHE_TO_TG:
                 st_id = get_storage_chat_id()
@@ -1959,8 +2462,8 @@ async def api_stream(request: web.Request) -> web.StreamResponse:
                     asyncio.create_task(upload_audio_to_telegram(bot, session, rec, st_id))
             return await proxy_audio_stream(request, direct_url, default_mime="audio/mpeg")
 
-    # 4) YouTube DASH m4a / SoundCloud HLS -> конвертируем в чистый .mp3 (1-2 сек) и отдаём как стандартный MP3 с Range 206!
-    if HAS_FFMPEG:
+    # 4) YouTube DASH m4a / SoundCloud HLS -> конвертируем/собираем в чистый .mp3 (1-2 сек) и отдаём как стандартный MP3 с Range 206!
+    if HAS_FFMPEG or (res and ("mpegurl" in res[1] or ".m3u8" in res[0].lower())):
         lock = MP3_CONVERT_LOCKS.setdefault(safe_tid, asyncio.Lock())
         async with lock:
             if not (cached_mp3.exists() and cached_mp3.stat().st_size > 12_000):
@@ -2026,7 +2529,7 @@ async def main():
 
     me = await bot.get_me()
     BOT_USERNAME_CACHE = f"@{me.username}" if me.username else str(me.id)
-    log.info("APATHY v27 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s", BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG)
+    log.info("APATHY v29 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s", BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG)
 
     connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=300)
     http_session = aiohttp.ClientSession(connector=connector)
@@ -2037,6 +2540,12 @@ async def main():
     app["http_session"] = http_session
 
     app.router.add_get("/health", api_ping)
+    app.router.add_post("/api/auth/webapp", api_auth_webapp)
+    app.router.add_post("/api/auth/start", api_auth_start)
+    app.router.add_get("/api/auth/poll", api_auth_poll)
+    app.router.add_get("/api/user/me", api_user_me)
+    app.router.add_post("/api/user/sync", api_user_sync)
+    app.router.add_post("/api/user/logout", api_user_logout)
     app.router.add_get("/api/tg/ping", api_ping)
     app.router.add_get("/api/tg/library", api_library)
     app.router.add_get("/api/tg/search", api_search)

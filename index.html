@@ -15,7 +15,7 @@
   
   <link rel="preconnect" href="https://bot-1795701331-3932-awuro.bothost.tech" crossorigin />
   <link rel="dns-prefetch" href="https://lrclib.net" />
-  <link rel="stylesheet" href="./style.css?v=27" />
+  <link rel="stylesheet" href="./style.css?v=29" />
 </head>
 <body>
   <div class="app-shell">
@@ -211,32 +211,52 @@
 
           <div class="card-glass" id="authCard">
             <div id="guestBox">
-              <div class="auth-tabs">
-                <button class="auth-tab active" data-auth="login">Вход</button>
-                <button class="auth-tab" data-auth="register">Регистрация</button>
+              <div style="display:flex;align-items:center;gap:11px;margin-bottom:12px;">
+                <div style="width:42px;height:42px;border-radius:13px;background:rgba(34,158,217,0.18);border:1px solid rgba(56,178,255,0.42);display:flex;align-items:center;justify-content:center;color:#7fd0ff;flex-shrink:0;">
+                  <svg width="21" height="21" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M21.9 4.2c.3-1.1-.7-2-1.7-1.6L2.7 9.4c-1.1.4-1.1 2 .1 2.3l4.5 1.4 1.7 5.3c.3 1 1.6 1.2 2.2.4l2.5-2.9 4.8 3.5c.9.6 2.1.1 2.3-1l1.1-14.2zm-4.5 4.1-7.2 6.5-.3 3.2-1.2-3.9 8.7-5.8z"/>
+                  </svg>
+                </div>
+                <div style="min-width:0;">
+                  <div style="font-size:15px;font-weight:600;">Аккаунт Telegram</div>
+                  <div style="font-size:11.5px;color:var(--text-dim);margin-top:2px;line-height:1.38;">
+                    Личные плейлисты и избранное сохраняются в облаке и доступны с любого устройства
+                  </div>
+                </div>
               </div>
-              <form id="authForm" autocomplete="off">
-                <div class="field-group">
-                  <label class="field-label" for="authLogin">Логин</label>
-                  <input class="field-input" id="authLogin" type="text" placeholder="Введите логин" minlength="3" required />
+
+              <button type="button" class="tg-auth-btn" id="tgLoginBtn">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M21.9 4.2c.3-1.1-.7-2-1.7-1.6L2.7 9.4c-1.1.4-1.1 2 .1 2.3l4.5 1.4 1.7 5.3c.3 1 1.6 1.2 2.2.4l2.5-2.9 4.8 3.5c.9.6 2.1.1 2.3-1l1.1-14.2zm-4.5 4.1-7.2 6.5-.3 3.2-1.2-3.9 8.7-5.8z"/>
+                </svg>
+                <span>Войти через Telegram</span>
+              </button>
+
+              <div class="auth-msg" id="authMsg" style="margin-top:8px;"></div>
+
+              <div class="tg-pending-box" id="tgAuthPendingBox">
+                <div class="tg-pending-row">
+                  <div class="spinner" style="width:14px;height:14px;border-width:2px;"></div>
+                  <span>Нажмите <b>«Запустить»</b> в открывшемся боте Telegram...</span>
                 </div>
-                <div class="field-group">
-                  <label class="field-label" for="authPass">Пароль</label>
-                  <input class="field-input" id="authPass" type="password" placeholder="Введите пароль" minlength="4" required />
+                <div class="tg-pending-actions">
+                  <a class="min-btn primary" id="tgOpenBotLink" href="#" target="_blank" rel="noopener" style="padding:7px 14px;font-size:11.5px;text-decoration:none;">Открыть бота</a>
+                  <button type="button" class="min-btn" id="tgCancelAuthBtn" style="padding:7px 12px;font-size:11.5px;">Отмена</button>
                 </div>
-                <div class="auth-msg" id="authMsg"></div>
-                <button type="submit" class="min-btn primary" style="width:100%" id="authSubmitBtn">Войти в APATHY</button>
-              </form>
+              </div>
             </div>
 
             <div id="userBox" style="display:none;">
               <div class="profile-head">
                 <div class="profile-avatar-lg chrome-text" id="profileAvatarLg">AP</div>
                 <div style="min-width:0;flex:1;">
-                  <div style="font-size:17px;font-weight:600;" id="profileUsername">@user</div>
-                  <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">APATHY Chrome Member</div>
+                  <div style="font-size:16px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" id="profileDisplayName">Пользователь</div>
+                  <div style="font-size:11.5px;color:var(--text-dim);margin-top:1px;" id="profileUsername">@user</div>
+                  <div class="sync-badge" id="syncStatusBadge">
+                    <span class="sync-dot"></span>
+                    <span id="syncStatusText">Синхронизировано с Telegram</span>
+                  </div>
                 </div>
-                <button class="min-btn" id="logoutBtn" style="padding:7px 12px;font-size:11.5px;">Выйти</button>
               </div>
               <div class="stats-grid">
                 <div class="stat-box">
@@ -251,6 +271,10 @@
                   <div class="stat-num" id="statPlaylists">0</div>
                   <div class="stat-lbl">Плейлистов</div>
                 </div>
+              </div>
+              <div style="display:flex;gap:8px;margin-top:12px;">
+                <button type="button" class="min-btn primary" id="manualSyncBtn" style="flex:1;padding:8px 12px;font-size:11.5px;">↻ Синхронизировать</button>
+                <button type="button" class="min-btn" id="logoutBtn" style="padding:8px 14px;font-size:11.5px;">Выйти</button>
               </div>
             </div>
           </div>
@@ -511,6 +535,6 @@
   </div>
 
   <script src="https://telegram.org/js/telegram-web-app.js" async></script>
-  <script src="./app.js?v=27"></script>
+  <script src="./app.js?v=29"></script>
 </body>
 </html>
