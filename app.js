@@ -120,14 +120,46 @@
 
       // ================= THEME MANAGER =================
       const THEME_META = {
-        chrome: { label: 'Тёмный хром', color: '#06070a' },
-        purple: { label: 'Тёмно-фиолетовый', color: '#08050f' },
-        red:    { label: 'Красно-тёмный', color: '#0b0406' }
+        chrome: {
+          label: 'Тёмный хром',
+          color: '#06070a',
+          hi: '#f2f6ff',
+          mid: '#9aa7bc',
+          rim: '#d4dfef',
+          dark: '#141822',
+          deep: '#0a0c12',
+          mist: 'rgba(184, 202, 228, 0.14)',
+          glow: 'rgba(218, 232, 255, 0.34)'
+        },
+        purple: {
+          label: 'Тёмно-фиолетовый',
+          color: '#08050f',
+          hi: '#f2e8ff',
+          mid: '#9f82d8',
+          rim: '#d5beff',
+          dark: '#181028',
+          deep: '#0b0714',
+          mist: 'rgba(176, 132, 245, 0.15)',
+          glow: 'rgba(202, 166, 255, 0.34)'
+        },
+        red: {
+          label: 'Красно-тёмный',
+          color: '#0b0406',
+          hi: '#ffe8ec',
+          mid: '#c96878',
+          rim: '#f5b8c2',
+          dark: '#220e14',
+          deep: '#100609',
+          mist: 'rgba(235, 92, 114, 0.14)',
+          glow: 'rgba(255, 130, 148, 0.32)'
+        }
       };
+      let activeVizPalette = THEME_META.chrome;
 
       function applyTheme(themeKey, notify = false) {
         if (!THEME_META[themeKey]) themeKey = 'chrome';
         state.theme = themeKey;
+        activeVizPalette = THEME_META[themeKey] || THEME_META.chrome;
         document.documentElement.setAttribute('data-theme', themeKey);
         $('metaThemeColor').setAttribute('content', THEME_META[themeKey].color);
         $('activeThemeLabel').textContent = THEME_META[themeKey].label;
@@ -1185,98 +1217,245 @@
         }
       }
 
-      // ================= SPLASH SCREEN =================
+      // ================= SPLASH SCREEN (ULTRA-SMOOTH GPU UNLOCK v33) =================
+      let splashParticlesActive = false;
+      let splashParticlesRaf = 0;
+      let startSplashParticlesLoop = () => {};
+
       function initSplashParticles() {
-        const canvas = $('splashParticles'), ctx = canvas.getContext('2d');
-        let w = 0, h = 0;
-        const pts = Array.from({ length: 34 }, () => ({
-          x: Math.random(), y: Math.random(), r: Math.random() * 1.6 + 0.5,
-          vx: (Math.random() - 0.5) * 0.00045, vy: -Math.random() * 0.0007 - 0.0002, a: Math.random() * 0.5 + 0.2
+        const canvas = $('splashParticles');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d', { alpha: true });
+        let w = 0, h = 0, dpr = 1;
+        const pts = Array.from({ length: 26 }, () => ({
+          x: Math.random(), y: Math.random(), r: Math.random() * 1.5 + 0.55,
+          vx: (Math.random() - 0.5) * 0.00042, vy: -Math.random() * 0.00062 - 0.00018, a: Math.random() * 0.45 + 0.18
         }));
+
         function resize() {
           const rect = splashScreen.getBoundingClientRect();
-          w = canvas.width = rect.width * devicePixelRatio;
-          h = canvas.height = rect.height * devicePixelRatio;
+          dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+          w = canvas.width = Math.max(1, Math.round(rect.width * dpr));
+          h = canvas.height = Math.max(1, Math.round(rect.height * dpr));
         }
-        resize(); window.addEventListener('resize', resize);
+        resize();
+        window.addEventListener('resize', () => {
+          if (!splashScreen.classList.contains('hidden')) resize();
+        });
+
         function draw() {
-          if (!splashScreen.classList.contains('hidden')) {
-            ctx.clearRect(0, 0, w, h);
-            const col = getComputedStyle(document.documentElement).getPropertyValue('--viz-color-1').trim() || '#e4ecf8';
-            pts.forEach(p => {
-              p.x += p.vx; p.y += p.vy;
-              if (p.y < -0.05) { p.y = 1.05; p.x = Math.random(); }
-              if (p.x < 0) p.x = 1; if (p.x > 1) p.x = 0;
-              ctx.globalAlpha = p.a; ctx.fillStyle = col;
-              ctx.beginPath(); ctx.arc(p.x * w, p.y * h, p.r * devicePixelRatio, 0, Math.PI * 2); ctx.fill();
-            });
+          if (!splashParticlesActive || splashScreen.classList.contains('hidden') || document.hidden) {
+            splashParticlesActive = false;
+            splashParticlesRaf = 0;
+            return;
           }
-          requestAnimationFrame(draw);
+          ctx.clearRect(0, 0, w, h);
+          ctx.fillStyle = activeVizPalette.hi;
+          for (let i = 0; i < pts.length; i++) {
+            const p = pts[i];
+            p.x += p.vx;
+            p.y += p.vy;
+            if (p.y < -0.04) { p.y = 1.04; p.x = Math.random(); }
+            if (p.x < 0) p.x = 1;
+            else if (p.x > 1) p.x = 0;
+            ctx.globalAlpha = p.a;
+            ctx.beginPath();
+            ctx.arc(p.x * w, p.y * h, p.r * dpr, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          ctx.globalAlpha = 1;
+          splashParticlesRaf = requestAnimationFrame(draw);
         }
-        draw();
+
+        startSplashParticlesLoop = () => {
+          if (splashParticlesActive) return;
+          resize();
+          splashParticlesActive = true;
+          splashParticlesRaf = requestAnimationFrame(draw);
+        };
+
+        if (!splashScreen.classList.contains('hidden')) {
+          startSplashParticlesLoop();
+        }
       }
 
+      let chromeFlashTimer = null;
       function triggerChromeFlash() {
+        clearTimeout(chromeFlashTimer);
         chromeFlash.classList.remove('active');
-        void chromeFlash.offsetWidth;
-        chromeFlash.classList.add('active');
+        requestAnimationFrame(() => {
+          chromeFlash.classList.add('active');
+          chromeFlashTimer = setTimeout(() => chromeFlash.classList.remove('active'), 360);
+        });
       }
 
       function unlockFromSplash() {
-        try { playUnlockChime(); } catch (e) {}
-        triggerChromeFlash();
+        splashParticlesActive = false;
+        if (splashParticlesRaf) {
+          cancelAnimationFrame(splashParticlesRaf);
+          splashParticlesRaf = 0;
+        }
         splashScreen.classList.add('hidden');
         mainApp.classList.add('visible');
+        triggerChromeFlash();
+        // Play chime on next frame so AudioContext init never stalls the visual unlock frame
+        setTimeout(() => {
+          try { playUnlockChime(); } catch (e) {}
+        }, 16);
       }
 
       function initCrossSwipe() {
-        const cross = $('draggableCross'), ring = $('crossRing');
-        let dragging = false, startX = 0, startY = 0, dx = 0, dy = 0, startTime = 0;
-        function onStart(e) {
-          unlockAudioForIos(); dragging = true;
-          const pt = e.touches ? e.touches[0] : e;
-          startX = pt.clientX; startY = pt.clientY; dx = 0; dy = 0; startTime = performance.now();
-          cross.style.transition = 'none';
-        }
-        function onMove(e) {
+        const cross = $('draggableCross');
+        const ring = $('crossRing');
+        const glow = $('crossGlow');
+        let dragging = false;
+        let unlocked = false;
+        let pointerId = null;
+        let startX = 0, startY = 0, dx = 0, dy = 0, startTime = 0;
+        let rafPending = false;
+
+        function paintDragFrame() {
+          rafPending = false;
           if (!dragging) return;
-          if (e.cancelable) e.preventDefault();
-          const pt = e.touches ? e.touches[0] : e;
-          dx = pt.clientX - startX; dy = pt.clientY - startY;
-          const dist = Math.hypot(dx, dy), prog = Math.min(dist / 100, 1);
-          cross.style.transform = `translate3d(${dx}px, ${dy}px, 0) rotate(${dx * 0.14}deg) scale(${1 + prog * 0.12})`;
-          cross.style.filter = `drop-shadow(0 0 ${24 + prog * 34}px var(--accent-glow)) brightness(${1 + prog * 0.35})`;
-          ring.style.transform = `scale(${1 + prog * 0.32})`; ring.style.opacity = String(0.55 + prog * 0.45);
-        }
-        function onEnd() {
-          if (!dragging) return; dragging = false;
-          const dist = Math.hypot(dx, dy), velocity = dist / Math.max(performance.now() - startTime, 1);
-          if (dist > 78 || (dist > 36 && velocity > 0.42)) {
-            const angle = Math.atan2(dy, dx);
-            cross.style.transition = 'transform 0.42s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.35s ease';
-            cross.style.transform = `translate3d(${Math.cos(angle) * 320}px, ${Math.sin(angle) * 320}px, 0) rotate(${dx * 0.3}deg) scale(1.35)`;
-            cross.style.opacity = '0';
-            unlockFromSplash();
-            setTimeout(() => {
-              cross.style.transition = 'none'; cross.style.transform = 'translate3d(0,0,0)';
-              cross.style.opacity = '1'; cross.style.filter = ''; ring.style.transform = ''; ring.style.opacity = '';
-            }, 650);
-          } else {
-            cross.style.transition = 'transform 0.45s cubic-bezier(0.22, 1.4, 0.36, 1), filter 0.3s ease';
-            cross.style.transform = 'translate3d(0, 0, 0) rotate(0deg) scale(1)';
-            cross.style.filter = ''; ring.style.transform = 'scale(1)'; ring.style.opacity = '0.55';
+          const dist = Math.hypot(dx, dy);
+          const prog = Math.min(dist / 92, 1);
+          // Pure GPU-composited transform & opacity only (ZERO filter re-rasterization!)
+          cross.style.transform = `translate3d(${dx}px, ${dy}px, 0) rotate(${(dx * 0.12).toFixed(2)}deg) scale(${(1 + prog * 0.1).toFixed(3)})`;
+          if (ring) {
+            ring.style.transform = `translate3d(0, 0, 0) scale(${(1 + prog * 0.28).toFixed(3)})`;
+            ring.style.opacity = (0.55 + prog * 0.42).toFixed(2);
+          }
+          if (glow) {
+            glow.style.transform = `translate3d(${(dx * 0.45).toFixed(1)}px, ${(dy * 0.45).toFixed(1)}px, 0) scale(${(1 + prog * 0.35).toFixed(3)})`;
+            glow.style.opacity = (0.48 + prog * 0.48).toFixed(2);
           }
         }
-        cross.addEventListener('mousedown', onStart);
-        window.addEventListener('mousemove', onMove);
-        window.addEventListener('mouseup', onEnd);
-        cross.addEventListener('touchstart', onStart, { passive: true });
-        window.addEventListener('touchmove', onMove, { passive: false });
-        window.addEventListener('touchend', onEnd);
+
+        function resetCrossVisuals() {
+          cross.style.transition = 'none';
+          cross.style.transform = 'translate3d(0, 0, 0)';
+          cross.style.opacity = '1';
+          if (ring) {
+            ring.style.transition = 'none';
+            ring.style.transform = 'translate3d(0, 0, 0) scale(1)';
+            ring.style.opacity = '0.55';
+          }
+          if (glow) {
+            glow.style.transition = 'none';
+            glow.style.transform = 'translate3d(0, 0, 0) scale(1)';
+            glow.style.opacity = '0.48';
+          }
+        }
+
+        function beginDrag(clientX, clientY, pid = null) {
+          if (unlocked || splashScreen.classList.contains('hidden')) return;
+          dragging = true;
+          pointerId = pid;
+          startX = clientX;
+          startY = clientY;
+          dx = 0;
+          dy = 0;
+          startTime = performance.now();
+          cross.style.transition = 'none';
+          if (ring) ring.style.transition = 'none';
+          if (glow) glow.style.transition = 'none';
+          unlockAudioForIos();
+        }
+
+        function moveDrag(clientX, clientY) {
+          if (!dragging) return;
+          dx = clientX - startX;
+          dy = clientY - startY;
+          if (!rafPending) {
+            rafPending = true;
+            requestAnimationFrame(paintDragFrame);
+          }
+        }
+
+        function finishDrag() {
+          if (!dragging) return;
+          dragging = false;
+          pointerId = null;
+          const dist = Math.hypot(dx, dy);
+          const velocity = dist / Math.max(performance.now() - startTime, 1);
+
+          if (dist > 54 || (dist > 22 && velocity > 0.28)) {
+            unlocked = true;
+            const angle = Math.atan2(dy, dx);
+            cross.style.transition = 'transform 0.22s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease-out';
+            cross.style.transform = `translate3d(${(Math.cos(angle) * 260).toFixed(1)}px, ${(Math.sin(angle) * 260).toFixed(1)}px, 0) rotate(${(dx * 0.24).toFixed(1)}deg) scale(1.22)`;
+            cross.style.opacity = '0';
+            if (ring) {
+              ring.style.transition = 'transform 0.22s ease-out, opacity 0.2s ease-out';
+              ring.style.transform = 'translate3d(0, 0, 0) scale(1.42)';
+              ring.style.opacity = '0';
+            }
+            if (glow) {
+              glow.style.transition = 'transform 0.22s ease-out, opacity 0.2s ease-out';
+              glow.style.transform = 'translate3d(0, 0, 0) scale(1.55)';
+              glow.style.opacity = '0';
+            }
+            unlockFromSplash();
+            setTimeout(() => {
+              unlocked = false;
+              resetCrossVisuals();
+            }, 300);
+          } else {
+            cross.style.transition = 'transform 0.28s cubic-bezier(0.22, 1.4, 0.36, 1)';
+            cross.style.transform = 'translate3d(0, 0, 0)';
+            if (ring) {
+              ring.style.transition = 'transform 0.24s ease-out, opacity 0.24s ease-out';
+              ring.style.transform = 'translate3d(0, 0, 0) scale(1)';
+              ring.style.opacity = '0.55';
+            }
+            if (glow) {
+              glow.style.transition = 'transform 0.24s ease-out, opacity 0.24s ease-out';
+              glow.style.transform = 'translate3d(0, 0, 0) scale(1)';
+              glow.style.opacity = '0.48';
+            }
+          }
+        }
+
+        if ('PointerEvent' in window) {
+          cross.addEventListener('pointerdown', (e) => {
+            if (e.button && e.button !== 0) return;
+            try { cross.setPointerCapture(e.pointerId); } catch (err) {}
+            beginDrag(e.clientX, e.clientY, e.pointerId);
+          });
+          cross.addEventListener('pointermove', (e) => {
+            if (!dragging || (pointerId !== null && e.pointerId !== pointerId)) return;
+            moveDrag(e.clientX, e.clientY);
+          });
+          cross.addEventListener('pointerup', (e) => {
+            if (pointerId !== null && e.pointerId !== pointerId) return;
+            try { cross.releasePointerCapture(e.pointerId); } catch (err) {}
+            finishDrag();
+          });
+          cross.addEventListener('pointercancel', finishDrag);
+        } else {
+          cross.addEventListener('mousedown', (e) => beginDrag(e.clientX, e.clientY));
+          window.addEventListener('mousemove', (e) => moveDrag(e.clientX, e.clientY));
+          window.addEventListener('mouseup', finishDrag);
+          cross.addEventListener('touchstart', (e) => {
+            const pt = e.touches && e.touches[0];
+            if (pt) beginDrag(pt.clientX, pt.clientY);
+          }, { passive: true });
+          window.addEventListener('touchmove', (e) => {
+            if (!dragging) return;
+            if (e.cancelable) e.preventDefault();
+            const pt = e.touches && e.touches[0];
+            if (pt) moveDrag(pt.clientX, pt.clientY);
+          }, { passive: false });
+          window.addEventListener('touchend', finishDrag);
+        }
+
         const pill = splashScreen.querySelector('.swipe-pill');
         if (pill) {
           pill.style.cursor = 'pointer';
-          pill.addEventListener('click', () => { unlockAudioForIos(); unlockFromSplash(); });
+          pill.addEventListener('click', () => {
+            unlockAudioForIos();
+            unlockFromSplash();
+          });
         }
       }
 
@@ -1973,16 +2152,287 @@
       }
 
       function initPlayerLoopAndVisualizer() {
-        const canvas = $('playerVizCanvas'), ctx = canvas.getContext('2d');
-        let cw = 0, ch = 0, phase = 0;
+        const canvas = $('playerVizCanvas');
+        const ctx = canvas.getContext('2d', { alpha: true });
+        let cw = 0, ch = 0, dpr = 1;
+        let windTime = 0;
+        let windSpeedCur = 0.14;
+        let windAmpCur = 0.22;
+        let pulseCur = 0;
+
+        // Deterministic PRNG so the chrome forest silhouette stays elegant and stable across resizes
+        function mulberry32(seed) {
+          let a = seed >>> 0;
+          return function() {
+            a |= 0; a = (a + 0x6D2B79F5) | 0;
+            let t = Math.imul(a ^ (a >>> 15), 1 | a);
+            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+          };
+        }
+
+        let forestLayers = [[], [], []];
+        let standingCrosses = [];
+        let floatingCrosses = [];
+        let windMotes = [];
+
+        function buildChromeForestScene() {
+          const rand = mulberry32(20261126);
+          forestLayers = [[], [], []];
+          standingCrosses = [];
+          floatingCrosses = [];
+          windMotes = [];
+
+          // 3 parallax depth layers of gothic chrome conifers / pines
+          const layerSpecs = [
+            { count: 22, minH: 0.26, maxH: 0.44, minW: 0.045, maxW: 0.082, tiersMin: 5, tiersMax: 7, swayScale: 0.55 }, // Back mist treeline
+            { count: 15, minH: 0.34, maxH: 0.56, minW: 0.062, maxW: 0.105, tiersMin: 6, tiersMax: 8, swayScale: 0.85 }, // Mid metallic chrome pines
+            { count: 10, minH: 0.42, maxH: 0.68, minW: 0.080, maxW: 0.135, tiersMin: 6, tiersMax: 9, swayScale: 1.15 }  // Foreground sculpted chrome trees
+          ];
+
+          layerSpecs.forEach((spec, layerIdx) => {
+            for (let i = 0; i < spec.count; i++) {
+              const frac = (i + 0.15 + rand() * 0.7) / spec.count;
+              // Foreground trees frame left & right edges more densely so center UI stays airy
+              let xNorm = frac;
+              if (layerIdx === 2) {
+                const side = i % 2 === 0 ? 0 : 1;
+                const localF = Math.floor(i / 2) / Math.max(1, Math.floor(spec.count / 2));
+                xNorm = side === 0 ? (0.02 + localF * 0.34 + rand() * 0.05) : (0.98 - localF * 0.34 - rand() * 0.05);
+              }
+              const hNorm = spec.minH + rand() * (spec.maxH - spec.minH);
+              const wNorm = spec.minW + rand() * (spec.maxW - spec.minW);
+              const tiers = spec.tiersMin + Math.floor(rand() * (spec.tiersMax - spec.tiersMin + 1));
+              forestLayers[layerIdx].push({
+                xNorm,
+                hNorm,
+                wNorm,
+                tiers,
+                lean: (rand() - 0.5) * 0.18,
+                phase: rand() * Math.PI * 2,
+                freq: 0.78 + rand() * 0.55,
+                swayScale: spec.swayScale * (0.82 + rand() * 0.36),
+                hasTopCross: rand() < (layerIdx === 1 ? 0.24 : 0.14),
+                rimAlpha: layerIdx === 0 ? 0.22 : (layerIdx === 1 ? 0.42 : 0.62)
+              });
+            }
+          });
+
+          // Standing APATHY gothic chrome crosses rising through the misty forest floor
+          const crossPositions = [0.11, 0.26, 0.42, 0.58, 0.74, 0.89];
+          crossPositions.forEach((xp, idx) => {
+            standingCrosses.push({
+              xNorm: xp + (rand() - 0.5) * 0.04,
+              hNorm: 0.13 + rand() * 0.12,
+              layer: idx % 2 === 0 ? 1 : 2,
+              phase: rand() * Math.PI * 2,
+              tiltBase: (rand() - 0.5) * 0.06,
+              shimmerPhase: rand() * Math.PI * 2
+            });
+          });
+
+          // Ethereal drifting chrome crosses & diamond glints carried by the wind
+          for (let i = 0; i < 12; i++) {
+            floatingCrosses.push({
+              x: rand(),
+              y: 0.12 + rand() * 0.66,
+              size: 7 + rand() * 11,
+              speedX: 0.018 + rand() * 0.032,
+              speedY: -0.005 - rand() * 0.01,
+              phase: rand() * Math.PI * 2,
+              rot: (rand() - 0.5) * 0.45,
+              rotSpeed: (rand() - 0.5) * 0.5,
+              alpha: 0.18 + rand() * 0.34
+            });
+          }
+
+          // Fine chrome wind motes / mist needles
+          for (let i = 0; i < 36; i++) {
+            windMotes.push({
+              x: rand(),
+              y: 0.18 + rand() * 0.8,
+              len: 5 + rand() * 16,
+              speed: 0.055 + rand() * 0.11,
+              phase: rand() * Math.PI * 2,
+              alpha: 0.09 + rand() * 0.22
+            });
+          }
+        }
+
+        function drawGothicChromeCross(cx, cy, hPx, tiltRad, alpha, pal, shimmer) {
+          const wPx = hPx * 0.66;
+          const armY = -hPx * 0.66;
+          const topY = -hPx;
+          const neckW = Math.max(1.2, hPx * 0.055);
+          const armHalf = wPx * 0.5;
+          const coreHalf = Math.max(2.2, hPx * 0.095);
+
+          ctx.save();
+          ctx.translate(cx, cy);
+          ctx.rotate(tiltRad);
+          ctx.globalAlpha = alpha;
+
+          const grad = ctx.createLinearGradient(-armHalf, topY, armHalf, 0);
+          grad.addColorStop(0, pal.hi);
+          grad.addColorStop(0.28, pal.mid);
+          grad.addColorStop(0.52, pal.dark);
+          grad.addColorStop(0.78, pal.rim);
+          grad.addColorStop(1, pal.hi);
+
+          // Pointed APATHY diamond-flare cross silhouette
+          ctx.beginPath();
+          ctx.moveTo(0, topY);
+          ctx.lineTo(neckW, armY - neckW * 1.4);
+          ctx.lineTo(coreHalf, armY - neckW * 0.55);
+          ctx.lineTo(armHalf, armY);
+          ctx.lineTo(coreHalf, armY + neckW * 0.55);
+          ctx.lineTo(neckW, armY + neckW * 1.5);
+          ctx.lineTo(0, 0);
+          ctx.lineTo(-neckW, armY + neckW * 1.5);
+          ctx.lineTo(-coreHalf, armY + neckW * 0.55);
+          ctx.lineTo(-armHalf, armY);
+          ctx.lineTo(-coreHalf, armY - neckW * 0.55);
+          ctx.lineTo(-neckW, armY - neckW * 1.4);
+          ctx.closePath();
+
+          ctx.fillStyle = grad;
+          ctx.fill();
+
+          // Sharp metallic chrome bevel highlight
+          ctx.strokeStyle = pal.hi;
+          ctx.globalAlpha = alpha * (0.45 + shimmer * 0.45);
+          ctx.lineWidth = Math.max(0.8, dpr * 0.9);
+          ctx.stroke();
+
+          // Center diamond specular glint
+          ctx.fillStyle = '#ffffff';
+          ctx.globalAlpha = alpha * (0.55 + shimmer * 0.4);
+          const dSize = Math.max(1.4, hPx * 0.052);
+          ctx.beginPath();
+          ctx.moveTo(0, armY - dSize);
+          ctx.lineTo(dSize, armY);
+          ctx.lineTo(0, armY + dSize);
+          ctx.lineTo(-dSize, armY);
+          ctx.closePath();
+          ctx.fill();
+
+          ctx.restore();
+        }
+
+        function drawChromePineTree(tree, layerIdx, baseY, windT, windAmp, pal) {
+          const bx = tree.xNorm * cw;
+          const hPx = tree.hNorm * ch;
+          const wPx = tree.wNorm * cw;
+
+          // Traveling wind gust wave sweeping across the forest (left -> right)
+          const gust = Math.sin(windT * 1.35 - tree.xNorm * 5.2 + tree.phase)
+            + 0.48 * Math.sin(windT * 2.55 - tree.xNorm * 8.4 + tree.phase * 1.4)
+            + 0.25 * Math.cos(windT * 0.62 + tree.phase);
+
+          // Base stays rooted; canopy bends smoothly with wind
+          const topShift = (tree.lean * wPx * 0.45) + gust * (14 * dpr + hPx * 0.072) * windAmp * tree.swayScale;
+          const midShift = topShift * 0.36;
+
+          const topX = bx + topShift;
+          const topY = baseY - hPx;
+
+          // 1) Chrome curved trunk
+          const trunkW = Math.max(1.4 * dpr, wPx * (layerIdx === 2 ? 0.095 : 0.075));
+          ctx.beginPath();
+          ctx.moveTo(bx - trunkW * 0.55, baseY + 4 * dpr);
+          ctx.quadraticCurveTo(bx + midShift - trunkW * 0.22, baseY - hPx * 0.5, topX, topY);
+          ctx.quadraticCurveTo(bx + midShift + trunkW * 0.22, baseY - hPx * 0.5, bx + trunkW * 0.55, baseY + 4 * dpr);
+          ctx.closePath();
+          ctx.fillStyle = layerIdx === 0 ? pal.deep : pal.dark;
+          ctx.fill();
+
+          // 2) Layered gothic chrome pine boughs (quadratic bend + windward silver rim)
+          const tiers = tree.tiers;
+          const canopyGrad = ctx.createLinearGradient(bx - wPx, topY, bx + wPx, baseY);
+          if (layerIdx === 0) {
+            canopyGrad.addColorStop(0, pal.mid);
+            canopyGrad.addColorStop(0.45, pal.dark);
+            canopyGrad.addColorStop(1, pal.deep);
+          } else if (layerIdx === 1) {
+            canopyGrad.addColorStop(0, pal.rim);
+            canopyGrad.addColorStop(0.28, pal.dark);
+            canopyGrad.addColorStop(0.68, pal.mid);
+            canopyGrad.addColorStop(1, pal.deep);
+          } else {
+            canopyGrad.addColorStop(0, pal.hi);
+            canopyGrad.addColorStop(0.22, pal.dark);
+            canopyGrad.addColorStop(0.55, pal.deep);
+            canopyGrad.addColorStop(0.85, pal.mid);
+            canopyGrad.addColorStop(1, '#040508');
+          }
+
+          for (let t = 0; t < tiers; t++) {
+            const p = t / tiers; // 0 = top spire, ~1 = bottom bough
+            const pNext = Math.min(1, (t + 1.28) / tiers);
+            const yTip = topY + p * hPx * 0.84;
+            const yBot = topY + pNext * hPx * 0.88;
+
+            // Quadratic trunk spine offset at yTip and yBot
+            const kTip = Math.pow(1 - p * 0.84, 1.65);
+            const kBot = Math.pow(1 - pNext * 0.88, 1.65);
+            const cxTip = bx + topShift * kTip;
+            const cxBot = bx + topShift * kBot;
+
+            // Extra flutter on outer branch tips during wind gusts
+            const tierGust = Math.sin(windT * 2.1 - tree.xNorm * 6.0 + t * 0.65 + tree.phase) * 3.8 * dpr * windAmp * tree.swayScale;
+            const halfSpread = wPx * (0.16 + p * 0.86);
+            const droop = (4 + p * 11) * dpr;
+
+            const leftX = cxBot - halfSpread + tierGust * 0.7;
+            const rightX = cxBot + halfSpread + tierGust * 1.15;
+
+            ctx.beginPath();
+            ctx.moveTo(cxTip, yTip);
+            ctx.quadraticCurveTo(cxTip - halfSpread * 0.45, (yTip + yBot) * 0.52, leftX, yBot + droop * 0.45);
+            ctx.lineTo(cxBot - halfSpread * 0.24, yBot - droop * 0.15);
+            ctx.lineTo(cxBot, yBot + droop * 0.22);
+            ctx.lineTo(cxBot + halfSpread * 0.24, yBot - droop * 0.15);
+            ctx.lineTo(rightX, yBot + droop * 0.45);
+            ctx.quadraticCurveTo(cxTip + halfSpread * 0.45, (yTip + yBot) * 0.52, cxTip, yTip);
+            ctx.closePath();
+
+            ctx.globalAlpha = layerIdx === 0 ? 0.52 : (layerIdx === 1 ? 0.78 : 0.92);
+            ctx.fillStyle = canopyGrad;
+            ctx.fill();
+
+            // Liquid-chrome highlight along top-left windward silhouette edge
+            ctx.beginPath();
+            ctx.moveTo(cxTip, yTip);
+            ctx.quadraticCurveTo(cxTip - halfSpread * 0.42, (yTip + yBot) * 0.5, leftX, yBot + droop * 0.42);
+            ctx.moveTo(cxTip, yTip);
+            ctx.quadraticCurveTo(cxTip + halfSpread * 0.42, (yTip + yBot) * 0.5, rightX, yBot + droop * 0.42);
+            ctx.strokeStyle = pal.hi;
+            ctx.globalAlpha = tree.rimAlpha * (0.55 + 0.45 * (1 - p));
+            ctx.lineWidth = (layerIdx === 2 ? 1.15 : 0.8) * dpr;
+            ctx.stroke();
+          }
+
+          // Optional small gothic spire cross crowning select chrome trees
+          if (tree.hasTopCross) {
+            const spireTilt = (topShift / Math.max(hPx, 1)) * 0.85;
+            drawGothicChromeCross(topX, topY + 2 * dpr, 15 * dpr, spireTilt, layerIdx === 1 ? 0.48 : 0.62, pal, 0.5 + 0.5 * Math.sin(windT * 1.8 + tree.phase));
+          }
+        }
+
         function resize() {
           const rect = playerOverlay.getBoundingClientRect();
-          cw = canvas.width = Math.max(1, rect.width) * devicePixelRatio;
-          ch = canvas.height = Math.max(1, rect.height) * devicePixelRatio;
+          dpr = Math.min(window.devicePixelRatio || 1, 1.75);
+          cw = canvas.width = Math.max(1, Math.round(rect.width * dpr));
+          ch = canvas.height = Math.max(1, Math.round(rect.height * dpr));
+          buildChromeForestScene();
         }
-        resize(); window.addEventListener('resize', resize);
+        resize();
+        window.addEventListener('resize', resize);
 
         function tick(now) {
+          const dtRaw = lastTickTime ? (now - lastTickTime) / 1000 : 0.016;
+          const dt = Math.min(Math.max(dtRaw, 0.001), 0.05);
+
           if (state.isPlaying && state.currentTrack) {
             const track = state.currentTrack;
             if (currentAudioMode === 'stream') {
@@ -1999,7 +2449,6 @@
                 }
               }
             } else {
-              const dt = (now - lastTickTime) / 1000;
               if (dt > 0 && dt < 0.5) state.currentTime += dt;
               if (state.currentTime >= track.duration) {
                 if (state.repeat) { state.currentTime = 0; startSynthLoop(track); }
@@ -2010,44 +2459,119 @@
           }
           lastTickTime = now;
 
-          if (playerOverlay.classList.contains('open')) {
+          if (playerOverlay.classList.contains('open') && !document.hidden && cw > 1 && ch > 1) {
+            const pal = activeVizPalette;
+
+            // Smooth wind transition: lively wind when playing, ultra-slow breathing drift when paused!
+            const targetSpeed = state.isPlaying ? 1.55 : 0.16;
+            const targetAmp = state.isPlaying ? 1.05 : 0.24;
+            const easeRate = Math.min(1, dt * 3.2);
+            windSpeedCur += (targetSpeed - windSpeedCur) * easeRate;
+            windAmpCur += (targetAmp - windAmpCur) * easeRate;
+            windTime += dt * windSpeedCur;
+
+            // Optional subtle beat pulse from analyser (synth) or gentle harmonic breathing (stream)
+            let beatBoost = 0;
+            if (state.isPlaying) {
+              if (analyser && currentAudioMode === 'synth') {
+                const bins = new Uint8Array(analyser.frequencyBinCount);
+                analyser.getByteFrequencyData(bins);
+                beatBoost = ((bins[1] + bins[2] + bins[3]) / (3 * 255)) * 0.35;
+              } else {
+                beatBoost = 0.14 * Math.abs(Math.sin(windTime * 1.9));
+              }
+            }
+            pulseCur += (beatBoost - pulseCur) * Math.min(1, dt * 6);
+            const effAmp = windAmpCur + pulseCur;
+
             ctx.clearRect(0, 0, cw, ch);
-            const cs = getComputedStyle(document.documentElement);
-            const c1 = cs.getPropertyValue('--viz-color-1').trim() || '#e4ecf8';
-            const c2 = cs.getPropertyValue('--viz-color-2').trim() || '#768499';
-            const amp = state.isPlaying ? 1.0 : 0.18;
 
-            let dataArr = null;
-            if (analyser && state.isPlaying && currentAudioMode === 'synth') {
-              dataArr = new Uint8Array(analyser.frequencyBinCount);
-              analyser.getByteFrequencyData(dataArr);
+            // 1) Atmospheric chrome horizon glow behind the forest
+            const horizonGrad = ctx.createRadialGradient(cw * 0.5, ch * 0.84, cw * 0.04, cw * 0.5, ch * 0.78, cw * 0.72);
+            horizonGrad.addColorStop(0, pal.glow);
+            horizonGrad.addColorStop(0.42, pal.mist);
+            horizonGrad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = horizonGrad;
+            ctx.fillRect(0, 0, cw, ch);
+
+            // 2) Floating chrome crosses carried slowly across the sky in the wind
+            for (let i = 0; i < floatingCrosses.length; i++) {
+              const fc = floatingCrosses[i];
+              fc.x += fc.speedX * dt * windSpeedCur;
+              fc.y += fc.speedY * dt * (0.4 + windSpeedCur * 0.5) + Math.sin(windTime + fc.phase) * 0.00025;
+              if (fc.x > 1.08) { fc.x = -0.08; fc.y = 0.14 + ((i * 0.17) % 0.64); }
+              if (fc.y < 0.06) fc.y = 0.74;
+              const tilt = fc.rot + Math.sin(windTime * 0.9 + fc.phase) * 0.18 * effAmp;
+              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 2.1 + fc.phase);
+              drawGothicChromeCross(fc.x * cw, fc.y * ch, fc.size * dpr, tilt, fc.alpha, pal, shimmer);
             }
 
-            phase += state.isPlaying ? 0.055 : 0.012;
-            const baseY = ch * 0.86, bars = 40, step = cw / bars;
-
-            ctx.beginPath();
-            for (let i = 0; i <= bars; i++) {
-              const x = i * step;
-              const sim = 0.25 + 0.35 * Math.abs(Math.sin(phase * 1.4 + i * 0.31)) + 0.22 * Math.abs(Math.cos(phase * 2.1 - i * 0.19));
-              const fVal = dataArr ? dataArr[i % dataArr.length] / 255 : sim;
-              const wave = Math.sin(phase * 1.3 + i * 0.28) * 12 * devicePixelRatio * amp;
-              const y = baseY - (fVal * 52 * devicePixelRatio * amp) + wave;
-              if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            // 3) Back layer chrome forest + misty band
+            const baseY = ch + 6 * dpr;
+            for (let i = 0; i < forestLayers[0].length; i++) {
+              drawChromePineTree(forestLayers[0][i], 0, baseY, windTime, effAmp, pal);
             }
-            const grad = ctx.createLinearGradient(0, baseY - 60 * devicePixelRatio, cw, baseY + 20 * devicePixelRatio);
-            grad.addColorStop(0, c2); grad.addColorStop(0.5, c1); grad.addColorStop(1, c2);
-            ctx.strokeStyle = grad; ctx.lineWidth = 2 * devicePixelRatio; ctx.stroke();
 
-            ctx.fillStyle = c1; ctx.globalAlpha = 0.14;
-            for (let i = 0; i < bars; i++) {
-              const sim = 0.22 + 0.45 * Math.abs(Math.sin(phase * 1.6 + i * 0.37));
-              const fVal = dataArr ? dataArr[i % dataArr.length] / 255 : sim;
-              const bh = Math.max(4, fVal * 46 * devicePixelRatio * amp);
-              ctx.fillRect(i * step + 2 * devicePixelRatio, ch - bh - 12 * devicePixelRatio, step - 4 * devicePixelRatio, bh);
+            // Ground mist between back & mid forest
+            const mistBand1 = ctx.createLinearGradient(0, ch * 0.64, 0, ch);
+            mistBand1.addColorStop(0, 'rgba(0,0,0,0)');
+            mistBand1.addColorStop(0.55, pal.mist);
+            mistBand1.addColorStop(1, 'rgba(4,5,8,0.82)');
+            ctx.globalAlpha = 0.9;
+            ctx.fillStyle = mistBand1;
+            ctx.fillRect(0, ch * 0.62, cw, ch * 0.38);
+
+            // 4) Mid layer chrome forest + mid standing chrome crosses
+            for (let i = 0; i < forestLayers[1].length; i++) {
+              drawChromePineTree(forestLayers[1][i], 1, baseY, windTime, effAmp, pal);
             }
+            for (let i = 0; i < standingCrosses.length; i++) {
+              const sc = standingCrosses[i];
+              if (sc.layer !== 1) continue;
+              const swayTilt = sc.tiltBase + Math.sin(windTime * 1.15 - sc.xNorm * 4 + sc.phase) * 0.055 * effAmp;
+              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 2.2 + sc.shimmerPhase);
+              drawGothicChromeCross(sc.xNorm * cw, ch * 0.99, sc.hNorm * ch, swayTilt, 0.58, pal, shimmer);
+            }
+
+            // 5) Diagonal chrome wind needles / mist streaks
+            ctx.strokeStyle = pal.hi;
+            ctx.lineWidth = Math.max(0.8, 0.95 * dpr);
+            for (let i = 0; i < windMotes.length; i++) {
+              const m = windMotes[i];
+              m.x += m.speed * dt * windSpeedCur;
+              m.y += Math.sin(windTime * 1.4 + m.phase) * 0.00045;
+              if (m.x > 1.06) m.x = -0.06;
+              const mx = m.x * cw;
+              const my = m.y * ch;
+              const streakLen = m.len * dpr * (0.45 + effAmp * 0.9);
+              ctx.globalAlpha = m.alpha * (state.isPlaying ? 0.95 : 0.45);
+              ctx.beginPath();
+              ctx.moveTo(mx, my);
+              ctx.lineTo(mx + streakLen, my - streakLen * 0.14);
+              ctx.stroke();
+            }
+
+            // 6) Foreground sculpted chrome forest + foreground gothic chrome crosses
+            for (let i = 0; i < forestLayers[2].length; i++) {
+              drawChromePineTree(forestLayers[2][i], 2, baseY, windTime, effAmp, pal);
+            }
+            for (let i = 0; i < standingCrosses.length; i++) {
+              const sc = standingCrosses[i];
+              if (sc.layer !== 2) continue;
+              const swayTilt = sc.tiltBase + Math.sin(windTime * 1.3 - sc.xNorm * 5 + sc.phase) * 0.075 * effAmp;
+              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 2.6 + sc.shimmerPhase);
+              drawGothicChromeCross(sc.xNorm * cw, ch * 1.01, sc.hNorm * ch * 1.15, swayTilt, 0.78, pal, shimmer);
+            }
+
+            // Subtle dark floor vignette so scrubber & controls remain super crisp
+            const floorGrad = ctx.createLinearGradient(0, ch * 0.82, 0, ch);
+            floorGrad.addColorStop(0, 'rgba(0,0,0,0)');
+            floorGrad.addColorStop(1, 'rgba(3,4,7,0.78)');
             ctx.globalAlpha = 1;
+            ctx.fillStyle = floorGrad;
+            ctx.fillRect(0, ch * 0.82, cw, ch * 0.18);
           }
+
           requestAnimationFrame(tick);
         }
         requestAnimationFrame(tick);
@@ -2720,6 +3244,7 @@
       $('replaySplashBtn').addEventListener('click', () => {
         splashScreen.classList.remove('hidden');
         mainApp.classList.remove('visible');
+        startSplashParticlesLoop();
       });
 
       if (location.protocol === 'file:') {
