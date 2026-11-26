@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APATHY v30 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
+APATHY v31 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
 ===========================================================================================================
-Исправлено в v30 (обход блокировок YouTube на Docker/VPS-серверах):
+Исправлено в v31 (обход блокировок YouTube на Docker/VPS-серверах):
   1. Мульти-поиск строго по аудиоисточникам одновременно:
        • SoundCloud API v2 (полные треки, прогрессивный MP3 без блокировок дата-центров — идеально для ру-рэпа/андерграунда)
        • Прямые РФ MP3-порталы (Hitmo, Hitmotop, Muzofond, Mp3Party, LightAudio — мгновенный MP3, 0% CPU)
@@ -18,6 +18,8 @@ APATHY v30 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУ�
 
 import asyncio
 import base64
+import gzip
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import secrets
@@ -157,6 +159,14 @@ TG_FILE_PATH_CACHE = BoundedTTLCache(maxsize=220, default_ttl=1800)
 BOT_PICK_CACHE = BoundedTTLCache(maxsize=350, default_ttl=1800)
 PENDING_AUTH_CODES = BoundedTTLCache(maxsize=200, default_ttl=300)
 BG_CACHE_INFLIGHT: set = set()
+BACKUP_LOCK = asyncio.Lock()
+DB_DIRTY: bool = False
+DB_FIRST_DIRTY_AT: float = 0.0
+DB_LAST_DIRTY_AT: float = 0.0
+DB_LAST_BACKUP_AT: float = 0.0
+LAST_BACKUP_MSG_ID: int = 0
+BACKUP_DEBOUNCE_SEC = 45
+BACKUP_MAX_WAIT_SEC = 300
 
 
 # -------------------- БАЗА ДАННЫХ (SQLite) --------------------
@@ -240,14 +250,289 @@ def init_db() -> sqlite3.Connection:
 DB = init_db()
 
 
+def mark_db_dirty() -> None:
+    global DB_DIRTY, DB_FIRST_DIRTY_AT, DB_LAST_DIRTY_AT
+    now = time.time()
+    DB_DIRTY = True
+    DB_LAST_DIRTY_AT = now
+    if DB_FIRST_DIRTY_AT == 0.0:
+        DB_FIRST_DIRTY_AT = now
+
+
 def get_setting(key: str, default: str = "") -> str:
     row = DB.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     return (row["value"] if row else default).strip()
 
 
-def set_setting(key: str, value: str) -> None:
+def set_setting(key: str, value: str, mark_dirty: bool = True) -> None:
     DB.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)", (key, value.strip()))
     DB.commit()
+    if mark_dirty:
+        mark_db_dirty()
+
+
+def get_db_stats() -> Dict[str, int]:
+    try:
+        users_c = int(DB.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"])
+        tracks_c = int(DB.execute("SELECT COUNT(*) AS c FROM tracks WHERE tg_file_id != ''").fetchone()["c"])
+        all_tracks_c = int(DB.execute("SELECT COUNT(*) AS c FROM tracks").fetchone()["c"])
+        states_c = int(DB.execute("SELECT COUNT(*) AS c FROM user_state").fetchone()["c"])
+        pl_total = 0
+        for r in DB.execute("SELECT playlists_json FROM user_state").fetchall():
+            try:
+                pls = json.loads(r["playlists_json"] or "[]")
+                if isinstance(pls, list):
+                    pl_total += len(pls)
+            except Exception:
+                pass
+        return {
+            "users": users_c,
+            "tracks": tracks_c,
+            "all_tracks": all_tracks_c,
+            "states": states_c,
+            "playlists": pl_total,
+        }
+    except Exception:
+        return {"users": 0, "tracks": 0, "all_tracks": 0, "states": 0, "playlists": 0}
+
+
+def _create_db_snapshot_gz_sync(src_db_path: str, out_gz_path: str) -> Tuple[bool, str]:
+    """Безопасный снимок живой SQLite-базы (WAL-совместимый) + проверка целостности + gzip."""
+    tmp_snap = out_gz_path + ".sqlite"
+    try:
+        src = sqlite3.connect(src_db_path, timeout=15)
+        dst = sqlite3.connect(tmp_snap)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+
+        chk_conn = sqlite3.connect(tmp_snap)
+        try:
+            chk = chk_conn.execute("PRAGMA integrity_check").fetchone()
+            if not chk or str(chk[0]).lower() != "ok":
+                return False, "integrity_check_failed"
+        finally:
+            chk_conn.close()
+
+        with open(tmp_snap, "rb") as f_in, gzip.open(out_gz_path, "wb", compresslevel=6) as f_out:
+            shutil.copyfileobj(f_in, f_out, length=65536)
+
+        if not os.path.exists(out_gz_path) or os.path.getsize(out_gz_path) < 64:
+            return False, "empty_gzip"
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:120]
+    finally:
+        try:
+            if os.path.exists(tmp_snap):
+                os.remove(tmp_snap)
+        except OSError:
+            pass
+
+
+def _unpack_and_validate_backup_sync(raw_path: str, out_db_path: str) -> Tuple[bool, str]:
+    """Распаковывает (если gzip) и проверяет целостность файла бэкапа SQLite перед заменой живой БД."""
+    try:
+        with open(raw_path, "rb") as f:
+            magic = f.read(16)
+        if magic.startswith(b"\x1f\x8b"):
+            with gzip.open(raw_path, "rb") as f_in, open(out_db_path, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out, length=65536)
+        elif magic.startswith(b"SQLite format 3"):
+            shutil.copyfile(raw_path, out_db_path)
+        else:
+            return False, "not_sqlite_or_gzip"
+
+        conn = sqlite3.connect(out_db_path)
+        try:
+            chk = conn.execute("PRAGMA integrity_check").fetchone()
+            if not chk or str(chk[0]).lower() != "ok":
+                return False, "corrupt_sqlite"
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if not ({"tracks", "users", "user_state"} & tables):
+                return False, "missing_apathy_tables"
+        finally:
+            conn.close()
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+async def backup_db_to_telegram(bot: Bot, reason: str = "auto") -> Tuple[bool, str, Dict[str, Any]]:
+    """Делает сжатый снимок apathy_music.db, отправляет и закрепляет в приватном канале STORAGE_CHAT_ID."""
+    global DB_DIRTY, DB_FIRST_DIRTY_AT, DB_LAST_BACKUP_AT, LAST_BACKUP_MSG_ID
+
+    st_id = get_storage_chat_id()
+    if not st_id:
+        return False, "STORAGE_CHAT_ID не задан", {}
+
+    stats = get_db_stats()
+    if reason == "auto" and stats["users"] == 0 and stats["all_tracks"] == 0 and stats["states"] == 0:
+        DB_DIRTY = False
+        DB_FIRST_DIRTY_AT = 0.0
+        return False, "empty_db", stats
+
+    async with BACKUP_LOCK:
+        try:
+            DB.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
+
+        with tempfile.TemporaryDirectory(prefix="apathy_bak_") as tmpdir:
+            gz_path = os.path.join(tmpdir, "apathy_backup.db.gz")
+            ok, err = await asyncio.to_thread(_create_db_snapshot_gz_sync, str(DB_PATH), gz_path)
+            if not ok:
+                log.warning("DB backup snapshot failed: %s", err)
+                return False, err, stats
+
+            size_bytes = os.path.getsize(gz_path)
+            if size_bytes > MAX_AUDIO_BYTES:
+                log.warning("DB backup too large for Telegram Bot API getFile (%d bytes)", size_bytes)
+                return False, f"backup_too_large ({size_bytes // 1024} KB)", stats
+
+            ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            reason_lbl = {"manual": "Ручной бэкап", "shutdown": "Бэкап при остановке", "auto": "Автобэкап"}.get(reason, "Бэкап")
+            caption = (
+                "#apathy_db_backup\n"
+                f"💾 <b>{reason_lbl} базы APATHY</b> (v31)\n"
+                f"👤 Пользователей: <b>{stats['users']}</b> · 🎵 Треков: <b>{stats['all_tracks']}</b> · 📋 Плейлистов: <b>{stats['playlists']}</b>\n"
+                f"📦 Размер: <b>{size_bytes / 1024:.1f} КБ</b> · 🕒 {ts_str}"
+            )
+
+            try:
+                doc_file = FSInputFile(gz_path, filename="apathy_backup.db.gz")
+                sent = await bot.send_document(
+                    chat_id=st_id,
+                    document=doc_file,
+                    caption=caption,
+                    parse_mode="HTML",
+                    disable_notification=True,
+                )
+            except Exception as e:
+                log.warning("Failed to upload DB backup to %s: %s", st_id, e)
+                return False, f"send_error: {str(e)[:90]}", stats
+
+            try:
+                await bot.pin_chat_message(chat_id=st_id, message_id=sent.message_id, disable_notification=True)
+            except Exception as e:
+                log.warning("Failed to pin DB backup message in %s: %s", st_id, e)
+
+            # Удаляем предыдущее сообщение с бэкапом (только ПОСЛЕ того как новый успешно закреплён)
+            prev_id_str = get_setting("last_backup_msg_id", "")
+            prev_id = int(prev_id_str) if prev_id_str.isdigit() else LAST_BACKUP_MSG_ID
+            if prev_id and prev_id != sent.message_id:
+                try:
+                    await bot.delete_message(chat_id=st_id, message_id=prev_id)
+                except Exception:
+                    pass
+
+            LAST_BACKUP_MSG_ID = sent.message_id
+            set_setting("last_backup_msg_id", str(sent.message_id), mark_dirty=False)
+
+            DB_DIRTY = False
+            DB_FIRST_DIRTY_AT = 0.0
+            DB_LAST_BACKUP_AT = time.time()
+            log.info(
+                "DB backup uploaded & pinned (reason=%s, msg_id=%d, size=%.1fKB, users=%d, tracks=%d)",
+                reason, sent.message_id, size_bytes / 1024.0, stats["users"], stats["all_tracks"],
+            )
+            return True, "", {**stats, "size_kb": round(size_bytes / 1024.0, 1), "msg_id": sent.message_id}
+
+
+async def restore_db_from_telegram(bot: Bot, force: bool = False) -> Tuple[bool, str, Dict[str, int]]:
+    """Восстанавливает apathy_music.db из закреплённого сообщения в канале STORAGE_CHAT_ID."""
+    global DB, DB_DIRTY, DB_FIRST_DIRTY_AT, LAST_BACKUP_MSG_ID
+
+    st_id = get_storage_chat_id()
+    if not st_id:
+        return False, "STORAGE_CHAT_ID не задан", {}
+
+    cur_stats = get_db_stats()
+    if not force and (cur_stats["users"] > 0 or cur_stats["all_tracks"] > 0 or cur_stats["states"] > 0):
+        log.info(
+            "Local DB already populated (users=%d, tracks=%d, states=%d) — auto-restore skipped",
+            cur_stats["users"], cur_stats["all_tracks"], cur_stats["states"],
+        )
+        return False, "already_populated", cur_stats
+
+    try:
+        chat = await bot.get_chat(st_id)
+    except Exception as e:
+        log.warning("Cannot access STORAGE_CHAT_ID %s for restore: %s", st_id, e)
+        return False, f"chat_access_error: {str(e)[:90]}", cur_stats
+
+    pinned = getattr(chat, "pinned_message", None)
+    if not pinned or not getattr(pinned, "document", None):
+        log.info("No pinned backup document found in storage chat %s", st_id)
+        return False, "no_pinned_backup", cur_stats
+
+    doc = pinned.document
+    fname = (doc.file_name or "").lower()
+    cap = (pinned.caption or "").lower()
+    if "apathy_backup" not in fname and "#apathy_db_backup" not in cap and not fname.endswith((".db", ".db.gz")):
+        return False, "pinned_not_backup", cur_stats
+
+    async with BACKUP_LOCK:
+        with tempfile.TemporaryDirectory(prefix="apathy_rst_") as tmpdir:
+            raw_path = os.path.join(tmpdir, doc.file_name or "apathy_backup.db.gz")
+            out_db = os.path.join(tmpdir, "restored.db")
+            try:
+                await bot.download(doc, destination=raw_path)
+            except Exception as e:
+                log.warning("Failed to download pinned backup: %s", e)
+                return False, f"download_error: {str(e)[:90]}", cur_stats
+
+            ok, err = await asyncio.to_thread(_unpack_and_validate_backup_sync, raw_path, out_db)
+            if not ok:
+                log.warning("Pinned backup validation failed: %s", err)
+                return False, err, cur_stats
+
+            try:
+                DB.close()
+            except Exception:
+                pass
+
+            for suffix in ("", "-wal", "-shm"):
+                p = Path(str(DB_PATH) + suffix)
+                try:
+                    if p.exists():
+                        p.unlink()
+                except OSError:
+                    pass
+
+            shutil.copyfile(out_db, str(DB_PATH))
+            DB = init_db()
+            LAST_BACKUP_MSG_ID = pinned.message_id
+            set_setting("last_backup_msg_id", str(pinned.message_id), mark_dirty=False)
+            DB_DIRTY = False
+            DB_FIRST_DIRTY_AT = 0.0
+
+            new_stats = get_db_stats()
+            log.info(
+                "DB restored from Telegram pinned backup (msg_id=%d, users=%d, tracks=%d, playlists=%d)",
+                pinned.message_id, new_stats["users"], new_stats["all_tracks"], new_stats["playlists"],
+            )
+            return True, "", new_stats
+
+
+async def auto_backup_loop(bot: Bot) -> None:
+    """Фоновый цикл автобэкапа: сохраняет базу в канал через 45 сек после последних изменений."""
+    while True:
+        try:
+            await asyncio.sleep(20)
+            if not DB_DIRTY or not get_storage_chat_id():
+                continue
+            now = time.time()
+            idle_enough = (now - DB_LAST_DIRTY_AT) >= BACKUP_DEBOUNCE_SEC
+            waited_max = DB_FIRST_DIRTY_AT > 0 and (now - DB_FIRST_DIRTY_AT) >= BACKUP_MAX_WAIT_SEC
+            if idle_enough or waited_max:
+                await backup_db_to_telegram(bot, reason="auto")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("auto_backup_loop error: %s", e)
 
 
 def get_storage_chat_id() -> Optional[int]:
@@ -428,6 +713,7 @@ def save_telegram_track(
             ),
         )
     DB.commit()
+    mark_db_dirty()
     row = DB.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
     return track_dict_to_api(dict(row))
 
@@ -493,7 +779,7 @@ def lookup_track_record(track_id: str) -> Optional[Dict[str, Any]]:
 
 
 
-# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v30) ====================
+# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v31) ====================
 def _user_row_to_public(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
     tg_id = int(d["tg_id"])
@@ -533,6 +819,7 @@ async def sync_tg_profile_photo(bot: Bot, tg_id: int, force: bool = False) -> st
                 (fid, now, now, int(tg_id)),
             )
             DB.commit()
+            mark_db_dirty()
             return fid
     except Exception as e:
         log.warning("get_user_profile_photos failed for %s: %s", tg_id, e)
@@ -640,6 +927,7 @@ def upsert_telegram_user(
             (int(tg_id), username or "", first_name or "", last_name or "", photo_url or "", token, now, now),
         )
     DB.commit()
+    mark_db_dirty()
     row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
     return _user_row_to_public(row), row["session_token"]
 
@@ -756,6 +1044,7 @@ def save_user_cloud_state(tg_id: int, playlists: list, liked_ids: list, saved_tr
     if theme in ("chrome", "purple", "red"):
         DB.execute("UPDATE users SET theme = ?, updated_at = ? WHERE tg_id = ?", (theme, now, int(tg_id)))
     DB.commit()
+    mark_db_dirty()
     return now
 
 
@@ -1909,13 +2198,14 @@ async def cmd_start(message: Message, bot: Bot):
 
     total = DB.execute("SELECT COUNT(*) AS c FROM tracks WHERE tg_file_id != ''").fetchone()["c"]
     text = (
-        "<b>APATHY v30 · Музыкальный бот и личные плейлисты</b>\n\n"
+        "<b>APATHY v31 · Музыкальный бот и личные плейлисты</b>\n\n"
         f"🌐 Сайт плеера: {SITE_URL}/\n"
         f"💾 Общих треков в базе: <b>{total}</b>\n\n"
         "• <b>Напиши название трека</b> — ищу по SoundCloud, РФ MP3-порталам и YouTube (строго .mp3).\n"
         "• <b>Перешли любой аудиофайл</b> — сразу появится в плеере APATHY.\n"
         "• <b>/playlists</b> — твои личные плейлисты и избранное\n"
-        "• <b>/test</b> — проверка источников · <b>/list</b> — последние треки"
+        "• <b>/backup</b> — сохранить бэкап базы в канал · <b>/restore</b> — восстановить из канала\n"
+        "• <b>/test</b> — проверка источников и бэкапа · <b>/list</b> — последние треки"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=build_webapp_keyboard(), disable_web_page_preview=True)
 
@@ -1950,8 +2240,51 @@ async def cmd_my_playlists(message: Message):
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=build_webapp_keyboard())
 
 
+@router.message(Command("backup"))
+async def cmd_manual_backup(message: Message, bot: Bot):
+    if ADMIN_ID and message.from_user and message.from_user.id != ADMIN_ID:
+        await message.answer("Только администратор может запускать ручной бэкап.")
+        return
+    m = await message.answer("💾 Создаю и отправляю бэкап базы APATHY в канал-хранилище...")
+    ok, err, info = await backup_db_to_telegram(bot, reason="manual")
+    if ok:
+        await m.edit_text(
+            f"✅ <b>Бэкап сохранён и закреплён в канале!</b>\n\n"
+            f"👤 Пользователей: <b>{info.get('users', 0)}</b>\n"
+            f"🎵 Треков в базе: <b>{info.get('all_tracks', 0)}</b>\n"
+            f"📋 Плейлистов: <b>{info.get('playlists', 0)}</b>\n"
+            f"📦 Размер архива: <b>{info.get('size_kb', 0)} КБ</b>",
+            parse_mode="HTML",
+        )
+    else:
+        await m.edit_text(
+            f"❌ Не удалось сделать бэкап (<code>{err}</code>).\n"
+            "Проверьте переменную <b>STORAGE_CHAT_ID</b> и права бота (публикация и закрепление) в канале.",
+            parse_mode="HTML",
+        )
+
+
+@router.message(Command("restore"))
+async def cmd_manual_restore(message: Message, bot: Bot):
+    if ADMIN_ID and message.from_user and message.from_user.id != ADMIN_ID:
+        await message.answer("Только администратор может восстанавливать базу.")
+        return
+    m = await message.answer("♻️ Загружаю закреплённый бэкап из канала-хранилища...")
+    ok, err, stats = await restore_db_from_telegram(bot, force=True)
+    if ok:
+        await m.edit_text(
+            f"✅ <b>База APATHY восстановлена из Telegram!</b>\n\n"
+            f"👤 Пользователей: <b>{stats.get('users', 0)}</b>\n"
+            f"🎵 Треков в базе: <b>{stats.get('all_tracks', 0)}</b>\n"
+            f"📋 Плейлистов: <b>{stats.get('playlists', 0)}</b>",
+            parse_mode="HTML",
+        )
+    else:
+        await m.edit_text(f"❌ Не удалось восстановить базу: <code>{err}</code>", parse_mode="HTML")
+
+
 @router.message(Command("test"))
-async def cmd_test_sources(message: Message):
+async def cmd_test_sources(message: Message, bot: Bot):
     if HTTP_SESSION_REF is None:
         return
     m = await message.answer("🔎 Проверяю источники аудио с сервера (запрос: Miyagi)...")
@@ -1979,10 +2312,23 @@ async def cmd_test_sources(message: Message):
     )
     cookies_st = "✅ подключён" if (COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 20) else "не загружен"
     ff_st = f"✅ активен ({FFMPEG_SOURCE} · выход строго .mp3)" if HAS_FFMPEG else "⚠️ не установлен — добавьте imageio-ffmpeg в requirements.txt"
+    st_id = get_storage_chat_id()
+    st_txt = "⚠️ не задан (добавьте STORAGE_CHAT_ID)"
+    if st_id:
+        try:
+            st_chat = await bot.get_chat(st_id)
+            has_pin = bool(getattr(st_chat, "pinned_message", None) and getattr(st_chat.pinned_message, "document", None))
+            st_txt = f"✅ <code>{st_id}</code> ({'бэкап закреплён' if has_pin else 'бэкапа пока нет — нажмите /backup'})"
+        except Exception as e:
+            st_txt = f"❌ <code>{st_id}</code> (нет доступа: {str(e)[:40]})"
+    db_s = get_db_stats()
     await m.edit_text(
-        "<b>Диагностика источников сервера (v30):</b>\n\n"
+        "<b>Диагностика источников сервера (v31):</b>\n\n"
         + "\n".join(lines)
-        + f"\n\n🎛 ffmpeg: {ff_st}\n🍪 cookies.txt: {cookies_st}",
+        + f"\n\n🎛 ffmpeg: {ff_st}"
+        + f"\n💾 Бэкап-канал: {st_txt}"
+        + f"\n📊 В базе: {db_s['users']} польз. · {db_s['all_tracks']} трек. · {db_s['playlists']} плейл."
+        + f"\n🍪 cookies.txt: {cookies_st}",
         parse_mode="HTML",
     )
 
@@ -2035,6 +2381,7 @@ async def cmd_delete_track(message: Message):
         if q == r["id"].lower() or q in fold_ru(f"{r['artist']} {r['title']}"):
             DB.execute("DELETE FROM tracks WHERE id = ?", (r["id"],))
             DB.commit()
+            mark_db_dirty()
             await message.answer(f"🗑 Удалено: <b>{r['artist']} — {r['title']}</b>", parse_mode="HTML")
             return
     await message.answer("Трек не найден в базе.")
@@ -2445,6 +2792,7 @@ async def api_user_avatar_upload(request: web.Request) -> web.Response:
         (sqlite3.Binary(raw_bytes), mime, now, now, tg_id),
     )
     DB.commit()
+    mark_db_dirty()
     return web.json_response(
         {
             "ok": True,
@@ -2466,6 +2814,7 @@ async def api_user_avatar_delete(request: web.Request) -> web.Response:
         (now, now, tg_id),
     )
     DB.commit()
+    mark_db_dirty()
     await sync_tg_profile_photo(request.app["bot"], tg_id, force=True)
     fresh = DB.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
     pub = _user_row_to_public(fresh) if fresh else {"photoUrl": "", "hasCustomAvatar": False}
@@ -2506,6 +2855,7 @@ async def api_user_logout(request: web.Request) -> web.Response:
         new_tok = secrets.token_urlsafe(32)
         DB.execute("UPDATE users SET session_token = ?, updated_at = ? WHERE tg_id = ?", (new_tok, int(time.time()), int(row["tg_id"])))
         DB.commit()
+        mark_db_dirty()
     return web.json_response({"ok": True})
 
 
@@ -2514,8 +2864,8 @@ async def api_ping(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "service": "apathy-tg-audio-v30",
-            "version": "v30",
+            "service": "apathy-tg-audio-v31",
+            "version": "v31",
             "bot": BOT_USERNAME_CACHE,
             "siteUrl": SITE_URL,
             "tracksCount": total,
@@ -2774,7 +3124,18 @@ async def main():
 
     me = await bot.get_me()
     BOT_USERNAME_CACHE = f"@{me.username}" if me.username else str(me.id)
-    log.info("APATHY v30 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s", BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG)
+
+    # Автовосстановление базы из закреплённого бэкапа в STORAGE_CHAT_ID (если контейнер пустой после пересборки)
+    restored, rst_err, rst_stats = await restore_db_from_telegram(bot, force=False)
+    if restored:
+        log.info("Auto-restored DB from Telegram channel: %s", rst_stats)
+    elif rst_err not in ("already_populated", "no_pinned_backup", "STORAGE_CHAT_ID не задан"):
+        log.warning("Auto-restore skipped with status: %s", rst_err)
+
+    log.info(
+        "APATHY v31 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s | storage=%s",
+        BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG, get_storage_chat_id(),
+    )
 
     connector = aiohttp.TCPConnector(limit=30, ttl_dns_cache=300)
     http_session = aiohttp.ClientSession(connector=connector)
@@ -2829,10 +3190,22 @@ async def main():
 
     log.info("APATHY Audio API listening on %s ports=%s | Public: %s", HOST, bound_ports, get_bot_api_url())
 
+    backup_task = asyncio.create_task(auto_backup_loop(bot))
+
     try:
         await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot, allowed_updates=["message", "callback_query", "channel_post"])
     finally:
+        backup_task.cancel()
+        try:
+            await backup_task
+        except asyncio.CancelledError:
+            pass
+        if DB_DIRTY and get_storage_chat_id():
+            try:
+                await asyncio.wait_for(backup_db_to_telegram(bot, reason="shutdown"), timeout=15)
+            except Exception as e:
+                log.warning("Shutdown backup failed: %s", e)
         await runner.cleanup()
         await http_session.close()
         await bot.session.close()
