@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="chrome">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="referrer" content="no-referrer" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="APATHY" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#06070a" id="metaThemeColor" />
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="apple-touch-icon" href="./icon.png" />
+  <title>APATHY — Chrome Music Player</title>
+    <link rel="preconnect" href="https://itunes.apple.com" crossorigin />
+  <link rel="dns-prefetch" href="https://dl2.mp3party.net" />
+  <link rel="dns-prefetch" href="https://lrclib.net" />
+  <link rel="stylesheet" href="./style.css?v=22" />
+</head>
+<body>
+  <div class="app-shell">
+    <audio id="apathyAudio" playsinline webkit-playsinline preload="auto" referrerpolicy="no-referrer" style="display:none;"></audio>
+    <div id="ytAudioMount" style="position:fixed;right:0;bottom:0;width:240px;height:240px;opacity:0.001;pointer-events:none;overflow:hidden;z-index:-1;" aria-hidden="true"><div id="ytPlayerFrame"></div></div>
+    <!-- Blurred Dark Forest Backgrounds -->
+    <div class="bg-layer bg-chrome"></div>
+    <div class="bg-layer bg-purple"></div>
+    <div class="bg-layer bg-red"></div>
+    <div class="bg-veil"></div>
+    <div class="chrome-flash" id="chromeFlash"></div>
+    <div class="toast" id="toast"></div>
+
+    <!-- ================= SPLASH SCREEN: SWIPE THE CHROME CROSS ================= -->
+    <section id="splashScreen">
+      <canvas id="splashParticles"></canvas>
+      <div class="splash-brand">
+        <h1 class="splash-logo chrome-text">APATHY</h1>
+        <div class="splash-sub">CHROME AUDIO ENGINE</div>
+      </div>
+
+      <div class="cross-stage" id="crossStage">
+        <div class="cross-ring" id="crossRing"></div>
+        <div id="draggableCross" aria-label="Свайпните крест для входа">
+          <svg viewBox="0 0 200 280" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <linearGradient id="chromeMetalMain" x1="20" y1="10" x2="180" y2="270" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#FFFFFF"/>
+                <stop offset="18%" stop-color="#C8D2E2"/>
+                <stop offset="42%" stop-color="#48505E"/>
+                <stop offset="52%" stop-color="#171A21"/>
+                <stop offset="72%" stop-color="#9AA6B8"/>
+                <stop offset="90%" stop-color="#F2F6FF"/>
+                <stop offset="100%" stop-color="#6B7485"/>
+              </linearGradient>
+              <linearGradient id="chromeBevel" x1="180" y1="20" x2="20" y2="250" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95"/>
+                <stop offset="45%" stop-color="#768194" stop-opacity="0.35"/>
+                <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.85"/>
+              </linearGradient>
+              <linearGradient id="chromeCore" x1="100" y1="20" x2="100" y2="260" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#FFFFFF"/>
+                <stop offset="35%" stop-color="#2A2F3A"/>
+                <stop offset="65%" stop-color="#DCE5F2"/>
+                <stop offset="100%" stop-color="#1A1D24"/>
+              </linearGradient>
+            </defs>
+            <path d="M100 8 L113 68 L128 84 L188 94 L128 106 L114 122 L100 272 L86 122 L72 106 L12 94 L72 84 L87 68 Z"
+                  fill="url(#chromeMetalMain)" stroke="url(#chromeBevel)" stroke-width="2.2" stroke-linejoin="round"/>
+            <path d="M100 32 L106 86 L156 94 L106 102 L100 244 L94 102 L44 94 L94 86 Z"
+                  fill="url(#chromeCore)" opacity="0.85"/>
+            <path d="M100 12 L100 268 M18 94 L182 94" stroke="#FFFFFF" stroke-opacity="0.72" stroke-width="1.2"/>
+            <polygon points="100,82 112,94 100,106 88,94" fill="#FFFFFF" fill-opacity="0.92"/>
+            <polygon points="100,87 107,94 100,101 93,94" fill="#13161D"/>
+          </svg>
+        </div>
+      </div>
+
+      <div class="splash-hint">
+        <div class="swipe-pill">
+          <span>Свайпни крест</span>
+          <span class="swipe-arrow">→</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= MAIN APP ================= -->
+    <div class="main-app" id="mainApp">
+      <header class="top-bar">
+        <div class="brand-mini">
+          <svg class="brand-cross-mini" viewBox="0 0 24 32" fill="none">
+            <path d="M12 1L14.5 9.5L23 12L14.5 14.5L12 31L9.5 14.5L1 12L9.5 9.5L12 1Z" fill="currentColor" opacity="0.9"/>
+          </svg>
+          <span class="chrome-text">APATHY</span>
+        </div>
+        <button class="top-profile-btn" id="topProfileBtn" title="Профиль" aria-label="Профиль">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+            <circle cx="12" cy="7" r="4"/>
+          </svg>
+        </button>
+      </header>
+
+      <main class="views-wrap">
+        <!-- TAB 1: SEARCH (DEEZER + SOUNDCLOUD + HITMOS / YT MUSIC / YOUTUBE) -->
+        <section class="tab-view active" id="viewSearch">
+          <div class="search-hero">
+            <h2 class="hero-title chrome-text">APATHY</h2>
+            <div class="hero-caption">Telegram Бот · Единый поиск полных треков</div>
+
+            <form class="search-box" id="searchForm" autocomplete="off">
+              <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+              </svg>
+              <input type="search" class="search-input" id="searchInput" placeholder="Трек или исполнитель..." enterkeyhint="search" />
+              <button type="button" class="search-clear" id="searchClear" aria-label="Очистить">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
+              </button>
+              <button type="submit" class="search-go-btn">Найти</button>
+            </form>
+
+            <!-- Live Unified Sources Status -->
+            <div class="sources-live-bar" id="searchSourcesBar"></div>
+
+            <!-- Quick Discovery Tags -->
+            <div class="quick-tags" id="quickTags">
+              <button type="button" class="quick-tag" data-q="onda andar">onda andar</button>
+              <button type="button" class="quick-tag" data-q="Pharaoh">Pharaoh</button>
+              <button type="button" class="quick-tag" data-q="Miyagi">Miyagi</button>
+              <button type="button" class="quick-tag" data-q="Скриптонит">Скриптонит</button>
+              <button type="button" class="quick-tag" data-q="kai angel">kai angel</button>
+              <button type="button" class="quick-tag" data-q="madk1d">madk1d</button>
+              <button type="button" class="quick-tag" data-q="Баста">Баста</button>
+              <button type="button" class="quick-tag" data-q="Король и Шут">Король и Шут</button>
+              <button type="button" class="quick-tag" data-q="The Weeknd">The Weeknd</button>
+              <button type="button" class="quick-tag" data-q="тёмный принц">тёмный принц</button>
+            </div>
+          </div>
+
+          <div class="section-label">
+            <span id="searchResultTitle">Треки из Telegram</span>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <button type="button" class="tg-refresh-btn" id="tgRefreshBtn">↻ Из бота</button>
+              <span id="searchCount">0</span>
+            </div>
+          </div>
+
+          <div class="search-loader" id="searchLoader">
+            <div class="spinner"></div>
+            <span id="searchLoaderText">Поиск музыки...</span>
+          </div>
+
+          <div class="track-list" id="searchTrackList"></div>
+        </section>
+
+        <!-- TAB 2: YOUR TRACKS & PLAYLISTS -->
+        <section class="tab-view" id="viewTracks">
+          <div class="lib-header">
+            <h2 class="view-title">Ваши треки</h2>
+            <span style="font-size:11px;color:var(--text-dim)" id="libTotalCount">0 треков</span>
+          </div>
+
+          <div class="lib-actions">
+            <button class="min-btn primary" id="openImportBtn">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              <span>Перенести треки</span>
+            </button>
+            <button class="min-btn" id="uploadAudioBtn">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+              </svg>
+              <span>Свой MP3 / M4A</span>
+            </button>
+            <input type="file" id="audioFileInput" accept="audio/*,.mp3,.m4a,.wav,.ogg" multiple hidden />
+          </div>
+
+          <div class="section-label" style="margin-top:4px;">
+            <span>Плейлисты</span>
+            <span id="plCountLabel">0</span>
+          </div>
+          <div class="playlist-strip" id="playlistStrip"></div>
+
+          <div class="active-pl-bar" id="activePlBar">
+            <div style="min-width:0;">
+              <div style="font-size:14px;font-weight:600;" id="activePlTitle">Плейлист</div>
+              <div style="font-size:11px;color:var(--text-dim);" id="activePlSub">0 треков</div>
+            </div>
+            <div style="display:flex;gap:6px;flex-shrink:0;">
+              <button class="min-btn primary" id="playActivePlBtn" style="padding:7px 11px;font-size:11.5px;">Слушать</button>
+              <button class="min-icon-btn" id="deleteActivePlBtn" title="Удалить плейлист" style="border:1px solid var(--border);">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="chip-row" id="libFilterChips" style="margin-top:0;margin-bottom:12px;">
+            <button class="chip-btn active" data-filter="all">Все треки</button>
+            <button class="chip-btn" data-filter="liked">Избранное</button>
+            <button class="chip-btn" data-filter="soundcloud">SoundCloud</button>
+            <button class="chip-btn" data-filter="catalog">Из поиска</button>
+            <button class="chip-btn" data-filter="imported">С площадок</button>
+            <button class="chip-btn" data-filter="local">Мои файлы</button>
+          </div>
+
+          <div class="track-list" id="libraryTrackList"></div>
+        </section>
+
+        <!-- TAB 3: PROFILE & DARK THEMES -->
+        <section class="tab-view" id="viewProfile">
+          <div class="lib-header">
+            <h2 class="view-title">Профиль</h2>
+          </div>
+
+          <div class="card-glass" id="authCard">
+            <div id="guestBox">
+              <div class="auth-tabs">
+                <button class="auth-tab active" data-auth="login">Вход</button>
+                <button class="auth-tab" data-auth="register">Регистрация</button>
+              </div>
+              <form id="authForm" autocomplete="off">
+                <div class="field-group">
+                  <label class="field-label" for="authLogin">Логин</label>
+                  <input class="field-input" id="authLogin" type="text" placeholder="Введите логин" minlength="3" required />
+                </div>
+                <div class="field-group">
+                  <label class="field-label" for="authPass">Пароль</label>
+                  <input class="field-input" id="authPass" type="password" placeholder="Введите пароль" minlength="4" required />
+                </div>
+                <div class="auth-msg" id="authMsg"></div>
+                <button type="submit" class="min-btn primary" style="width:100%" id="authSubmitBtn">Войти в APATHY</button>
+              </form>
+            </div>
+
+            <div id="userBox" style="display:none;">
+              <div class="profile-head">
+                <div class="profile-avatar-lg chrome-text" id="profileAvatarLg">AP</div>
+                <div style="min-width:0;flex:1;">
+                  <div style="font-size:17px;font-weight:600;" id="profileUsername">@user</div>
+                  <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">APATHY Chrome Member</div>
+                </div>
+                <button class="min-btn" id="logoutBtn" style="padding:7px 12px;font-size:11.5px;">Выйти</button>
+              </div>
+              <div class="stats-grid">
+                <div class="stat-box">
+                  <div class="stat-num" id="statTracks">0</div>
+                  <div class="stat-lbl">Треков</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-num" id="statLiked">0</div>
+                  <div class="stat-lbl">Избранное</div>
+                </div>
+                <div class="stat-box">
+                  <div class="stat-num" id="statPlaylists">0</div>
+                  <div class="stat-lbl">Плейлистов</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card-glass">
+            <div style="display:flex;align-items:center;justify-content:space-between;">
+              <div style="font-size:13px;font-weight:600;letter-spacing:0.06em;">Оформление</div>
+              <span style="font-size:10.5px;color:var(--text-dim);" id="activeThemeLabel">Тёмный хром</span>
+            </div>
+            <div style="font-size:11.5px;color:var(--text-dim);margin-top:4px;">
+              Тёмный размытый фон и цветовые акценты интерфейса
+            </div>
+
+            <div class="theme-grid" id="themeGrid">
+              <button class="theme-card active" data-set-theme="chrome">
+                <div class="theme-preview tp-chrome"><span class="theme-dot" style="background:#d8e2f0;"></span></div>
+                <div class="theme-name">Тёмный хром</div>
+              </button>
+              <button class="theme-card" data-set-theme="purple">
+                <div class="theme-preview tp-purple"><span class="theme-dot" style="background:#b98eff;"></span></div>
+                <div class="theme-name">Тёмно-фиолетовый</div>
+              </button>
+              <button class="theme-card" data-set-theme="red">
+                <div class="theme-preview tp-red"><span class="theme-dot" style="background:#ef5c6e;"></span></div>
+                <div class="theme-name">Красно-тёмный</div>
+              </button>
+            </div>
+          </div>
+
+          <div class="card-glass" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+            <div>
+              <div style="font-size:13px;font-weight:500;">Проверка звука (iPhone / Android)</div>
+              <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">Разблокировать аудиодвижок Safari</div>
+            </div>
+            <button class="min-btn primary" id="testSoundBtn" style="padding:8px 12px;font-size:11.5px;">Тест звука</button>
+          </div>
+
+          <div class="card-glass" style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+            <div>
+              <div style="font-size:13px;font-weight:500;">Экран входа с крестом</div>
+              <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">Повторить свайп-разблокировку</div>
+            </div>
+            <button class="min-btn" id="replaySplashBtn" style="padding:8px 12px;font-size:11.5px;">Открыть</button>
+          </div>
+        </section>
+      </main>
+
+      <!-- Mini Player -->
+      <div class="mini-player" id="miniPlayer">
+        <div class="mini-art" id="miniArt">AP</div>
+        <div class="mini-info">
+          <div class="mini-title" id="miniTitle">Трек не выбран</div>
+          <div class="mini-artist" id="miniArtist">APATHY</div>
+        </div>
+        <button class="min-icon-btn" id="miniPlayBtn" aria-label="Пауза / Плей" style="color:var(--text-main);">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" id="miniPlayIcon"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+        </button>
+        <div class="mini-progress" id="miniProgress"></div>
+      </div>
+
+      <!-- Bottom 3-Icon Navigation -->
+      <nav class="bottom-nav">
+        <button class="nav-btn active" data-tab="viewSearch">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="7.5"/><path d="m20 20-4.2-4.2"/>
+          </svg>
+          <span>Поиск</span>
+        </button>
+        <button class="nav-btn" data-tab="viewTracks">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>
+          </svg>
+          <span>Ваши треки</span>
+        </button>
+        <button class="nav-btn" data-tab="viewProfile">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+          </svg>
+          <span>Профиль</span>
+        </button>
+      </nav>
+    </div>
+
+    <!-- ================= FULLSCREEN PLAYER ================= -->
+    <section id="playerOverlay" aria-hidden="true">
+      <canvas id="playerVizCanvas"></canvas>
+
+      <div class="player-top">
+        <button class="min-icon-btn" id="closePlayerBtn" aria-label="Свернуть" style="color:var(--text-main);">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </button>
+        <div class="player-top-label chrome-text">APATHY PLAYER</div>
+        <button class="min-icon-btn" id="toggleLyricsFullBtn" title="Развернуть текст" style="color:var(--text-dim);">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 6h16M4 12h12M4 18h8"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="player-split" id="playerSplit">
+        <div class="player-left">
+          <div class="cover-stage" id="playerCover">
+            <img id="playerCoverImg" alt="" />
+            <svg class="cover-emblem" viewBox="0 0 120 160" fill="none">
+              <path d="M60 6L68 48L108 56L68 64L60 154L52 64L12 56L52 48L60 6Z" fill="url(#chromeMetalMain)" stroke="rgba(255,255,255,0.65)" stroke-width="1.2"/>
+            </svg>
+            <div class="cover-sheen"></div>
+          </div>
+
+          <div class="player-track-info">
+            <div class="player-track-texts">
+              <div class="player-title" id="playerTitle">Трек</div>
+              <div class="player-artist" id="playerArtist">Исполнитель</div>
+            </div>
+            <div class="player-quick-acts">
+              <button class="min-icon-btn" id="playerAddPlBtn" aria-label="В плейлист" title="В плейлист">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                  <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+              </button>
+              <button class="min-icon-btn" id="playerLikeBtn" aria-label="В избранное">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="scrubber-wrap">
+            <input type="range" class="scrubber" id="playerScrubber" min="0" max="100" step="0.1" value="0" />
+            <div class="time-row">
+              <span id="curTime">0:00</span>
+              <span id="totTime">0:00</span>
+            </div>
+          </div>
+
+          <div class="chrome-controls-main">
+            <button class="chrome-btn md" id="btnPrev" aria-label="Предыдущий">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="19 20 9 12 19 4 19 20"/><rect x="5" y="4" width="2.4" height="16" rx="1"/>
+              </svg>
+            </button>
+            <button class="chrome-btn play-orb" id="btnPlayPause" aria-label="Воспроизвести / Пауза">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor" id="mainPlayIcon">
+                <polygon points="7 4 20 12 7 20 7 4"/>
+              </svg>
+            </button>
+            <button class="chrome-btn md" id="btnNext" aria-label="Следующий">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5 4 15 12 5 20 5 4"/><rect x="16.6" y="4" width="2.4" height="16" rx="1"/>
+              </svg>
+            </button>
+          </div>
+
+          <div class="chrome-controls-sub">
+            <button class="chrome-btn sm" id="btnShuffle" aria-label="Перемешать">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/>
+                <polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/>
+              </svg>
+            </button>
+            <button class="chrome-btn sm" id="btnRepeat" aria-label="Повтор">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+                <polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <aside class="player-right">
+          <div class="lyrics-header">
+            <div class="lyrics-badge">
+              <span class="live-dot"></span>
+              <span id="lyricsHeaderTitle">ТЕКСТ</span>
+            </div>
+            <div class="lyrics-sync-bar">
+              <button class="sync-nudge-btn" id="lyricsMinusBtn" title="Сдвиг текста -0.5с">−</button>
+              <span style="font-size:8.5px;color:var(--text-faint);" id="lyricsSourceTag">SYNC</span>
+              <button class="sync-nudge-btn" id="lyricsPlusBtn" title="Сдвиг текста +0.5с">+</button>
+            </div>
+          </div>
+          <div class="lyrics-scroll" id="lyricsScroll"></div>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ================= ADD TO PLAYLIST MODAL ================= -->
+    <div class="modal-backdrop" id="playlistModal">
+      <div class="modal-sheet">
+        <div class="sheet-handle"></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+          <div style="font-size:16px;font-weight:600;letter-spacing:0.04em;" id="plModalHeading">Добавить в плейлист</div>
+          <button class="min-icon-btn" id="closePlModalBtn" aria-label="Закрыть">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+
+        <div class="pl-modal-track" id="plModalTrackBox" style="display:none;">
+          <div class="mini-art" id="plModalTrackArt">AP</div>
+          <div style="min-width:0;flex:1;">
+            <div style="font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" id="plModalTrackTitle"></div>
+            <div style="font-size:11px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" id="plModalTrackArtist"></div>
+          </div>
+        </div>
+
+        <div class="pl-create-row">
+          <input class="field-input" id="newPlNameInput" type="text" placeholder="Название нового плейлиста..." style="height:40px;font-size:13px;" />
+          <button class="min-btn primary" id="createPlBtn" style="padding:0 14px;height:40px;flex-shrink:0;">Создать</button>
+        </div>
+
+        <div class="pl-option-list" id="plOptionList"></div>
+      </div>
+    </div>
+
+    <!-- ================= IMPORT TRACKS MODAL ================= -->
+    <div class="modal-backdrop" id="importModal">
+      <div class="modal-sheet">
+        <div class="sheet-handle"></div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+          <div style="font-size:16px;font-weight:600;letter-spacing:0.04em;">Перенос треков</div>
+          <button class="min-icon-btn" id="closeImportBtn" aria-label="Закрыть">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div style="font-size:12px;color:var(--text-dim);">
+          Выберите площадку и вставьте ссылку на плейлист или профиль (можно оставить пустой для быстрого переноса подборки)
+        </div>
+
+        <div class="platform-grid" id="platformGrid">
+          <button class="platform-btn selected" data-platform="yandex"><span class="platform-dot" style="background:#fc0;"></span>Яндекс Музыка</button>
+          <button class="platform-btn" data-platform="spotify"><span class="platform-dot" style="background:#1ed760;"></span>Spotify</button>
+          <button class="platform-btn" data-platform="apple"><span class="platform-dot" style="background:#fa243c;"></span>Apple Music</button>
+          <button class="platform-btn" data-platform="vk"><span class="platform-dot" style="background:#4c75a3;"></span>VK Музыка</button>
+          <button class="platform-btn" data-platform="soundcloud" style="grid-column:span 2;"><span class="platform-dot" style="background:#ff5500;"></span>SoundCloud</button>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label" for="importLinkInput">Ссылка на плейлист / аккаунт</label>
+          <input class="field-input" id="importLinkInput" type="text" placeholder="https://music.yandex.ru/users/..." />
+        </div>
+
+        <div class="import-progress-wrap" id="importProgressWrap">
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);">
+            <span id="importStatusText">Синхронизация треков...</span>
+            <span id="importPercent">0%</span>
+          </div>
+          <div class="import-bar-bg"><div class="import-bar-fill" id="importBarFill"></div></div>
+        </div>
+
+        <button class="min-btn primary" id="startImportBtn" style="width:100%;margin-top:6px;">
+          Начать перенос в APATHY
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://telegram.org/js/telegram-web-app.js" async></script>
+  <script src="./app.js?v=22"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "APATHY — Chrome Music Player",
+  "short_name": "APATHY",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#06070a",
+  "theme_color": "#06070a",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "./icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    }
+  ]
+}
