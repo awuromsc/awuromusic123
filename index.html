@@ -12,15 +12,14 @@
   <link rel="manifest" href="./manifest.json" />
   <link rel="apple-touch-icon" href="./icon.png" />
   <title>APATHY — Chrome Music Player</title>
-    <link rel="preconnect" href="https://itunes.apple.com" crossorigin />
-  <link rel="dns-prefetch" href="https://dl2.mp3party.net" />
+  
   <link rel="dns-prefetch" href="https://lrclib.net" />
-  <link rel="stylesheet" href="./style.css?v=22" />
+  <link rel="stylesheet" href="./style.css?v=24" />
 </head>
 <body>
   <div class="app-shell">
     <audio id="apathyAudio" playsinline webkit-playsinline preload="auto" referrerpolicy="no-referrer" style="display:none;"></audio>
-    <div id="ytAudioMount" style="position:fixed;right:0;bottom:0;width:240px;height:240px;opacity:0.001;pointer-events:none;overflow:hidden;z-index:-1;" aria-hidden="true"><div id="ytPlayerFrame"></div></div>
+    </div>
     <!-- Blurred Dark Forest Backgrounds -->
     <div class="bg-layer bg-chrome"></div>
     <div class="bg-layer bg-purple"></div>
@@ -104,13 +103,13 @@
         <section class="tab-view active" id="viewSearch">
           <div class="search-hero">
             <h2 class="hero-title chrome-text">APATHY</h2>
-            <div class="hero-caption">Telegram Бот · Единый поиск полных треков</div>
+            <div class="hero-caption">Только аудио · поиск через Telegram-бота</div>
 
             <form class="search-box" id="searchForm" autocomplete="off">
               <svg class="search-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                 <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
               </svg>
-              <input type="search" class="search-input" id="searchInput" placeholder="Трек или исполнитель..." enterkeyhint="search" />
+              <input type="search" class="search-input" id="searchInput" placeholder="Поиск через Telegram-бота..." enterkeyhint="search" />
               <button type="button" class="search-clear" id="searchClear" aria-label="Очистить">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M18 6 6 18M6 6l12 12"/></svg>
               </button>
@@ -196,8 +195,7 @@
           <div class="chip-row" id="libFilterChips" style="margin-top:0;margin-bottom:12px;">
             <button class="chip-btn active" data-filter="all">Все треки</button>
             <button class="chip-btn" data-filter="liked">Избранное</button>
-            <button class="chip-btn" data-filter="soundcloud">SoundCloud</button>
-            <button class="chip-btn" data-filter="catalog">Из поиска</button>
+            <button class="chip-btn" data-filter="telegram">Из Telegram</button>
             <button class="chip-btn" data-filter="imported">С площадок</button>
             <button class="chip-btn" data-filter="local">Мои файлы</button>
           </div>
@@ -513,6 +511,6 @@
   </div>
 
   <script src="https://telegram.org/js/telegram-web-app.js" async></script>
-  <script src="./app.js?v=22"></script>
+  <script src="./app.js?v=24"></script>
 </body>
 </html>
