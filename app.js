@@ -65,7 +65,7 @@
             title: t.title,
             artist: t.artist,
             album: t.album || 'Telegram Бот',
-            duration: t.duration || 180,
+            duration: Math.round(Number(t.duration) || 180),
             artwork: t.artwork || '',
             coverGrad: t.coverGrad || '',
             source: t.source || 'Telegram',
@@ -3318,10 +3318,56 @@
         }
       }
 
+      let cloudSyncInFlight = false;
+      let cloudSyncQueued = false;
+
+      async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs);
+        try {
+          return await fetch(url, { ...options, signal: ctrl.signal });
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      async function trySilentMiniAppReauth() {
+        try {
+          const tgWebApp = window.Telegram && window.Telegram.WebApp;
+          if (!tgWebApp || !tgWebApp.initData || tgWebApp.initData.length <= 20) return false;
+          const r = await fetchWithTimeout(`${tgApiUrl('/api/auth/webapp')}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ initData: tgWebApp.initData })
+          }, 8000);
+          const d = r.ok ? await r.json() : null;
+          if (d && d.ok && d.token && d.user) {
+            persistAuthSession(d.token, d.user);
+            return true;
+          }
+        } catch (e) {}
+        return false;
+      }
+
       async function pushCloudSyncNow(notify = false) {
         if (!state.tgToken || !state.user || !state.user.tgId) return false;
         clearTimeout(syncDebounceTimer);
+
+        if (isOfflineEffective()) {
+          setSyncStatus('Сохранено локально (оффлайн)', false);
+          if (notify) showToast('Нет сети — изменения сохранены локально');
+          return false;
+        }
+
+        if (cloudSyncInFlight) {
+          cloudSyncQueued = true;
+          return false;
+        }
+
+        cloudSyncInFlight = true;
         setSyncStatus('Сохранение в аккаунт...', true);
+
+        let success = false;
         try {
           const payload = {
             playlists: state.playlists.slice(0, 50),
@@ -3329,55 +3375,113 @@
             savedTracks: getSerializableSavedTracks(),
             theme: state.theme
           };
-          const resp = await fetch(`${tgApiUrl('/api/user/sync')}`, {
+          let resp = await fetchWithTimeout(`${tgApiUrl('/api/user/sync')}`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
               'Authorization': 'Bearer ' + state.tgToken
             },
             body: JSON.stringify(payload)
-          });
+          }, 10000);
+
+          if (resp.status === 401) {
+            // Try silent re-auth inside Telegram Mini App before giving up
+            const reauthed = await trySilentMiniAppReauth();
+            if (reauthed) {
+              resp = await fetchWithTimeout(`${tgApiUrl('/api/user/sync')}`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': 'Bearer ' + state.tgToken
+                },
+                body: JSON.stringify(payload)
+              }, 10000);
+            }
+          }
+
           if (resp.status === 401) {
             const errBody = await resp.json().catch(() => null);
-            if (errBody && errBody.error === 'token_revoked') {
+            const errCode = errBody && errBody.error ? String(errBody.error) : '';
+            if (errCode === 'token_revoked' || errCode === 'unauthorized') {
               clearTgSession(false, false);
+              if ($('authMsg')) $('authMsg').textContent = 'Сессия обновилась — нажмите «Войти через Telegram» один раз.';
+              showToast('Обновите вход через Telegram');
+            } else {
+              setSyncStatus('Требуется обновить вход', false);
             }
             return false;
           }
-          const data = resp.ok ? await resp.json() : null;
+
+          const data = resp.ok ? await resp.json().catch(() => null) : null;
           if (data && data.ok) {
             if (data.syncedAt) lastCloudUpdatedAt = Number(data.syncedAt);
             const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
             setSyncStatus(`Синхронизировано · ${nowStr}`, false);
             if (notify) showToast('Плейлисты и избранное синхронизированы');
+            success = true;
             return true;
           }
-        } catch (e) {}
-        setSyncStatus('Ожидание сети для синхронизации', true);
-        if (notify) showToast('Не удалось связаться с сервером бота');
-        return false;
+
+          setSyncStatus(`Ошибка сохранения (${resp.status})`, false);
+          if (notify) showToast('Сервер временно не ответил — попробуйте чуть позже');
+          return false;
+        } catch (e) {
+          setSyncStatus('Ожидание сети для синхронизации', false);
+          if (notify) showToast('Не удалось связаться с сервером бота');
+          return false;
+        } finally {
+          cloudSyncInFlight = false;
+          if (cloudSyncQueued) {
+            cloudSyncQueued = false;
+            if (success) {
+              setTimeout(() => pushCloudSyncNow(false), 350);
+            }
+          }
+        }
       }
 
       async function refreshCloudAccountState(notify = false) {
         if (!state.tgToken) return false;
+        if (isOfflineEffective()) {
+          if (state.user && state.user.tgId) setSyncStatus('Оффлайн · данные на устройстве', false);
+          return false;
+        }
         try {
-          const resp = await fetch(`${tgApiUrl('/api/user/me')}?_=${Date.now()}`, {
+          let resp = await fetchWithTimeout(`${tgApiUrl('/api/user/me')}?_=${Date.now()}`, {
             headers: { 'Authorization': 'Bearer ' + state.tgToken }
-          });
+          }, 8500);
+
+          if (resp.status === 401) {
+            const reauthed = await trySilentMiniAppReauth();
+            if (reauthed) {
+              resp = await fetchWithTimeout(`${tgApiUrl('/api/user/me')}?_=${Date.now()}`, {
+                headers: { 'Authorization': 'Bearer ' + state.tgToken }
+              }, 8500);
+            }
+          }
+
           if (resp.status === 401) {
             const errBody = await resp.json().catch(() => null);
-            if (errBody && errBody.error === 'token_revoked') {
+            const errCode = errBody && errBody.error ? String(errBody.error) : '';
+            if (errCode === 'token_revoked' || errCode === 'unauthorized') {
               clearTgSession(false, false);
+            } else {
+              setSyncStatus('Требуется обновить вход', false);
             }
             return false;
           }
-          const data = resp.ok ? await resp.json() : null;
+
+          const data = resp.ok ? await resp.json().catch(() => null) : null;
           if (data && data.ok && data.user) {
             const nextTok = (data.token && typeof data.token === 'string') ? data.token : state.tgToken;
             persistAuthSession(nextTok, data.user);
             renderProfile();
             updateLibraryAuthGate();
             applyCloudState(data.state || {}, 'pull');
+            if (!cloudSyncInFlight) {
+              const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+              setSyncStatus(`Синхронизировано · ${nowStr}`, false);
+            }
             if (notify) showToast('Медиатека аккаунта обновлена');
             return true;
           }
@@ -3823,7 +3927,7 @@
         if (!state.offlineMode) {
           showToast('Соединение восстановлено');
           checkTgBotStatus();
-          refreshCloudAccountState(false);
+          refreshCloudAccountState(false).then((ok) => { if (ok) pushCloudSyncNow(false); });
           if (state.activeTab === 'viewSearch') performSearch();
         }
       });

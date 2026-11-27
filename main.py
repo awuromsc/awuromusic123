@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APATHY v37 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
+APATHY v38 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
 ===========================================================================================================
-Исправлено в v37 (обход блокировок YouTube на Docker/VPS-серверах):
+Исправлено в v38 (обход блокировок YouTube на Docker/VPS-серверах):
   1. Мульти-поиск строго по аудиоисточникам одновременно:
        • SoundCloud API v2 (полные треки, прогрессивный MP3 без блокировок дата-центров — идеально для ру-рэпа/андерграунда)
        • Прямые РФ MP3-порталы (Hitmo, Hitmotop, Muzofond, Mp3Party, LightAudio — мгновенный MP3, 0% CPU)
@@ -401,7 +401,7 @@ async def backup_db_to_telegram(bot: Bot, reason: str = "auto") -> Tuple[bool, s
             reason_lbl = {"manual": "Ручной бэкап", "shutdown": "Бэкап при остановке", "auto": "Автобэкап"}.get(reason, "Бэкап")
             caption = (
                 "#apathy_db_backup\n"
-                f"💾 <b>{reason_lbl} базы APATHY</b> (v37)\n"
+                f"💾 <b>{reason_lbl} базы APATHY</b> (v38)\n"
                 f"👤 Пользователей: <b>{stats['users']}</b> · 🎵 Треков: <b>{stats['all_tracks']}</b> · 📋 Плейлистов: <b>{stats['playlists']}</b>\n"
                 f"📦 Размер: <b>{size_bytes / 1024:.1f} КБ</b> · 🕒 {ts_str}"
             )
@@ -784,7 +784,7 @@ def lookup_track_record(track_id: str) -> Optional[Dict[str, Any]]:
 
 
 
-# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v37) ====================
+# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v38) ====================
 def _user_row_to_public(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
     tg_id = int(d["tg_id"])
@@ -1085,7 +1085,7 @@ def save_user_cloud_state(tg_id: int, playlists: list, liked_ids: list, saved_tr
                 track_id=raw_tid,
                 title=temp.get("title") or t.get("title") or "Без названия",
                 artist=temp.get("artist") or t.get("artist") or "Исполнитель",
-                duration=int(temp.get("duration") or t.get("duration") or 180),
+                duration=max(1, int(float(temp.get("duration") or t.get("duration") or 180))),
                 artwork=temp.get("artwork") or t.get("artwork") or "",
                 source=temp.get("source") or "audio",
                 source_id=str(temp.get("source_id") or ""),
@@ -1103,7 +1103,7 @@ def save_user_cloud_state(tg_id: int, playlists: list, liked_ids: list, saved_tr
                 track_id=raw_tid,
                 title=str(t.get("title") or "Без названия"),
                 artist=str(t.get("artist") or "Исполнитель"),
-                duration=int(t.get("duration") or 180),
+                duration=max(1, int(float(t.get("duration") or 180))),
                 artwork=str(t.get("artwork") or ""),
                 source=src_name,
                 source_id=src_id,
@@ -2306,7 +2306,7 @@ async def cmd_admin_help(message: Message, bot: Bot):
         return
     db_s = get_db_stats()
     text = (
-        "<b>🔧 Админ-команды APATHY (v37):</b>\n\n"
+        "<b>🔧 Админ-команды APATHY (v38):</b>\n\n"
         f"📊 В базе: <b>{db_s['users']}</b> польз. · <b>{db_s['all_tracks']}</b> трек. · <b>{db_s['playlists']}</b> плейл.\n\n"
         "• /backup — сохранить бэкап базы в канал\n"
         "• /restore — восстановить базу из канала\n"
@@ -2435,7 +2435,7 @@ async def cmd_test_sources(message: Message, bot: Bot):
             st_txt = f"❌ <code>{st_id}</code> (нет доступа: {str(e)[:40]})"
     db_s = get_db_stats()
     await m.edit_text(
-        "<b>Диагностика источников сервера (v37):</b>\n\n"
+        "<b>Диагностика источников сервера (v38):</b>\n\n"
         + "\n".join(lines)
         + f"\n\n🎛 ffmpeg: {ff_st}"
         + f"\n💾 Бэкап-канал: {st_txt}"
@@ -2961,7 +2961,11 @@ async def api_user_sync(request: web.Request) -> web.Response:
     liked_ids = (body or {}).get("likedIds") or []
     saved_tracks = (body or {}).get("savedTracks") or []
     theme = str((body or {}).get("theme") or "").strip()
-    ts = save_user_cloud_state(int(row["tg_id"]), playlists, liked_ids, saved_tracks, theme)
+    try:
+        ts = save_user_cloud_state(int(row["tg_id"]), playlists, liked_ids, saved_tracks, theme)
+    except Exception as e:
+        log.warning("api_user_sync save error for %s: %s", row["tg_id"], e)
+        return web.json_response({"ok": False, "error": "sync_save_error"}, status=500)
     return web.json_response(
         {
             "ok": True,
@@ -2995,8 +2999,8 @@ async def api_ping(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "service": "apathy-tg-audio-v37",
-            "version": "v37",
+            "service": "apathy-tg-audio-v38",
+            "version": "v38",
             "bot": BOT_USERNAME_CACHE,
             "siteUrl": SITE_URL,
             "tracksCount": total,
@@ -3290,7 +3294,7 @@ async def main():
         log.warning("Auto-restore skipped with status: %s", rst_err)
 
     log.info(
-        "APATHY v37 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s | storage=%s",
+        "APATHY v38 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s | storage=%s",
         BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG, get_storage_chat_id(),
     )
 
@@ -3298,7 +3302,7 @@ async def main():
     http_session = aiohttp.ClientSession(connector=connector)
     HTTP_SESSION_REF = http_session
 
-    app = web.Application(middlewares=[cors_middleware], client_max_size=3 * 1024 * 1024)
+    app = web.Application(middlewares=[cors_middleware], client_max_size=5 * 1024 * 1024)
     app["bot"] = bot
     app["http_session"] = http_session
 
