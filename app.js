@@ -41,7 +41,11 @@
         volume: Math.max(0, Math.min(1, Number(store.get('volume', 1)))),
         prevVolume: 1,
         lyricsExpanded: false,
+        lyricsHidden: Boolean(store.get('lyricsHidden', false)),
         modalTrack: null,
+        modalTracks: null,
+        libSelectMode: false,
+        selectedTrackIds: new Set(),
         offlineIds: new Set(),
         offlineDownloadingIds: new Set(),
         offlineBytes: 0,
@@ -53,7 +57,9 @@
         publishedMap: store.get('publishedMap', {}) || {},
         subscribedPlaylists: Array.isArray(store.get('subscribedPlaylists', [])) ? store.get('subscribedPlaylists', []) : [],
         selectedSubPlaylistId: null,
-        activePublicModalPl: null
+        activePublicModalPl: null,
+        dailyMix: null,
+        recentArtists: Array.isArray(store.get('recentArtistsV48', [])) ? store.get('recentArtistsV48', []) : []
       };
 
       savedCatalogTracks.forEach(t => {
@@ -1075,6 +1081,7 @@
         const q = searchInput.value.trim();
         searchClear.classList.toggle('show', q.length > 0);
         viewSearch.classList.toggle('has-results', q.length > 0 || state.searchMode === 'playlists');
+        updateDailyMixCardVisibility();
         if (state.searchMode === 'playlists') {
           await fetchPublicPlaylists(q, state.publicPlSort);
           return;
@@ -1325,7 +1332,7 @@
         const sl = $('volumeSlider');
         if (sl) {
           sl.value = String(pct);
-          sl.style.background = `linear-gradient(90deg, var(--accent) ${pct}%, rgba(255,255,255,0.14) ${pct}%)`;
+          sl.style.setProperty('--fill-pct', pct + '%');
         }
         const lbl = $('volumePct');
         if (lbl) lbl.textContent = pct + '%';
@@ -1942,8 +1949,15 @@
         let badgeLabel = isOfflineSaved ? 'Оффлайн' : (track.inTelegram ? 'Telegram' : (track.source || 'Бот'));
         let badgeClass = isOfflineSaved ? 'offline-tag' : ((track.fromTelegramBot || track.fromCatalog) ? 'tg-tag' : '');
 
+        const isSelectCtx = state.libSelectMode && (context === 'library' || context === 'playlist' || context === 'sub_playlist');
+        const isSelected = isSelectCtx && state.selectedTrackIds.has(track.id);
+
         const div = document.createElement('div');
-        div.className = 'track-item' + (isCurrent ? ' playing' : '') + (isCurrent && state.isPlaying ? ' is-running' : '');
+        div.className = 'track-item'
+          + (isCurrent ? ' playing' : '')
+          + (isCurrent && state.isPlaying ? ' is-running' : '')
+          + (isSelectCtx ? ' select-mode' : '')
+          + (isSelected ? ' selected' : '');
 
         const artContent = track.artwork
           ? `<img src="${escapeHtml(track.artwork)}" alt="" loading="lazy" /><span>${trackInitials(track.title)}</span>`
@@ -1953,6 +1967,10 @@
         const showDeleteFromLib = (context === 'library');
 
         div.innerHTML = `
+          ${isSelectCtx
+            ? `<div class="track-select-check">${isSelected ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>' : ''}</div>`
+            : ''
+          }
           <div class="track-art" style="background:${track.coverGrad || '#181b22'};">
             ${artContent}
             <div class="eq-bars"><span></span><span></span><span></span></div>
@@ -2006,6 +2024,14 @@
         const rowImg = div.querySelector('.track-art img');
         if (rowImg) rowImg.addEventListener('error', () => rowImg.remove());
         div.addEventListener('click', (e) => {
+          if (isSelectCtx) {
+            e.stopPropagation();
+            if (state.selectedTrackIds.has(track.id)) state.selectedTrackIds.delete(track.id);
+            else state.selectedTrackIds.add(track.id);
+            updateLibraryBulkBar();
+            renderLibrary();
+            return;
+          }
           if (e.target.closest('[data-offline]')) { e.stopPropagation(); toggleTrackOffline(track); return; }
           if (e.target.closest('[data-add-pl]')) { e.stopPropagation(); openPlaylistModal(track); return; }
           if (e.target.closest('[data-remove-pl]')) { e.stopPropagation(); removeTrackFromPlaylist(state.selectedPlaylistId, track.id); return; }
@@ -2014,6 +2040,9 @@
           if (context === 'search') state.activeQueue = [...state.searchResults];
           else if (context === 'public' && state.activePublicModalPl && Array.isArray(state.activePublicModalPl.tracks)) {
             state.activeQueue = [...state.activePublicModalPl.tracks];
+          }
+          else if (context === 'daily_mix' && state.dailyMix && Array.isArray(state.dailyMix.tracks)) {
+            state.activeQueue = [...state.dailyMix.tracks];
           }
           else state.activeQueue = getVisibleLibraryTracks();
           playTrack(track, true);
@@ -2078,6 +2107,7 @@
           card.addEventListener('click', () => {
             state.selectedSubPlaylistId = null;
             state.selectedPlaylistId = (state.selectedPlaylistId === pl.id) ? null : pl.id;
+            state.selectedTrackIds.clear();
             renderLibrary();
           });
           strip.appendChild(card);
@@ -2104,6 +2134,7 @@
           card.addEventListener('click', () => {
             state.selectedPlaylistId = null;
             state.selectedSubPlaylistId = (state.selectedSubPlaylistId === sub.id) ? null : sub.id;
+            state.selectedTrackIds.clear();
             renderLibrary();
           });
           strip.appendChild(card);
@@ -2181,22 +2212,35 @@
           </div>`;
           return;
         }
+        updateLibraryBulkBar(list);
         const ctx = state.selectedSubPlaylistId
           ? 'sub_playlist'
           : (state.selectedPlaylistId ? 'playlist' : 'library');
         list.forEach(t => libraryTrackList.appendChild(buildTrackRow(t, ctx)));
       }
 
-      function openPlaylistModal(track) {
-        state.modalTrack = track || null;
+      function openPlaylistModal(track, multiTracks = null) {
+        state.modalTrack = (!multiTracks && track) ? track : null;
+        state.modalTracks = (Array.isArray(multiTracks) && multiTracks.length) ? multiTracks : null;
         const isAuth = Boolean(state.user && state.user.tgId && state.tgToken);
-        $('plModalHeading').textContent = track
-          ? (isAuth ? 'В личный плейлист аккаунта' : 'Добавить в плейлист')
-          : 'Новый плейлист';
+        if (state.modalTracks) {
+          $('plModalHeading').textContent = `Добавить треки (${state.modalTracks.length})`;
+        } else {
+          $('plModalHeading').textContent = track
+            ? (isAuth ? 'В личный плейлист аккаунта' : 'Добавить в плейлист')
+            : 'Новый плейлист';
+        }
         const hint = $('plAuthHint');
         if (hint) hint.classList.toggle('show', !isAuth);
         const box = $('plModalTrackBox');
-        if (track) {
+        if (state.modalTracks) {
+          box.style.display = 'flex';
+          $('plModalTrackTitle').textContent = `Выбрано треков: ${state.modalTracks.length}`;
+          $('plModalTrackArtist').textContent = 'Нажмите на плейлист или создайте новый';
+          const artEl = $('plModalTrackArt');
+          artEl.style.background = '#181b22';
+          artEl.textContent = String(state.modalTracks.length);
+        } else if (track) {
           box.style.display = 'flex';
           $('plModalTrackTitle').textContent = track.title;
           $('plModalTrackArtist').textContent = track.artist;
@@ -2218,11 +2262,52 @@
       function closePlaylistModal() {
         playlistModal.classList.remove('open');
         state.modalTrack = null;
+        state.modalTracks = null;
       }
 
       function renderPlaylistModalOptions() {
         const listEl = $('plOptionList');
         listEl.innerHTML = '';
+        const multi = state.modalTracks;
+        if (multi && multi.length) {
+          if (!state.playlists.length) {
+            listEl.innerHTML = `<div style="font-size:12px;color:var(--text-dim);padding:6px 2px;">Создайте новый плейлист выше</div>`;
+            return;
+          }
+          state.playlists.forEach(pl => {
+            const allIn = multi.every(t => pl.trackIds.includes(t.id));
+            const item = document.createElement('div');
+            item.className = 'pl-option-item' + (allIn ? ' has-track' : '');
+            item.innerHTML = `
+              <div style="min-width:0;">
+                <div style="font-size:13.5px;font-weight:500;">${escapeHtml(pl.name)}</div>
+                <div style="font-size:11px;color:var(--text-dim);margin-top:2px;">${pl.trackIds.length} трек(ов)</div>
+              </div>
+              <div class="pl-check">
+                ${allIn ? `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>` : ''}
+              </div>
+            `;
+            item.addEventListener('click', () => {
+              let added = 0;
+              multi.forEach(t => {
+                ensureTrackInLibrary(t);
+                if (!pl.trackIds.includes(t.id)) {
+                  pl.trackIds.unshift(t.id);
+                  added++;
+                }
+              });
+              persistSavedCatalogTracks();
+              persistPlaylists(true);
+              exitLibrarySelectMode();
+              closePlaylistModal();
+              renderLibrary();
+              renderProfile();
+              showToast(added > 0 ? `Добавлено в «${pl.name}»: ${added} трек.` : `Эти треки уже в «${pl.name}»`);
+            });
+            listEl.appendChild(item);
+          });
+          return;
+        }
         const track = state.modalTrack;
         if (!track) {
           listEl.innerHTML = `<div style="font-size:12px;color:var(--text-dim);padding:6px 2px;">Введите название выше и нажмите «Создать»</div>`;
@@ -2319,7 +2404,13 @@
         const name = $('newPlNameInput').value.trim();
         if (!name) { showToast('Введите название плейлиста'); return; }
         const newPl = { id: 'pl_' + Date.now(), name, trackIds: [] };
-        if (state.modalTrack) {
+        if (state.modalTracks && state.modalTracks.length) {
+          state.modalTracks.forEach(t => {
+            ensureTrackInLibrary(t);
+            if (!newPl.trackIds.includes(t.id)) newPl.trackIds.push(t.id);
+          });
+          persistSavedCatalogTracks();
+        } else if (state.modalTrack) {
           ensureTrackInLibrary(state.modalTrack);
           newPl.trackIds.push(state.modalTrack.id);
         }
@@ -2331,7 +2422,12 @@
         renderSearchResultsList();
         renderProfile();
         updatePlayerPlaylistBtn();
-        if (state.modalTrack) {
+        if (state.modalTracks && state.modalTracks.length) {
+          const cnt = state.modalTracks.length;
+          exitLibrarySelectMode();
+          closePlaylistModal();
+          showToast(`Создан «${name}» (${cnt} трек.)`);
+        } else if (state.modalTrack) {
           showToast(`Создан «${name}» и трек добавлен`);
         } else {
           showToast(`Плейлист «${name}» создан`);
@@ -2413,6 +2509,7 @@
 
         const isSame = state.currentTrack && state.currentTrack.id === track.id;
         state.currentTrack = track;
+        if (!isSame && track.artist) recordRecentPlayedArtist(track.artist);
         const mySeq = ++playSeq;
 
         if (!isSame) {
@@ -2678,7 +2775,7 @@
         $('miniArtist').textContent = track.artist;
 
         const cover = $('playerCover'), coverImg = $('playerCoverImg');
-        cover.style.background = track.coverGrad || '#181b22';
+        cover.style.background = '';
         if (track.artwork) {
           coverImg.src = track.artwork;
           cover.classList.add('has-img');
@@ -2693,8 +2790,12 @@
         $('playerTitle').textContent = track.title;
         $('playerArtist').textContent = `${track.artist} · ${activeSource}`;
         $('totTime').textContent = fmtTime(track.duration);
-        $('playerScrubber').disabled = false;
-        $('playerScrubber').max = track.duration || 100;
+        const scElUi = $('playerScrubber');
+        scElUi.disabled = false;
+        scElUi.max = track.duration || 100;
+        const initPct = track.duration ? Math.min(100, Math.max(0, (state.currentTime / track.duration) * 100)) : 0;
+        scElUi.value = state.currentTime || 0;
+        scElUi.style.setProperty('--fill-pct', initPct.toFixed(2) + '%');
 
         const pauseSvg = `<rect x="6" y="4" width="4.2" height="16" rx="1.2"/><rect x="13.8" y="4" width="4.2" height="16" rx="1.2"/>`;
         const playSvg  = `<polygon points="7 4 20 12 7 20 7 4"/>`;
@@ -2749,7 +2850,9 @@
         const scrubQ = Math.round(state.currentTime * 4) / 4;
         if (scrubQ !== lastScrubVal || forceScroll) {
           lastScrubVal = scrubQ;
-          $('playerScrubber').value = state.currentTime;
+          const scEl = $('playerScrubber');
+          scEl.value = state.currentTime;
+          scEl.style.setProperty('--fill-pct', pct.toFixed(2) + '%');
         }
 
         const lines = track.lyrics || [];
@@ -3545,6 +3648,21 @@
           store.set('subscribedPlaylists', state.subscribedPlaylists);
           changed = true;
         }
+        if (cloudState.dailyMix && typeof cloudState.dailyMix === 'object' && Array.isArray(cloudState.dailyMix.tracks) && cloudState.dailyMix.tracks.length >= 4) {
+          const today = getTodayDateKey();
+          const userScope = (state.user && state.user.tgId) ? String(state.user.tgId) : 'guest';
+          const expectedKey = `${today}|${userScope}`;
+          if (cloudState.dailyMix.cacheKey === expectedKey) {
+            const normTracks = cloudState.dailyMix.tracks.map(normalizeCloudTrack).filter(Boolean);
+            if (normTracks.length >= 4) {
+              state.dailyMix = { ...cloudState.dailyMix, tracks: normTracks };
+              store.set('dailyMixV49', cloudState.dailyMix);
+              renderDailyMixCard();
+              const dModal = $('dailyMixModal');
+              if (dModal && dModal.classList.contains('open')) openDailyMixModal();
+            }
+          }
+        }
         return changed;
       }
 
@@ -3701,6 +3819,7 @@
             playlists: state.playlists.slice(0, 50),
             likedIds: Array.from(state.likedIds).slice(0, 500),
             savedTracks: getSerializableSavedTracks(),
+            dailyMix: getSerializableDailyMix(),
             theme: state.theme
           };
           let resp = await fetchWithTimeout(`${tgApiUrl('/api/user/sync')}`, {
@@ -3863,6 +3982,7 @@
         state.publishedMap = {};
         state.subscribedPlaylists = [];
         state.selectedSubPlaylistId = null;
+        state.dailyMix = null;
         store.set('publishedMap', {});
         store.set('subscribedPlaylists', []);
         persistAuthSession('', null);
@@ -4208,6 +4328,7 @@
         const btn = e.target.closest('.chip-btn');
         if (!btn) return;
         state.libFilter = btn.dataset.filter;
+        state.selectedTrackIds.clear();
         $('libFilterChips').querySelectorAll('.chip-btn').forEach(b => b.classList.toggle('active', b === btn));
         renderLibrary();
       });
@@ -4340,10 +4461,43 @@
           applyAudioVolume(state.prevVolume > 0.05 ? state.prevVolume : 1, true);
         }
       });
+      function applyLyricsVisibilityUI() {
+        playerSplit.classList.toggle('lyrics-hidden', state.lyricsHidden);
+        playerSplit.classList.toggle('lyrics-expanded', !state.lyricsHidden && state.lyricsExpanded);
+        const fullBtn = $('toggleLyricsFullBtn');
+        if (fullBtn) {
+          fullBtn.style.color = (!state.lyricsHidden && state.lyricsExpanded) ? 'var(--accent)' : 'var(--text-dim)';
+        }
+        const hideBtn = $('toggleLyricsHideBtn');
+        if (hideBtn) {
+          hideBtn.style.color = state.lyricsHidden ? 'var(--accent)' : 'var(--text-dim)';
+          hideBtn.title = state.lyricsHidden ? 'Показать текст' : 'Скрыть текст';
+        }
+        const hideIcon = $('toggleLyricsHideIcon');
+        if (hideIcon) {
+          hideIcon.innerHTML = state.lyricsHidden
+            ? '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>'
+            : '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/>';
+        }
+      }
+
+      $('toggleLyricsHideBtn').addEventListener('click', () => {
+        state.lyricsHidden = !state.lyricsHidden;
+        if (state.lyricsHidden) state.lyricsExpanded = false;
+        store.set('lyricsHidden', state.lyricsHidden);
+        applyLyricsVisibilityUI();
+        showToast(state.lyricsHidden ? 'Текст скрыт' : 'Текст показан');
+      });
+
       $('toggleLyricsFullBtn').addEventListener('click', () => {
-        state.lyricsExpanded = !state.lyricsExpanded;
-        playerSplit.classList.toggle('lyrics-expanded', state.lyricsExpanded);
-        $('toggleLyricsFullBtn').style.color = state.lyricsExpanded ? 'var(--accent)' : 'var(--text-dim)';
+        if (state.lyricsHidden) {
+          state.lyricsHidden = false;
+          store.set('lyricsHidden', false);
+          state.lyricsExpanded = true;
+        } else {
+          state.lyricsExpanded = !state.lyricsExpanded;
+        }
+        applyLyricsVisibilityUI();
       });
 
       $('lyricsMinusBtn').addEventListener('click', () => {
@@ -4430,6 +4584,11 @@
           }
 
           if (e.key === 'Escape') {
+            const dMixMod = $('dailyMixModal');
+            if (dMixMod && dMixMod.classList.contains('open')) {
+              closeDailyMixModal();
+              return;
+            }
             if (publicPlModal && publicPlModal.classList.contains('open')) {
               closePublicPlaylistModal();
               return;
@@ -5078,6 +5237,688 @@
         } catch (e) {}
       }
 
+
+      // ================= DAILY MIX ENGINE (v48: COHESIVE GENRE/VIBE + 24H CACHE) =================
+      const DAILY_MIX_CLUSTERS = [
+        {
+          id: 'dark_trap',
+          label: 'Тёмный трэп и опиум',
+          artists: ['kai angel', '9mice', 'viperr', 'pharaoh', 'madk1d', 'тёмный принц', 'onda andar', 'uglystephan', 'heronwater', 'playboi carti', 'destroy lonely', 'ken carson', 'yeat']
+        },
+        {
+          id: 'street_hiphop',
+          label: 'Уличный хип-хоп',
+          artists: ['friendly thug 52 ngg', 'alblak 52', 'скриптонит', 'macan', 'баста', 'kizaru', 'big baby tape', 'a.v.g', 'jakone', 'obladaet']
+        },
+        {
+          id: 'melodic_cloud',
+          label: 'Атмосферный и мелодичный вайб',
+          artists: ['miyagi', 'andy panda', 'miyagi & andy panda', 'endspiel', 'ollane', 'tumaniyo', 'markul', 'saluki', 'feduk', 'лсп', 'три дня дождя']
+        },
+        {
+          id: 'alt_rock',
+          label: 'Рок и альтернатива',
+          artists: ['король и шут', 'кино', 'земфира', 'сплин', 'би-2', 'три дня дождя', 'нервы', 'пошлая молли', 'валентин стрыкало', 'deftones', 'nirvana']
+        },
+        {
+          id: 'dark_rnb_pop',
+          label: 'Ночной R&B и поп',
+          artists: ['the weeknd', 'travis scott', 'don toliver', 'chase atlantic', 'billie eilish', 'lana del rey', 'the neighbourhood', 'arctic monkeys', 'sza', 'frank ocean']
+        },
+        {
+          id: 'phonk_elec',
+          label: 'Фонк и электроника',
+          artists: ['kordhell', 'dvrst', 'interworld', 'lxst cxntury', 'ghostface playa', 'moondeity', 'hensonn', 'crystal castles', 'pastel ghost', 'sidewalks and skeletons']
+        }
+      ];
+
+      let dailyMixLoading = false;
+      let dailyMixManualOffset = 0;
+
+      function getTodayDateKey() {
+        const d = new Date();
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}`;
+      }
+
+      function formatDailyMixDateLabel() {
+        try {
+          return new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }).replace('.', '');
+        } catch (e) {
+          return 'Сегодня';
+        }
+      }
+
+      function hashStringSeed(str) {
+        let h = 2166136261;
+        for (let i = 0; i < str.length; i++) {
+          h ^= str.charCodeAt(i);
+          h = Math.imul(h, 16777619);
+        }
+        return (h >>> 0);
+      }
+
+      function recordRecentPlayedArtist(artistStr) {
+        try {
+          const parsed = extractIndividualArtists(artistStr);
+          if (!parsed.length) return;
+          const a = parsed[0];
+          const next = [
+            { key: a.key, name: a.name, ts: Date.now() },
+            ...(state.recentArtists || []).filter(x => x && x.key !== a.key)
+          ].slice(0, 24);
+          state.recentArtists = next;
+          store.set('recentArtistsV48', next);
+        } catch (e) {}
+      }
+
+      function getDailyMixTasteProfile() {
+        const scoreMap = new Map();
+        const libById = new Map();
+        for (const t of state.libraryTracks) {
+          if (t && t.id) libById.set(t.id, t);
+        }
+
+        const addWeight = (artistStr, weight) => {
+          const list = extractIndividualArtists(artistStr || '');
+          for (const a of list) {
+            const cur = scoreMap.get(a.key);
+            if (cur) cur.score += weight;
+            else scoreMap.set(a.key, { key: a.key, name: a.name, score: weight });
+          }
+        };
+
+        if (state.likedIds && state.likedIds.size) {
+          for (const lid of state.likedIds) {
+            const t = libById.get(lid);
+            if (t && t.artist) addWeight(t.artist, 3.0);
+          }
+        }
+        for (const pl of (state.playlists || [])) {
+          if (!pl || !Array.isArray(pl.trackIds)) continue;
+          for (const tid of pl.trackIds) {
+            const t = libById.get(tid);
+            if (t && t.artist) addWeight(t.artist, 2.0);
+          }
+        }
+        for (const rec of (state.recentArtists || [])) {
+          if (rec && rec.name) addWeight(rec.name, 1.5);
+        }
+
+        return Array.from(scoreMap.values()).sort((a, b) => b.score - a.score);
+      }
+
+      function findVibeClusterForArtist(artistKey) {
+        if (!artistKey) return null;
+        for (const cl of DAILY_MIX_CLUSTERS) {
+          for (const a of cl.artists) {
+            const ak = normalizeArtistKey(a);
+            if (ak === artistKey || artistKey.includes(ak) || ak.includes(artistKey)) {
+              return cl;
+            }
+          }
+        }
+        return null;
+      }
+
+      function getCoOccurringArtistsFromPlaylists(anchorKey) {
+        const coMap = new Map();
+        const libById = new Map();
+        for (const t of state.libraryTracks) {
+          if (t && t.id) libById.set(t.id, t);
+        }
+        for (const pl of (state.playlists || [])) {
+          if (!pl || !Array.isArray(pl.trackIds) || pl.trackIds.length < 2) continue;
+          const plArtists = new Map();
+          let hasAnchor = false;
+          for (const tid of pl.trackIds) {
+            const t = libById.get(tid);
+            if (!t || !t.artist) continue;
+            for (const a of extractIndividualArtists(t.artist)) {
+              if (a.key === anchorKey) hasAnchor = true;
+              else plArtists.set(a.key, a.name);
+            }
+          }
+          if (hasAnchor) {
+            plArtists.forEach((name, key) => {
+              const cur = coMap.get(key);
+              if (cur) cur.weight += 1;
+              else coMap.set(key, { key, name, weight: 1 });
+            });
+          }
+        }
+        return Array.from(coMap.values()).sort((a, b) => b.weight - a.weight);
+      }
+
+      function updateDailyMixCardVisibility() {
+        const card = $('dailyMixCard');
+        if (!card) return;
+        const q = searchInput ? searchInput.value.trim() : '';
+        const shouldShow = (state.searchMode === 'tracks') && !q && (Boolean(state.dailyMix) || dailyMixLoading);
+        card.style.display = shouldShow ? 'flex' : 'none';
+      }
+
+      function renderDailyMixCard() {
+        const card = $('dailyMixCard');
+        if (!card) return;
+        card.classList.toggle('loading', dailyMixLoading);
+        updateDailyMixCardVisibility();
+
+        const mix = state.dailyMix;
+        if (!mix) {
+          if (dailyMixLoading) {
+            $('dailyMixTitle').textContent = 'Собираем микс дня...';
+            $('dailyMixSub').textContent = 'Подбираем треки в одном вайбе под ваш вкус';
+            $('dailyMixDate').textContent = formatDailyMixDateLabel();
+          }
+          return;
+        }
+
+        const covEl = $('dailyMixCover');
+        covEl.innerHTML = buildCoverCollageHtml(mix.covers || []);
+        covEl.querySelectorAll('img').forEach(img => img.addEventListener('error', () => img.remove()));
+
+        $('dailyMixDate').textContent = mix.dateLabel || formatDailyMixDateLabel();
+        $('dailyMixTitle').textContent = mix.title || 'Ваш микс дня';
+        $('dailyMixSub').textContent = mix.subtitle || `${(mix.tracks || []).length} треков под ваш вкус`;
+      }
+
+      function openDailyMixModal() {
+        const mix = state.dailyMix;
+        const modal = $('dailyMixModal');
+        if (!mix || !modal) return;
+
+        const covEl = $('dailyMixModalCover');
+        covEl.innerHTML = buildCoverCollageHtml(mix.covers || []);
+        covEl.querySelectorAll('img').forEach(img => img.addEventListener('error', () => img.remove()));
+
+        $('dailyMixModalDate').textContent = mix.dateLabel || formatDailyMixDateLabel();
+        $('dailyMixModalTitle').textContent = mix.title || 'Ваш микс дня';
+        $('dailyMixModalSub').textContent = `${(mix.tracks || []).length} трек. · ${mix.subtitle || ''}`;
+
+        const listEl = $('dailyMixModalTrackList');
+        listEl.innerHTML = '';
+        (mix.tracks || []).forEach(t => listEl.appendChild(buildTrackRow(t, 'daily_mix')));
+        modal.classList.add('open');
+      }
+
+      function closeDailyMixModal() {
+        const modal = $('dailyMixModal');
+        if (modal) modal.classList.remove('open');
+      }
+
+      function getSerializableDailyMix() {
+        const m = state.dailyMix;
+        if (!m || !m.cacheKey || !Array.isArray(m.tracks) || !m.tracks.length) return null;
+        return {
+          cacheKey: String(m.cacheKey),
+          dateLabel: String(m.dateLabel || formatDailyMixDateLabel()),
+          title: String(m.title || 'Ваш микс дня'),
+          subtitle: String(m.subtitle || ''),
+          covers: Array.isArray(m.covers) ? m.covers.slice(0, 4) : [],
+          tracks: m.tracks.slice(0, 50).map(t => ({
+            id: t.id,
+            tgTrackId: t.tgTrackId || '',
+            title: t.title || 'Без названия',
+            artist: t.artist || 'Исполнитель',
+            album: t.album || 'Микс дня',
+            duration: Number(t.duration || 180) || 180,
+            artwork: t.artwork || '',
+            coverGrad: t.coverGrad || '',
+            source: t.source || 'Telegram',
+            inTelegram: !!t.inTelegram
+          }))
+        };
+      }
+
+      async function loadOrBuildDailyMix(forceRebuild = false) {
+        if (dailyMixLoading) return;
+        const today = getTodayDateKey();
+        const userScope = (state.user && state.user.tgId) ? String(state.user.tgId) : 'guest';
+        const cacheKey = `${today}|${userScope}`;
+
+        if (!forceRebuild) {
+          const cached = store.get('dailyMixV49', null);
+          if (cached && cached.cacheKey === cacheKey && Array.isArray(cached.tracks) && cached.tracks.length >= 6) {
+            state.dailyMix = {
+              ...cached,
+              tracks: cached.tracks.map(normalizeCloudTrack).filter(Boolean)
+            };
+            renderDailyMixCard();
+            return;
+          }
+        }
+
+        if (isOfflineEffective()) {
+          const cached = store.get('dailyMixV49', null);
+          if (cached && Array.isArray(cached.tracks) && cached.tracks.length) {
+            state.dailyMix = {
+              ...cached,
+              tracks: cached.tracks.map(normalizeCloudTrack).filter(Boolean)
+            };
+            renderDailyMixCard();
+          }
+          return;
+        }
+
+        dailyMixLoading = true;
+        renderDailyMixCard();
+
+        try {
+          if (forceRebuild) dailyMixManualOffset += 1;
+          const seedNum = hashStringSeed(`${today}|${userScope}|${dailyMixManualOffset}`);
+          const taste = getDailyMixTasteProfile();
+
+          let seedArtists = [];
+          let vibeLabel = '';
+
+          if (taste.length > 0) {
+            const poolSize = Math.min(taste.length, 6);
+            const anchor = taste[seedNum % poolSize];
+            seedArtists.push(anchor.name);
+
+            const usedKeys = new Set([anchor.key]);
+            const cluster = findVibeClusterForArtist(anchor.key);
+            if (cluster) vibeLabel = cluster.label;
+
+            const coArtists = getCoOccurringArtistsFromPlaylists(anchor.key);
+            for (const ca of coArtists) {
+              if (!usedKeys.has(ca.key)) {
+                usedKeys.add(ca.key);
+                seedArtists.push(ca.name);
+                if (seedArtists.length >= 5) break;
+              }
+            }
+
+            if (cluster && seedArtists.length < 5) {
+              const rotated = [...cluster.artists];
+              const shift = seedNum % rotated.length;
+              const ordered = rotated.slice(shift).concat(rotated.slice(0, shift));
+              for (const rel of ordered) {
+                const rk = normalizeArtistKey(rel);
+                if (!usedKeys.has(rk)) {
+                  usedKeys.add(rk);
+                  seedArtists.push(rel);
+                  if (seedArtists.length >= 5) break;
+                }
+              }
+            }
+
+            if (seedArtists.length < 5) {
+              for (const t of taste) {
+                if (!usedKeys.has(t.key)) {
+                  usedKeys.add(t.key);
+                  seedArtists.push(t.name);
+                  if (seedArtists.length >= 5) break;
+                }
+              }
+            }
+          } else {
+            const cl = DAILY_MIX_CLUSTERS[seedNum % DAILY_MIX_CLUSTERS.length];
+            vibeLabel = cl.label;
+            const shift = seedNum % cl.artists.length;
+            const ordered = cl.artists.slice(shift).concat(cl.artists.slice(0, shift));
+            seedArtists = ordered.slice(0, 5);
+          }
+
+          const responses = await Promise.all(
+            seedArtists.map(a => searchViaTgBotOnly(a).catch(() => ({ ok: false, tracks: [] })))
+          );
+
+          const discoveryBuckets = [];
+          const familiarPool = [];
+          const seenKeys = new Set();
+
+          const addUnique = (t, targetArr) => {
+            if (!t || !t.id) return false;
+            const dedupKey = `${normalizeArtistKey(t.artist || '')}|${String(t.title || '').toLowerCase().replace(/[^a-zа-яё0-9]/gi, '')}`;
+            if (seenKeys.has(t.id) || seenKeys.has(dedupKey)) return false;
+            seenKeys.add(t.id);
+            seenKeys.add(dedupKey);
+            targetArr.push(t);
+            return true;
+          };
+
+          responses.forEach((res) => {
+            const bucket = [];
+            const list = (res && res.ok && Array.isArray(res.tracks)) ? res.tracks : [];
+            for (const t of list) {
+              if (state.likedIds && state.likedIds.has(t.id)) {
+                addUnique(t, familiarPool);
+              } else {
+                addUnique(t, bucket);
+              }
+            }
+            if (bucket.length) discoveryBuckets.push(bucket);
+          });
+
+          const mixed = [];
+          const maxTracks = 50;
+          const targetDiscovery = 33;
+
+          let round = 0;
+          while (mixed.length < targetDiscovery && round < 25) {
+            let addedAny = false;
+            for (const b of discoveryBuckets) {
+              if (round < b.length && mixed.length < targetDiscovery) {
+                mixed.push(b[round]);
+                addedAny = true;
+              }
+            }
+            if (!addedAny) break;
+            round++;
+          }
+
+          for (let i = 0; i < familiarPool.length && mixed.length < maxTracks; i++) {
+            const insertAt = Math.min(mixed.length, (i + 1) * 3 - 1);
+            mixed.splice(insertAt, 0, familiarPool[i]);
+          }
+
+          if (mixed.length < maxTracks) {
+            for (const b of discoveryBuckets) {
+              for (let i = round; i < b.length && mixed.length < maxTracks; i++) {
+                mixed.push(b[i]);
+              }
+            }
+          }
+
+          if (mixed.length < 4) {
+            const libRes = await searchViaTgBotOnly('').catch(() => ({ ok: false, tracks: [] }));
+            const libList = (libRes && libRes.ok && Array.isArray(libRes.tracks)) ? libRes.tracks : [];
+            for (const t of libList) {
+              if (mixed.length >= maxTracks) break;
+              addUnique(t, mixed);
+            }
+          }
+
+          if (mixed.length) {
+            const covers = [];
+            const seenCov = new Set();
+            for (const t of mixed) {
+              if (t.artwork && !seenCov.has(t.artwork)) {
+                seenCov.add(t.artwork);
+                covers.push(t.artwork);
+                if (covers.length >= 4) break;
+              }
+            }
+
+            const artistsPreview = seedArtists.slice(0, 3).join(', ');
+            const mixObj = {
+              cacheKey,
+              dateLabel: formatDailyMixDateLabel(),
+              title: vibeLabel ? `Микс дня · ${vibeLabel}` : 'Ваш микс дня',
+              subtitle: `${artistsPreview} и похожие по звучанию`,
+              covers,
+              tracks: mixed.slice(0, maxTracks)
+            };
+
+            state.dailyMix = mixObj;
+            const serMix = getSerializableDailyMix();
+            if (serMix) store.set('dailyMixV49', serMix);
+            if (state.tgToken && state.user && state.user.tgId) {
+              scheduleCloudSync();
+            }
+
+            const modal = $('dailyMixModal');
+            if (modal && modal.classList.contains('open')) {
+              openDailyMixModal();
+            }
+          }
+        } catch (e) {
+          // Silent fallback
+        } finally {
+          dailyMixLoading = false;
+          renderDailyMixCard();
+        }
+      }
+
+      function initDailyMixEvents() {
+        const leftArea = document.querySelector('#dailyMixCard .daily-mix-left');
+        if (leftArea) leftArea.addEventListener('click', openDailyMixModal);
+
+        if ($('dailyMixOpenBtn')) {
+          $('dailyMixOpenBtn').addEventListener('click', openDailyMixModal);
+        }
+        if ($('dailyMixPlayBtn')) {
+          $('dailyMixPlayBtn').addEventListener('click', () => {
+            const mix = state.dailyMix;
+            if (!mix || !mix.tracks || !mix.tracks.length) {
+              showToast('Микс дня ещё собирается...');
+              return;
+            }
+            state.activeQueue = [...mix.tracks];
+            playTrack(mix.tracks[0], true);
+          });
+        }
+        if ($('closeDailyMixModalBtn')) {
+          $('closeDailyMixModalBtn').addEventListener('click', closeDailyMixModal);
+        }
+        const modal = $('dailyMixModal');
+        if (modal) {
+          modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeDailyMixModal();
+          });
+        }
+        if ($('dailyMixModalPlayBtn')) {
+          $('dailyMixModalPlayBtn').addEventListener('click', () => {
+            const mix = state.dailyMix;
+            if (!mix || !mix.tracks || !mix.tracks.length) return;
+            state.activeQueue = [...mix.tracks];
+            playTrack(mix.tracks[0], true);
+          });
+        }
+      }
+
+
+      // ================= LIBRARY MULTI-SELECT & BULK ACTIONS (v50) =================
+      function exitLibrarySelectMode() {
+        state.libSelectMode = false;
+        state.selectedTrackIds.clear();
+        const btn = $('libSelectModeBtn');
+        if (btn) btn.classList.remove('active-select');
+        const bar = $('libBulkBar');
+        if (bar) bar.classList.remove('show');
+      }
+
+      function updateLibraryBulkBar(visibleList = null) {
+        const bar = $('libBulkBar');
+        const modeBtn = $('libSelectModeBtn');
+        if (modeBtn) modeBtn.classList.toggle('active-select', state.libSelectMode);
+        if (!bar) return;
+
+        if (!state.libSelectMode) {
+          bar.classList.remove('show');
+          return;
+        }
+
+        const list = visibleList || getVisibleLibraryTracks();
+        const visibleIds = new Set(list.map(t => t.id));
+        // Keep only IDs that exist in current visible list
+        for (const id of Array.from(state.selectedTrackIds)) {
+          if (!visibleIds.has(id)) state.selectedTrackIds.delete(id);
+        }
+
+        const count = state.selectedTrackIds.size;
+        bar.classList.add('show');
+        $('libBulkCount').textContent = `Выбрано: ${count}`;
+
+        const allSelected = list.length > 0 && count === list.length;
+        $('libSelectAllBtn').textContent = allSelected ? 'Снять все' : 'Выбрать все';
+
+        const isOwnPl = Boolean(state.selectedPlaylistId && !state.selectedSubPlaylistId);
+        const isSubPl = Boolean(state.selectedSubPlaylistId);
+
+        $('bulkRemovePlBtn').style.display = isOwnPl ? 'inline-flex' : 'none';
+        $('bulkDeleteBtn').style.display = isSubPl ? 'none' : 'inline-flex';
+
+        const disabled = count === 0;
+        ['bulkAddPlBtn', 'bulkLikeBtn', 'bulkOfflineBtn', 'bulkRemovePlBtn', 'bulkDeleteBtn'].forEach(id => {
+          const el = $(id);
+          if (el) el.disabled = disabled;
+        });
+      }
+
+      function getSelectedVisibleTracks() {
+        const list = getVisibleLibraryTracks();
+        return list.filter(t => t && state.selectedTrackIds.has(t.id));
+      }
+
+      function initLibraryBulkSelectEvents() {
+        if ($('libSelectModeBtn')) {
+          $('libSelectModeBtn').addEventListener('click', () => {
+            if (state.libSelectMode) {
+              exitLibrarySelectMode();
+            } else {
+              state.libSelectMode = true;
+              state.selectedTrackIds.clear();
+            }
+            renderLibrary();
+          });
+        }
+
+        if ($('libCancelSelectBtn')) {
+          $('libCancelSelectBtn').addEventListener('click', () => {
+            exitLibrarySelectMode();
+            renderLibrary();
+          });
+        }
+
+        if ($('libSelectAllBtn')) {
+          $('libSelectAllBtn').addEventListener('click', () => {
+            const list = getVisibleLibraryTracks();
+            if (!list.length) return;
+            const allSelected = state.selectedTrackIds.size === list.length;
+            if (allSelected) {
+              state.selectedTrackIds.clear();
+            } else {
+              list.forEach(t => state.selectedTrackIds.add(t.id));
+            }
+            renderLibrary();
+          });
+        }
+
+        if ($('bulkAddPlBtn')) {
+          $('bulkAddPlBtn').addEventListener('click', () => {
+            const selected = getSelectedVisibleTracks();
+            if (!selected.length) return;
+            openPlaylistModal(null, selected);
+          });
+        }
+
+        if ($('bulkLikeBtn')) {
+          $('bulkLikeBtn').addEventListener('click', () => {
+            const selected = getSelectedVisibleTracks();
+            if (!selected.length) return;
+            let added = 0;
+            selected.forEach(t => {
+              ensureTrackInLibrary(t);
+              if (!state.likedIds.has(t.id)) {
+                state.likedIds.add(t.id);
+                added++;
+              }
+            });
+            store.set('liked', Array.from(state.likedIds));
+            scheduleCloudSync();
+            favRecsDirty = true;
+            exitLibrarySelectMode();
+            renderLibrary();
+            renderSearchResultsList();
+            renderProfile();
+            updatePlayerLikeUI();
+            showToast(added > 0 ? `Добавлено в избранное: ${added} трек.` : 'Выбранные треки уже в избранном');
+          });
+        }
+
+        if ($('bulkOfflineBtn')) {
+          $('bulkOfflineBtn').addEventListener('click', async () => {
+            if (isOfflineEffective()) {
+              showToast('Для скачивания нужен интернет');
+              return;
+            }
+            const selected = getSelectedVisibleTracks();
+            const toDl = selected.filter(t => t && !state.offlineIds.has(t.id));
+            if (!toDl.length) {
+              showToast('Все выбранные треки уже сохранены оффлайн');
+              return;
+            }
+            const btn = $('bulkOfflineBtn');
+            btn.disabled = true;
+            let done = 0;
+            for (let i = 0; i < toDl.length; i++) {
+              btn.textContent = `${i + 1}/${toDl.length}`;
+              const ok = await cacheTrackOffline(toDl[i], { silent: true, pinned: true });
+              if (ok) done++;
+            }
+            btn.textContent = '⬇ Оффлайн';
+            btn.disabled = false;
+            exitLibrarySelectMode();
+            renderLibrary();
+            showToast(`Сохранено оффлайн: ${done} из ${toDl.length} трек.`);
+          });
+        }
+
+        if ($('bulkRemovePlBtn')) {
+          $('bulkRemovePlBtn').addEventListener('click', () => {
+            if (!state.selectedPlaylistId) return;
+            const pl = state.playlists.find(p => p.id === state.selectedPlaylistId);
+            if (!pl) return;
+            const count = state.selectedTrackIds.size;
+            if (!count) return;
+            pl.trackIds = pl.trackIds.filter(id => !state.selectedTrackIds.has(id));
+            persistPlaylists(true);
+            exitLibrarySelectMode();
+            renderLibrary();
+            renderSearchResultsList();
+            showToast(`Убрано из «${pl.name}»: ${count} трек.`);
+          });
+        }
+
+        if ($('bulkDeleteBtn')) {
+          $('bulkDeleteBtn').addEventListener('click', async () => {
+            const selected = getSelectedVisibleTracks();
+            if (!selected.length) return;
+            const delIds = new Set(selected.map(t => t.id));
+
+            state.libraryTracks = state.libraryTracks.filter(t => t && !delIds.has(t.id));
+            state.activeQueue = (state.activeQueue || []).filter(t => t && !delIds.has(t.id));
+            delIds.forEach(id => state.likedIds.delete(id));
+            state.playlists.forEach(pl => {
+              if (pl && Array.isArray(pl.trackIds)) {
+                pl.trackIds = pl.trackIds.filter(id => !delIds.has(id));
+              }
+            });
+
+            for (const t of selected) {
+              if (state.offlineIds.has(t.id)) {
+                await removeTrackOffline(t, true);
+              }
+              if (t.isLocal && t.audioUrl && String(t.audioUrl).startsWith('blob:')) {
+                try { URL.revokeObjectURL(t.audioUrl); } catch (e) {}
+              }
+            }
+
+            if (state.currentTrack && delIds.has(state.currentTrack.id)) {
+              pausePlayback();
+            }
+
+            store.set('liked', Array.from(state.likedIds));
+            persistSavedCatalogTracks();
+            persistPlaylists(true);
+            favRecsDirty = true;
+            exitLibrarySelectMode();
+            renderQuickTags();
+            renderLibrary();
+            renderSearchResultsList();
+            renderProfile();
+            updatePlayerLikeUI();
+            updatePlayerPlaylistBtn();
+            showToast(`Удалено треков: ${selected.length}`);
+          });
+        }
+      }
+
       // ================= INIT =================
       applyTheme(state.theme, false);
       applyAudioVolume(state.volume, false);
@@ -5088,7 +5929,10 @@
       initCrossSwipe();
       initPlayerLoopAndVisualizer();
       initDesktopFullscreenAndHotkeys();
+      applyLyricsVisibilityUI();
+      initLibraryBulkSelectEvents();
       initPublicPlaylistsEvents();
+      initDailyMixEvents();
       initTelegramMiniApp();
       initOfflineStorage().then(async () => {
         updateOfflineUI();
@@ -5097,6 +5941,7 @@
           checkTgBotStatus();
         }
         performSearch();
+        loadOrBuildDailyMix(false);
         handleInitialDeepLinkPlaylist();
       });
     })();

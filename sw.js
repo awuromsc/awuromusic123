@@ -1,6 +1,6 @@
-/* APATHY Chrome Music Player — Service Worker (v45 iOS Standalone Offline Fix) */
-const SHELL_CACHE = 'apathy-shell-v45';
-const ART_CACHE = 'apathy-art-v45';
+/* APATHY Chrome Music Player — Service Worker (v52 iOS Standalone Offline Fix) */
+const SHELL_CACHE = 'apathy-shell-v52';
+const ART_CACHE = 'apathy-art-v52';
 
 const SHELL_ASSETS = [
   '/',

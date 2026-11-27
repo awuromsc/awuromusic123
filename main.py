@@ -241,10 +241,14 @@ def init_db() -> sqlite3.Connection:
             playlists_json TEXT DEFAULT '[]',
             liked_ids_json TEXT DEFAULT '[]',
             saved_tracks_json TEXT DEFAULT '[]',
+            daily_mix_json TEXT DEFAULT '',
             updated_at INTEGER NOT NULL
         );
         """
     )
+    existing_state_cols = {r[1] for r in conn.execute("PRAGMA table_info(user_state)").fetchall()}
+    if "daily_mix_json" not in existing_state_cols:
+        conn.execute("ALTER TABLE user_state ADD COLUMN daily_mix_json TEXT DEFAULT ''")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS public_playlists (
@@ -1462,18 +1466,28 @@ def load_user_cloud_state(tg_id: int, theme: str = "chrome") -> Dict[str, Any]:
         saved_tracks = json.loads(row["saved_tracks_json"] or "[]")
     except Exception:
         saved_tracks = []
+    daily_mix = None
+    try:
+        raw_dm = row["daily_mix_json"] if "daily_mix_json" in row.keys() else ""
+        if raw_dm:
+            parsed_dm = json.loads(raw_dm)
+            if isinstance(parsed_dm, dict) and isinstance(parsed_dm.get("tracks"), list):
+                daily_mix = parsed_dm
+    except Exception:
+        daily_mix = None
     return {
         "playlists": playlists if isinstance(playlists, list) else [],
         "likedIds": liked_ids if isinstance(liked_ids, list) else [],
         "savedTracks": saved_tracks if isinstance(saved_tracks, list) else [],
         "publishedMap": pub_map,
         "subscribedPlaylists": sub_pls,
+        "dailyMix": daily_mix,
         "theme": theme or "chrome",
         "updatedAt": int(row["updated_at"] or 0),
     }
 
 
-def save_user_cloud_state(tg_id: int, playlists: list, liked_ids: list, saved_tracks: list, theme: str = "") -> int:
+def save_user_cloud_state(tg_id: int, playlists: list, liked_ids: list, saved_tracks: list, theme: str = "", daily_mix: Any = None) -> int:
     now = int(time.time())
     clean_playlists = playlists[:50] if isinstance(playlists, list) else []
     clean_likes = [str(x) for x in (liked_ids[:500] if isinstance(liked_ids, list) else [])]
@@ -1525,14 +1539,27 @@ def save_user_cloud_state(tg_id: int, playlists: list, liked_ids: list, saved_tr
                 added_by=int(tg_id),
             )
 
+    daily_mix_str = None
+    if isinstance(daily_mix, dict) and isinstance(daily_mix.get("tracks"), list) and daily_mix.get("cacheKey"):
+        clean_dm = {
+            "cacheKey": str(daily_mix.get("cacheKey") or "")[:64],
+            "dateLabel": str(daily_mix.get("dateLabel") or "")[:32],
+            "title": str(daily_mix.get("title") or "Ваш микс дня")[:100],
+            "subtitle": str(daily_mix.get("subtitle") or "")[:180],
+            "covers": [str(u)[:500] for u in (daily_mix.get("covers") or [])[:4] if u],
+            "tracks": [t for t in daily_mix.get("tracks", [])[:50] if isinstance(t, dict) and t.get("id")],
+        }
+        daily_mix_str = json.dumps(clean_dm, ensure_ascii=False)
+
     DB.execute(
         """
-        INSERT INTO user_state(tg_id, playlists_json, liked_ids_json, saved_tracks_json, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO user_state(tg_id, playlists_json, liked_ids_json, saved_tracks_json, daily_mix_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(tg_id) DO UPDATE SET
             playlists_json = excluded.playlists_json,
             liked_ids_json = excluded.liked_ids_json,
             saved_tracks_json = excluded.saved_tracks_json,
+            daily_mix_json = CASE WHEN excluded.daily_mix_json != '' THEN excluded.daily_mix_json ELSE user_state.daily_mix_json END,
             updated_at = excluded.updated_at
         """,
         (
@@ -1540,6 +1567,7 @@ def save_user_cloud_state(tg_id: int, playlists: list, liked_ids: list, saved_tr
             json.dumps(clean_playlists, ensure_ascii=False),
             json.dumps(clean_likes, ensure_ascii=False),
             json.dumps(clean_tracks, ensure_ascii=False),
+            daily_mix_str or "",
             now,
         ),
     )
@@ -2722,7 +2750,7 @@ async def cmd_admin_help(message: Message, bot: Bot):
         return
     db_s = get_db_stats()
     text = (
-        "<b>🔧 Админ-команды APATHY (v41):</b>\n\n"
+        "<b>🔧 Админ-команды APATHY (v42):</b>\n\n"
         f"📊 В базе: <b>{db_s['users']}</b> польз. · <b>{db_s['all_tracks']}</b> трек. · <b>{db_s['playlists']}</b> плейл. · <b>{db_s.get('public_playlists', 0)}</b> публ.\n\n"
         "• /backup — сохранить бэкап базы в канал\n"
         "• /restore — восстановить базу из канала\n"
@@ -3543,8 +3571,9 @@ async def api_user_sync(request: web.Request) -> web.Response:
     liked_ids = (body or {}).get("likedIds") or []
     saved_tracks = (body or {}).get("savedTracks") or []
     theme = str((body or {}).get("theme") or "").strip()
+    daily_mix = (body or {}).get("dailyMix")
     try:
-        ts = save_user_cloud_state(int(row["tg_id"]), playlists, liked_ids, saved_tracks, theme)
+        ts = save_user_cloud_state(int(row["tg_id"]), playlists, liked_ids, saved_tracks, theme, daily_mix)
     except Exception as e:
         log.warning("api_user_sync save error for %s: %s", row["tg_id"], e)
         return web.json_response({"ok": False, "error": "sync_save_error"}, status=500)
