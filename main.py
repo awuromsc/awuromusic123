@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APATHY v39 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
+APATHY v40 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
 ===========================================================================================================
-Исправлено в v39 (обход блокировок YouTube на Docker/VPS-серверах):
+Исправлено в v40 (обход блокировок YouTube на Docker/VPS-серверах):
   1. Мульти-поиск строго по аудиоисточникам одновременно:
        • SoundCloud API v2 (полные треки, прогрессивный MP3 без блокировок дата-центров — идеально для ру-рэпа/андерграунда)
        • Прямые РФ MP3-порталы (Hitmo, Hitmotop, Muzofond, Mp3Party, LightAudio — мгновенный MP3, 0% CPU)
@@ -401,7 +401,7 @@ async def backup_db_to_telegram(bot: Bot, reason: str = "auto") -> Tuple[bool, s
             reason_lbl = {"manual": "Ручной бэкап", "shutdown": "Бэкап при остановке", "auto": "Автобэкап"}.get(reason, "Бэкап")
             caption = (
                 "#apathy_db_backup\n"
-                f"💾 <b>{reason_lbl} базы APATHY</b> (v39)\n"
+                f"💾 <b>{reason_lbl} базы APATHY</b> (v40)\n"
                 f"👤 Пользователей: <b>{stats['users']}</b> · 🎵 Треков: <b>{stats['all_tracks']}</b> · 📋 Плейлистов: <b>{stats['playlists']}</b>\n"
                 f"📦 Размер: <b>{size_bytes / 1024:.1f} КБ</b> · 🕒 {ts_str}"
             )
@@ -554,6 +554,27 @@ def get_webapp_link() -> str:
     if api_base and api_base != SITE_URL and api_base != DEFAULT_BOT_API_URL:
         return f"{SITE_URL}/?api={quote(api_base, safe=':/')}"
     return f"{SITE_URL}/"
+
+
+def get_app_version_payload() -> Dict[str, Any]:
+    latest_code = int(get_setting("app_latest_code", "1") or 1)
+    min_code = int(get_setting("app_min_code", "1") or 1)
+    latest_name = get_setting("app_latest_name", "1.0.0") or "1.0.0"
+    changelog = get_setting("app_changelog", "Актуальная версия плеера APATHY.")
+    apk_url = get_setting("app_apk_url", "")
+    apk_fid = get_setting("app_apk_file_id", "")
+    if not apk_url and apk_fid:
+        apk_url = f"{get_bot_api_url()}/api/app/download"
+    return {
+        "ok": True,
+        "latestVersionCode": latest_code,
+        "latestVersionName": latest_name,
+        "minVersionCode": min_code,
+        "force": min_code >= latest_code and latest_code > 1,
+        "apkUrl": apk_url,
+        "hasTelegramApk": bool(apk_fid),
+        "changelog": changelog,
+    }
 
 
 # -------------------- ТЕКСТОВЫЕ УТИЛИТЫ --------------------
@@ -784,7 +805,7 @@ def lookup_track_record(track_id: str) -> Optional[Dict[str, Any]]:
 
 
 
-# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v39) ====================
+# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v40) ====================
 def _user_row_to_public(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
     tg_id = int(d["tg_id"])
@@ -2291,7 +2312,8 @@ async def cmd_start(message: Message, bot: Bot):
         f"🌐 Плеер: {SITE_URL}/\n\n"
         "• <b>Напиши название трека или исполнителя</b> — найду и пришлю аудио.\n"
         "• <b>Перешли любой аудиофайл</b> — трек сразу добавится в твой плейлист.\n"
-        "• <b>/playlists</b> — твои плейлисты и избранное"
+        "• <b>/playlists</b> — твои плейлисты и избранное\n"
+        "• <b>/apk</b> — скачать приложение APATHY для Android"
     )
     uid = message.from_user.id if message.from_user else None
     if await is_admin_user(bot, uid):
@@ -2306,7 +2328,7 @@ async def cmd_admin_help(message: Message, bot: Bot):
         return
     db_s = get_db_stats()
     text = (
-        "<b>🔧 Админ-команды APATHY (v39):</b>\n\n"
+        "<b>🔧 Админ-команды APATHY (v40):</b>\n\n"
         f"📊 В базе: <b>{db_s['users']}</b> польз. · <b>{db_s['all_tracks']}</b> трек. · <b>{db_s['playlists']}</b> плейл.\n\n"
         "• /backup — сохранить бэкап базы в канал\n"
         "• /restore — восстановить базу из канала\n"
@@ -2314,9 +2336,111 @@ async def cmd_admin_help(message: Message, bot: Bot):
         "• /list — последние треки в базе\n"
         "• /del название — удалить трек из базы\n"
         "• /setapi URL — задать публичный URL бота\n"
-        "• /setstorage — привязать канал-хранилище"
+        "• /setstorage — привязать канал-хранилище\n"
+        "• /setapp 2 2 1.1.0 | описание — версия и Force Update APK\n"
+        "• /setapk URL — внешняя ссылка на APK (или просто скиньте .apk файл боту)"
     )
     await message.answer(text, parse_mode="HTML")
+
+
+
+
+@router.message(Command("apk", "android"))
+async def cmd_download_apk(message: Message):
+    info = get_app_version_payload()
+    apk_fid = get_setting("app_apk_file_id", "")
+    apk_url = info.get("apkUrl") or ""
+    ver = info.get("latestVersionName") or "1.0.0"
+    chlog = info.get("changelog") or ""
+    if apk_fid:
+        cap = f"📱 <b>APATHY для Android · v{ver}</b>"
+        if chlog:
+            cap += f"\n\n{chlog}"
+        await message.answer_document(document=apk_fid, caption=cap, parse_mode="HTML")
+        return
+    if apk_url:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"⬇️ Скачать APATHY v{ver} (.apk)", url=apk_url)]])
+        await message.answer(
+            f"📱 <b>APATHY для Android · v{ver}</b>\n\n{chlog}",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        return
+    await message.answer("📱 Android-приложение (.apk) скоро появится здесь. Пока можно слушать прямо в браузере!", reply_markup=build_webapp_keyboard())
+
+
+@router.message(Command("setapp"))
+async def cmd_set_app_version(message: Message, bot: Bot):
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
+        return
+    raw = (message.text or "").split(maxsplit=1)
+    if len(raw) < 2 or not raw[1].strip():
+        cur = get_app_version_payload()
+        await message.answer(
+            "<b>Настройка версии Android APK (Force Update):</b>\n\n"
+            f"Сейчас: <b>v{cur['latestVersionName']}</b> (code={cur['latestVersionCode']}, min={cur['minVersionCode']})\n"
+            f"Ссылка: <code>{cur['apkUrl'] or 'не задана'}</code>\n\n"
+            "<b>Формат команды:</b>\n"
+            "<code>/setapp latestCode minCode versionName | Что нового</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "• Обязательное обновление до v1.1.0:\n"
+            "<code>/setapp 2 2 1.1.0 | Исправлены баги и ускорен плеер</code>\n"
+            "• Мягкое (можно нажать «Позже»):\n"
+            "<code>/setapp 2 1 1.1.0 | Новые функции</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    body = raw[1].strip()
+    if "|" in body:
+        meta_part, chlog = [x.strip() for x in body.split("|", 1)]
+    else:
+        meta_part, chlog = body, ""
+    tokens = meta_part.split()
+    if len(tokens) < 2 or not tokens[0].isdigit() or not tokens[1].isdigit():
+        await message.answer("Формат: <code>/setapp 2 2 1.1.0 | Описание</code>", parse_mode="HTML")
+        return
+
+    latest_code = int(tokens[0])
+    min_code = int(tokens[1])
+    ver_name = tokens[2] if len(tokens) >= 3 else f"1.{latest_code}.0"
+
+    set_setting("app_latest_code", str(latest_code))
+    set_setting("app_min_code", str(min_code))
+    set_setting("app_latest_name", ver_name)
+    if chlog:
+        set_setting("app_changelog", chlog)
+
+    mode = "🔒 ПРИНУДИТЕЛЬНОЕ (старые версии заблокированы)" if min_code >= latest_code else "🔔 Мягкое (можно пропустить)"
+    await message.answer(
+        f"✅ <b>Версия APK обновлена!</b>\n\n"
+        f"Версия: <b>v{ver_name}</b> (code {latest_code})\n"
+        f"Минимум: <b>code {min_code}</b>\n"
+        f"Режим: {mode}\n"
+        f"Описание: {chlog or 'без изменений'}",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("setapk"))
+async def cmd_set_apk_url(message: Message, bot: Bot):
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not re.match(r"^https?://", parts[1].strip(), re.I):
+        await message.answer(
+            "Укажите прямую HTTPS-ссылку на файл .apk:\n"
+            "<code>/setapk https://github.com/.../APATHY.apk</code>\n\n"
+            "Или просто <b>отправьте сам файл .apk</b> в этот чат — бот сохранит его автоматически!",
+            parse_mode="HTML",
+        )
+        return
+    url = parts[1].strip()
+    set_setting("app_apk_url", url)
+    set_setting("app_apk_file_id", "")
+    await message.answer(f"✅ Внешняя ссылка на APK сохранена:\n<code>{url}</code>", parse_mode="HTML")
 
 
 @router.message(Command("playlists", "my"))
@@ -2435,7 +2559,7 @@ async def cmd_test_sources(message: Message, bot: Bot):
             st_txt = f"❌ <code>{st_id}</code> (нет доступа: {str(e)[:40]})"
     db_s = get_db_stats()
     await m.edit_text(
-        "<b>Диагностика источников сервера (v39):</b>\n\n"
+        "<b>Диагностика источников сервера (v40):</b>\n\n"
         + "\n".join(lines)
         + f"\n\n🎛 ffmpeg: {ff_st}"
         + f"\n💾 Бэкап-канал: {st_txt}"
@@ -2564,6 +2688,28 @@ async def handle_uploaded_audio(message: Message, bot: Bot):
             await message.reply("🍪 Файл <b>cookies.txt</b> сохранён! Прямое скачивание с YouTube активировано.", parse_mode="HTML")
         except Exception as e:
             await message.reply(f"Не удалось сохранить cookies.txt: {e}")
+        return
+
+    # Поддержка загрузки нового Android .apk файла прямо в бота (только админ)
+    if message.document and (message.document.file_name or "").lower().endswith(".apk"):
+        uid_a = message.from_user.id if message.from_user else None
+        if not await is_admin_user(bot, uid_a):
+            return
+        doc = message.document
+        dl_url = f"{get_bot_api_url()}/api/app/download"
+        set_setting("app_apk_file_id", doc.file_id)
+        set_setting("app_apk_url", dl_url)
+        size_mb = (doc.file_size or 0) / (1024 * 1024)
+        cur = get_app_version_payload()
+        warn_big = "\n⚠️ Файл больше 19.5 МБ — для автоскачивания в приложении лучше выложить его на GitHub Releases и указать через /setapk URL." if (doc.file_size or 0) > MAX_AUDIO_BYTES else ""
+        await message.reply(
+            f"📱 <b>APK-файл сохранён!</b> ({size_mb:.1f} МБ)\n"
+            f"Прямая ссылка: <code>{dl_url}</code>\n"
+            f"Текущая версия в API: <b>v{cur['latestVersionName']}</b> (code {cur['latestVersionCode']}, min {cur['minVersionCode']}){warn_big}\n\n"
+            "Чтобы разослать принудительное обновление, отправьте:\n"
+            "<code>/setapp 2 2 1.1.0 | Что нового</code>",
+            parse_mode="HTML",
+        )
         return
 
     meta = _extract_audio_from_msg(message)
@@ -2994,13 +3140,55 @@ async def api_user_logout(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def api_app_version(request: web.Request) -> web.Response:
+    return web.json_response(
+        get_app_version_payload(),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+async def api_app_download(request: web.Request) -> web.StreamResponse:
+    apk_fid = get_setting("app_apk_file_id", "")
+    ext_url = get_setting("app_apk_url", "")
+    bot: Bot = request.app["bot"]
+    session: aiohttp.ClientSession = request.app["http_session"]
+
+    if apk_fid:
+        tg_url = await get_tg_file_url(bot, apk_fid)
+        if tg_url:
+            try:
+                async with session.get(tg_url, timeout=aiohttp.ClientTimeout(total=120, sock_connect=10, sock_read=30)) as up:
+                    if up.status == 200:
+                        ver = get_setting("app_latest_name", "1.0.0") or "1.0.0"
+                        resp_headers = {
+                            "Content-Type": "application/vnd.android.package-archive",
+                            "Content-Disposition": f'attachment; filename="APATHY-v{ver}.apk"',
+                            "Cache-Control": "no-cache",
+                            "Access-Control-Allow-Origin": "*",
+                        }
+                        if "Content-Length" in up.headers:
+                            resp_headers["Content-Length"] = up.headers["Content-Length"]
+                        resp = web.StreamResponse(status=200, headers=resp_headers)
+                        await resp.prepare(request)
+                        async for chunk in up.content.iter_chunked(65536):
+                            await resp.write(chunk)
+                        await resp.write_eof()
+                        return resp
+            except Exception as e:
+                log.warning("api_app_download stream error: %s", e)
+
+    if ext_url and not ext_url.rstrip("/").endswith("/api/app/download"):
+        raise web.HTTPFound(ext_url)
+    return web.Response(status=404, text="APK not uploaded yet")
+
+
 async def api_ping(request: web.Request) -> web.Response:
     total = DB.execute("SELECT COUNT(*) AS c FROM tracks WHERE tg_file_id != ''").fetchone()["c"]
     return web.json_response(
         {
             "ok": True,
-            "service": "apathy-tg-audio-v39",
-            "version": "v39",
+            "service": "apathy-tg-audio-v40",
+            "version": "v40",
             "bot": BOT_USERNAME_CACHE,
             "siteUrl": SITE_URL,
             "tracksCount": total,
@@ -3281,6 +3469,7 @@ async def main():
             [
                 BotCommand(command="start", description="Открыть плеер APATHY"),
                 BotCommand(command="playlists", description="Мои плейлисты"),
+                BotCommand(command="apk", description="Скачать приложение для Android"),
             ]
         )
     except Exception as e:
@@ -3294,7 +3483,7 @@ async def main():
         log.warning("Auto-restore skipped with status: %s", rst_err)
 
     log.info(
-        "APATHY v39 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s | storage=%s",
+        "APATHY v40 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s | storage=%s",
         BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG, get_storage_chat_id(),
     )
 
@@ -3307,6 +3496,8 @@ async def main():
     app["http_session"] = http_session
 
     app.router.add_get("/health", api_ping)
+    app.router.add_get("/api/app/version", api_app_version)
+    app.router.add_get("/api/app/download", api_app_download)
     app.router.add_post("/api/auth/webapp", api_auth_webapp)
     app.router.add_post("/api/auth/start", api_auth_start)
     app.router.add_get("/api/auth/poll", api_auth_poll)
