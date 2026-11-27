@@ -1876,3 +1876,57 @@
       margin: 0 auto 18px;
       max-width: 300px;
     }
+
+
+    /* v39 Profile Telegram News Channel Card */
+    .tg-channel-card {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      text-decoration: none;
+      color: var(--text-main);
+      cursor: pointer;
+      transition: border-color 0.2s ease, background 0.2s ease, transform 0.14s ease;
+    }
+    .tg-channel-card:hover {
+      border-color: rgba(56, 178, 255, 0.48);
+    }
+    .tg-channel-card:active {
+      transform: scale(0.985);
+    }
+    .tg-channel-ico {
+      width: 38px;
+      height: 38px;
+      border-radius: 12px;
+      background: rgba(34, 158, 217, 0.16);
+      border: 1px solid rgba(56, 178, 255, 0.38);
+      color: #7fd0ff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .tg-channel-meta {
+      min-width: 0;
+      flex: 1;
+    }
+    .tg-channel-title {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      color: var(--text-main);
+    }
+    .tg-channel-sub {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+    .tg-channel-arrow {
+      color: var(--text-dim);
+      flex-shrink: 0;
+      transition: transform 0.18s ease, color 0.18s ease;
+    }
+    .tg-channel-card:hover .tg-channel-arrow {
+      transform: translateX(2px);
+      color: var(--text-main);
+    }

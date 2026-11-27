@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APATHY v38 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
+APATHY v39 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
 ===========================================================================================================
-Исправлено в v38 (обход блокировок YouTube на Docker/VPS-серверах):
+Исправлено в v39 (обход блокировок YouTube на Docker/VPS-серверах):
   1. Мульти-поиск строго по аудиоисточникам одновременно:
        • SoundCloud API v2 (полные треки, прогрессивный MP3 без блокировок дата-центров — идеально для ру-рэпа/андерграунда)
        • Прямые РФ MP3-порталы (Hitmo, Hitmotop, Muzofond, Mp3Party, LightAudio — мгновенный MP3, 0% CPU)
@@ -401,7 +401,7 @@ async def backup_db_to_telegram(bot: Bot, reason: str = "auto") -> Tuple[bool, s
             reason_lbl = {"manual": "Ручной бэкап", "shutdown": "Бэкап при остановке", "auto": "Автобэкап"}.get(reason, "Бэкап")
             caption = (
                 "#apathy_db_backup\n"
-                f"💾 <b>{reason_lbl} базы APATHY</b> (v38)\n"
+                f"💾 <b>{reason_lbl} базы APATHY</b> (v39)\n"
                 f"👤 Пользователей: <b>{stats['users']}</b> · 🎵 Треков: <b>{stats['all_tracks']}</b> · 📋 Плейлистов: <b>{stats['playlists']}</b>\n"
                 f"📦 Размер: <b>{size_bytes / 1024:.1f} КБ</b> · 🕒 {ts_str}"
             )
@@ -784,7 +784,7 @@ def lookup_track_record(track_id: str) -> Optional[Dict[str, Any]]:
 
 
 
-# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v38) ====================
+# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v39) ====================
 def _user_row_to_public(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
     tg_id = int(d["tg_id"])
@@ -2306,7 +2306,7 @@ async def cmd_admin_help(message: Message, bot: Bot):
         return
     db_s = get_db_stats()
     text = (
-        "<b>🔧 Админ-команды APATHY (v38):</b>\n\n"
+        "<b>🔧 Админ-команды APATHY (v39):</b>\n\n"
         f"📊 В базе: <b>{db_s['users']}</b> польз. · <b>{db_s['all_tracks']}</b> трек. · <b>{db_s['playlists']}</b> плейл.\n\n"
         "• /backup — сохранить бэкап базы в канал\n"
         "• /restore — восстановить базу из канала\n"
@@ -2435,7 +2435,7 @@ async def cmd_test_sources(message: Message, bot: Bot):
             st_txt = f"❌ <code>{st_id}</code> (нет доступа: {str(e)[:40]})"
     db_s = get_db_stats()
     await m.edit_text(
-        "<b>Диагностика источников сервера (v38):</b>\n\n"
+        "<b>Диагностика источников сервера (v39):</b>\n\n"
         + "\n".join(lines)
         + f"\n\n🎛 ffmpeg: {ff_st}"
         + f"\n💾 Бэкап-канал: {st_txt}"
@@ -2999,8 +2999,8 @@ async def api_ping(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "service": "apathy-tg-audio-v38",
-            "version": "v38",
+            "service": "apathy-tg-audio-v39",
+            "version": "v39",
             "bot": BOT_USERNAME_CACHE,
             "siteUrl": SITE_URL,
             "tracksCount": total,
@@ -3294,7 +3294,7 @@ async def main():
         log.warning("Auto-restore skipped with status: %s", rst_err)
 
     log.info(
-        "APATHY v38 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s | storage=%s",
+        "APATHY v39 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s | storage=%s",
         BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG, get_storage_chat_id(),
     )
 

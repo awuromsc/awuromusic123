@@ -1,6 +1,6 @@
-/* APATHY Chrome Music Player — Service Worker (v38 Offline Shell & Artwork Cache) */
-const SHELL_CACHE = 'apathy-shell-v38';
-const ART_CACHE = 'apathy-art-v38';
+/* APATHY Chrome Music Player — Service Worker (v39 Offline Shell & Artwork Cache) */
+const SHELL_CACHE = 'apathy-shell-v39';
+const ART_CACHE = 'apathy-art-v39';
 
 const SHELL_ASSETS = [
   './',

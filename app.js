@@ -3938,6 +3938,17 @@
         showToast('Тестовый сигнал отправлен! Проверьте переключатель беззвучного режима');
       });
 
+      const tgChannelLink = $('tgChannelLink');
+      if (tgChannelLink) {
+        tgChannelLink.addEventListener('click', (e) => {
+          const tgWebApp = window.Telegram && window.Telegram.WebApp;
+          if (tgWebApp && typeof tgWebApp.openTelegramLink === 'function') {
+            e.preventDefault();
+            tgWebApp.openTelegramLink('https://t.me/apathymsc');
+          }
+        });
+      }
+
       $('replaySplashBtn').addEventListener('click', () => {
         splashScreen.classList.remove('hidden');
         mainApp.classList.remove('visible');
