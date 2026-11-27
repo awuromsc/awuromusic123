@@ -41,6 +41,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -158,6 +159,8 @@ DIRECT_STREAM_CACHE = BoundedTTLCache(maxsize=180, default_ttl=1500)
 TG_FILE_PATH_CACHE = BoundedTTLCache(maxsize=220, default_ttl=1800)
 BOT_PICK_CACHE = BoundedTTLCache(maxsize=350, default_ttl=1800)
 PENDING_AUTH_CODES = BoundedTTLCache(maxsize=200, default_ttl=300)
+ADMIN_STATUS_CACHE = BoundedTTLCache(maxsize=200, default_ttl=600)
+SESSION_TTL_SEC = 365 * 86400  # 1 год
 BG_CACHE_INFLIGHT: set = set()
 BACKUP_LOCK = asyncio.Lock()
 DB_DIRTY: bool = False
@@ -228,6 +231,8 @@ def init_db() -> sqlite3.Connection:
         conn.execute("ALTER TABLE users ADD COLUMN custom_avatar_mime TEXT DEFAULT ''")
     if "avatar_version" not in existing_user_cols:
         conn.execute("ALTER TABLE users ADD COLUMN avatar_version INTEGER DEFAULT 0")
+    if "revoked_before" not in existing_user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN revoked_before INTEGER DEFAULT 0")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS user_state (
@@ -885,73 +890,65 @@ def add_track_to_user_playlist(tg_id: int, track_api: Dict[str, Any], tg_user: A
     return str(target_pl.get("name") or "Мой плейлист")
 
 
-SESSION_TTL_SEC = 180 * 86400        # 180 дней (6 месяцев)
-SESSION_REFRESH_AFTER_SEC = 7 * 86400  # автопродление каждые 7 дней
+def _session_hmac_key() -> bytes:
+    return hmac.new(b"apathy_session_v2", (BOT_TOKEN or "apathy_fallback").encode("utf-8"), hashlib.sha256).digest()
 
 
-def _session_signing_key() -> bytes:
-    secret_src = f"apathy-session-v1:{BOT_TOKEN or 'fallback-local'}"
-    return hashlib.sha256(secret_src.encode("utf-8")).digest()
-
-
-def issue_signed_session_token(
-    tg_id: int,
-    username: str = "",
-    first_name: str = "",
-    last_name: str = "",
-) -> str:
-    """Выдаёт криптографически подписанный токен на 180 дней (переживает перезапуски/пересборки контейнера)."""
+def issue_long_lived_token(tg_id: int, ttl_sec: int = SESSION_TTL_SEC) -> str:
+    """Выпускает криптографически подписанный токен на 365 дней — не слетает при перезапусках сервера."""
     now = int(time.time())
-    payload = {
-        "uid": int(tg_id),
-        "u": str(username or "")[:64],
-        "fn": str(first_name or "")[:64],
-        "ln": str(last_name or "")[:64],
-        "iat": now,
-        "exp": now + SESSION_TTL_SEC,
-    }
-    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    sig = hmac.new(_session_signing_key(), b64.encode("ascii"), hashlib.sha256).hexdigest()[:40]
-    return f"ap1.{b64}.{sig}"
+    exp = now + int(ttl_sec)
+    payload = f"{int(tg_id)}.{now}.{exp}"
+    sig = hmac.new(_session_hmac_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return f"ap2.{payload}.{sig}"
 
 
-def verify_signed_session_token(token: str) -> Optional[Dict[str, Any]]:
+def verify_long_lived_token(token: str) -> Optional[Tuple[int, int, int]]:
+    """Проверяет токен ap2.<tg_id>.<iat>.<exp>.<sig>. Возвращает (tg_id, iat, exp) или None."""
     tok = str(token or "").strip()
-    if not tok.startswith("ap1."):
+    if not tok.startswith("ap2."):
         return None
     parts = tok.split(".")
-    if len(parts) != 3:
+    if len(parts) != 5:
         return None
-    _, b64, sig = parts
-    expected = hmac.new(_session_signing_key(), b64.encode("ascii"), hashlib.sha256).hexdigest()[:40]
+    _, uid_s, iat_s, exp_s, sig = parts
+    if not (uid_s.isdigit() and iat_s.isdigit() and exp_s.isdigit()):
+        return None
+    payload = f"{uid_s}.{iat_s}.{exp_s}"
+    expected = hmac.new(_session_hmac_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
     if not hmac.compare_digest(expected, sig):
         return None
-    try:
-        pad = "=" * ((4 - len(b64) % 4) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(b64 + pad).decode("utf-8"))
-        if not isinstance(payload, dict) or not payload.get("uid"):
-            return None
-        exp = int(payload.get("exp") or 0)
-        if exp and exp < int(time.time()):
-            return None
-        return payload
-    except Exception:
+    exp = int(exp_s)
+    if exp < int(time.time()):
         return None
+    return (int(uid_s), int(iat_s), exp)
 
 
-def maybe_refresh_session_token(row: sqlite3.Row, incoming_token: str) -> Optional[str]:
-    """Тихо продлевает старые случайные токены или токены старше 7 дней ещё на 180 дней."""
-    payload = verify_signed_session_token(incoming_token)
-    now = int(time.time())
-    if payload is None or (now - int(payload.get("iat") or 0)) >= SESSION_REFRESH_AFTER_SEC:
-        return issue_signed_session_token(
-            tg_id=int(row["tg_id"]),
-            username=str(row["username"] or ""),
-            first_name=str(row["first_name"] or ""),
-            last_name=str(row["last_name"] or ""),
-        )
-    return None
+async def is_admin_user(bot: Bot, user_id: Optional[int]) -> bool:
+    """Проверяет, является ли пользователь администратором (ADMIN_ID или админ приватного канала STORAGE_CHAT_ID)."""
+    if not user_id:
+        return False
+    uid = int(user_id)
+    if ADMIN_ID is not None:
+        return uid == ADMIN_ID
+    saved_admin = get_setting("admin_id", "")
+    if saved_admin and saved_admin.lstrip("-").isdigit():
+        return uid == int(saved_admin)
+    st_id = get_storage_chat_id()
+    if not st_id:
+        return False
+    cache_key = f"{st_id}:{uid}"
+    cached = ADMIN_STATUS_CACHE.get(cache_key)
+    if cached is not None:
+        return bool(cached)
+    try:
+        member = await bot.get_chat_member(chat_id=st_id, user_id=uid)
+        ok = getattr(member, "status", "") in ("creator", "administrator")
+        ADMIN_STATUS_CACHE.set(cache_key, ok, ttl=600)
+        return ok
+    except Exception:
+        ADMIN_STATUS_CACHE.set(cache_key, False, ttl=180)
+        return False
 
 
 def upsert_telegram_user(
@@ -960,73 +957,73 @@ def upsert_telegram_user(
     first_name: str = "",
     last_name: str = "",
     photo_url: str = "",
+    refresh_token: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     now = int(time.time())
     existing = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
-    eff_u = username or (existing["username"] if existing else "") or ""
-    eff_fn = first_name or (existing["first_name"] if existing else "") or ""
-    eff_ln = last_name if last_name else ((existing["last_name"] if existing else "") or "")
-    signed_tok = issue_signed_session_token(int(tg_id), eff_u, eff_fn, eff_ln)
-
     if existing:
+        cur_tok = str(existing["session_token"] or "")
+        # Если токен старого формата (не ap2.) или истёк/запрошено обновление — выдаём свежий на 365 дней
+        if refresh_token or not verify_long_lived_token(cur_tok):
+            token = issue_long_lived_token(int(tg_id))
+        else:
+            token = cur_tok
         DB.execute(
             """
             UPDATE users SET
-                username = ?,
+                username = COALESCE(NULLIF(?, ''), username),
                 first_name = COALESCE(NULLIF(?, ''), first_name),
-                last_name = ?,
+                last_name = CASE WHEN ? != '' THEN ? ELSE last_name END,
                 photo_url = COALESCE(NULLIF(?, ''), photo_url),
                 session_token = ?,
                 updated_at = ?
             WHERE tg_id = ?
             """,
             (
-                eff_u,
-                eff_fn,
-                eff_ln,
+                username or "",
+                first_name or "",
+                last_name or "",
+                last_name or "",
                 photo_url or "",
-                signed_tok,
+                token,
                 now,
                 int(tg_id),
             ),
         )
     else:
+        token = issue_long_lived_token(int(tg_id))
         DB.execute(
             """
             INSERT INTO users(tg_id, username, first_name, last_name, photo_url, session_token, theme, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, 'chrome', ?, ?)
             """,
-            (int(tg_id), eff_u, eff_fn, eff_ln, photo_url or "", signed_tok, now, now),
+            (int(tg_id), username or "", first_name or "", last_name or "", photo_url or "", token, now, now),
         )
     DB.commit()
     mark_db_dirty()
     row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
-    return _user_row_to_public(row), signed_tok
+    return _user_row_to_public(row), token
 
 
 def get_user_by_token(token: str) -> Optional[sqlite3.Row]:
     tok = str(token or "").strip()
     if not tok or len(tok) < 16:
         return None
-
-    # 1) Криптографически подписанный долгоживущий токен (180 дней) — работает на нескольких устройствах
-    #    и автоматически восстанавливает запись пользователя даже после сброса/пересборки контейнера!
-    payload = verify_signed_session_token(tok)
-    if payload:
-        uid = int(payload["uid"])
-        row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (uid,)).fetchone()
+    # 1) Криптографический долгоживущий токен ap2 (выживает при перезапуске/бэкапах/на нескольких устройствах!)
+    parsed = verify_long_lived_token(tok)
+    if parsed:
+        tg_id, iat, _exp = parsed
+        row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
         if row:
+            revoked_before = int(row["revoked_before"] or 0)
+            if revoked_before and iat < revoked_before:
+                return None
             return row
-        # Самовосстановление пользователя в БД по подписанному токену
-        upsert_telegram_user(
-            tg_id=uid,
-            username=str(payload.get("u") or ""),
-            first_name=str(payload.get("fn") or ""),
-            last_name=str(payload.get("ln") or ""),
-        )
-        return DB.execute("SELECT * FROM users WHERE tg_id = ?", (uid,)).fetchone()
+        # Даже если контейнер перезапустился с пустой БД — подпись верна, восстанавливаем профиль автоматически!
+        upsert_telegram_user(tg_id=tg_id)
+        return DB.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)).fetchone()
 
-    # 2) Обратная совместимость со старыми случайными токенами v29–v37
+    # 2) Обратная совместимость со старыми токенами из БД
     return DB.execute("SELECT * FROM users WHERE session_token = ?", (tok,)).fetchone()
 
 
@@ -2274,31 +2271,52 @@ async def cmd_start(message: Message, bot: Bot):
             username=u.username or "",
             first_name=u.first_name or "",
             last_name=u.last_name or "",
+            refresh_token=True,
         )
         await sync_tg_profile_photo(bot, u.id, force=True)
         PENDING_AUTH_CODES.set(code, {"status": "authorized", "tg_id": u.id, "token": token}, ttl=180)
         display = f"@{u.username}" if u.username else (u.first_name or f"ID {u.id}")
         await message.answer(
             f"✅ <b>Вход в APATHY выполнен!</b>\n\n"
-            f"Аккаунт <b>{display}</b> привязан к сайту.\n"
-            "Вернитесь в браузер — ваши личные плейлисты и избранное уже синхронизируются.",
+            f"Аккаунт <b>{display}</b> привязан к плееру.\n"
+            "Вернитесь на сайт — ваши личные плейлисты и избранное уже доступны.",
             parse_mode="HTML",
             reply_markup=build_webapp_keyboard(),
         )
         return
 
-    total = DB.execute("SELECT COUNT(*) AS c FROM tracks WHERE tg_file_id != ''").fetchone()["c"]
+    # Чистый текст приветствия для обычных пользователей (без служебных и админ-команд!)
     text = (
-        "<b>APATHY v37 · Музыкальный бот и личные плейлисты</b>\n\n"
-        f"🌐 Сайт плеера: {SITE_URL}/\n"
-        f"💾 Общих треков в базе: <b>{total}</b>\n\n"
-        "• <b>Напиши название трека</b> — ищу по SoundCloud, РФ MP3-порталам и YouTube (строго .mp3).\n"
-        "• <b>Перешли любой аудиофайл</b> — сразу появится в плеере APATHY.\n"
-        "• <b>/playlists</b> — твои личные плейлисты и избранное\n"
-        "• <b>/backup</b> — сохранить бэкап базы в канал · <b>/restore</b> — восстановить из канала\n"
-        "• <b>/test</b> — проверка источников и бэкапа · <b>/list</b> — последние треки"
+        "<b>APATHY · Музыкальный плеер</b>\n\n"
+        f"🌐 Плеер: {SITE_URL}/\n\n"
+        "• <b>Напиши название трека или исполнителя</b> — найду и пришлю аудио.\n"
+        "• <b>Перешли любой аудиофайл</b> — трек сразу добавится в твой плейлист.\n"
+        "• <b>/playlists</b> — твои плейлисты и избранное"
     )
+    uid = message.from_user.id if message.from_user else None
+    if await is_admin_user(bot, uid):
+        text += "\n\n<i>🔧 Админ-панель: /admin</i>"
     await message.answer(text, parse_mode="HTML", reply_markup=build_webapp_keyboard(), disable_web_page_preview=True)
+
+
+@router.message(Command("admin"))
+async def cmd_admin_help(message: Message, bot: Bot):
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
+        return
+    db_s = get_db_stats()
+    text = (
+        "<b>🔧 Админ-команды APATHY (v37):</b>\n\n"
+        f"📊 В базе: <b>{db_s['users']}</b> польз. · <b>{db_s['all_tracks']}</b> трек. · <b>{db_s['playlists']}</b> плейл.\n\n"
+        "• /backup — сохранить бэкап базы в канал\n"
+        "• /restore — восстановить базу из канала\n"
+        "• /test — диагностика источников, ffmpeg и бэкапа\n"
+        "• /list — последние треки в базе\n"
+        "• /del название — удалить трек из базы\n"
+        "• /setapi URL — задать публичный URL бота\n"
+        "• /setstorage — привязать канал-хранилище"
+    )
+    await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("playlists", "my"))
@@ -2312,13 +2330,13 @@ async def cmd_my_playlists(message: Message):
     tracks = cloud.get("savedTracks") or []
     if not pls and not likes and not tracks:
         await message.answer(
-            "У тебя пока нет сохранённых плейлистов.\nОткрой плеер APATHY, зайди в <b>Профиль → Войти через Telegram</b> и добавляй треки кнопкой «+»!",
+            "У тебя пока нет сохранённых плейлистов.\nОткрой плеер APATHY, войди через Telegram и добавляй треки кнопкой «+»!",
             parse_mode="HTML",
             reply_markup=build_webapp_keyboard(),
         )
         return
     lines = [
-        f"<b>Твоя медиатека APATHY:</b>",
+        "<b>Твоя медиатека APATHY:</b>",
         f"❤️ Избранных треков: <b>{len(likes)}</b>",
         f"🎵 Сохранено треков: <b>{len(tracks)}</b>",
         "",
@@ -2333,8 +2351,8 @@ async def cmd_my_playlists(message: Message):
 
 @router.message(Command("backup"))
 async def cmd_manual_backup(message: Message, bot: Bot):
-    if ADMIN_ID and message.from_user and message.from_user.id != ADMIN_ID:
-        await message.answer("Только администратор может запускать ручной бэкап.")
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
         return
     m = await message.answer("💾 Создаю и отправляю бэкап базы APATHY в канал-хранилище...")
     ok, err, info = await backup_db_to_telegram(bot, reason="manual")
@@ -2357,8 +2375,8 @@ async def cmd_manual_backup(message: Message, bot: Bot):
 
 @router.message(Command("restore"))
 async def cmd_manual_restore(message: Message, bot: Bot):
-    if ADMIN_ID and message.from_user and message.from_user.id != ADMIN_ID:
-        await message.answer("Только администратор может восстанавливать базу.")
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
         return
     m = await message.answer("♻️ Загружаю закреплённый бэкап из канала-хранилища...")
     ok, err, stats = await restore_db_from_telegram(bot, force=True)
@@ -2376,6 +2394,9 @@ async def cmd_manual_restore(message: Message, bot: Bot):
 
 @router.message(Command("test"))
 async def cmd_test_sources(message: Message, bot: Bot):
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
+        return
     if HTTP_SESSION_REF is None:
         return
     m = await message.answer("🔎 Проверяю источники аудио с сервера (запрос: Miyagi)...")
@@ -2425,9 +2446,9 @@ async def cmd_test_sources(message: Message, bot: Bot):
 
 
 @router.message(Command("setstorage"))
-async def cmd_set_storage(message: Message):
-    if ADMIN_ID and message.from_user and message.from_user.id != ADMIN_ID:
-        await message.answer("Только администратор может менять хранилище.")
+async def cmd_set_storage(message: Message, bot: Bot):
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
         return
     set_setting("storage_chat_id", str(message.chat.id))
     await message.answer(f"✅ Чат <code>{message.chat.id}</code> назначен хранилищем APATHY.", parse_mode="HTML")
@@ -2440,9 +2461,9 @@ async def channel_set_storage(message: Message):
 
 
 @router.message(Command("setapi"))
-async def cmd_set_api(message: Message):
-    if ADMIN_ID and message.from_user and message.from_user.id != ADMIN_ID:
-        await message.answer("Только администратор может менять адрес API.")
+async def cmd_set_api(message: Message, bot: Bot):
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not re.match(r"^https?://", parts[1].strip(), re.I):
@@ -2458,9 +2479,9 @@ async def cmd_set_api(message: Message):
 
 
 @router.message(Command("del"))
-async def cmd_delete_track(message: Message):
-    if ADMIN_ID and message.from_user and message.from_user.id != ADMIN_ID:
-        await message.answer("Только администратор может удалять треки.")
+async def cmd_delete_track(message: Message, bot: Bot):
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -2479,7 +2500,10 @@ async def cmd_delete_track(message: Message):
 
 
 @router.message(Command("list"))
-async def cmd_list(message: Message):
+async def cmd_list(message: Message, bot: Bot):
+    uid = message.from_user.id if message.from_user else None
+    if not await is_admin_user(bot, uid):
+        return
     rows = DB.execute("SELECT * FROM tracks WHERE tg_file_id != '' ORDER BY created_at DESC LIMIT 15").fetchall()
     if not rows:
         await message.answer("База пока пуста. Напиши название трека или перешли аудиофайл сюда!", reply_markup=build_webapp_keyboard())
@@ -2532,7 +2556,8 @@ def _extract_audio_from_msg(message: Message) -> Optional[Dict[str, Any]]:
 async def handle_uploaded_audio(message: Message, bot: Bot):
     # Поддержка загрузки cookies.txt для YouTube прямо в бота
     if message.document and (message.document.file_name or "").lower() == "cookies.txt":
-        if ADMIN_ID and message.from_user and message.from_user.id != ADMIN_ID:
+        uid_c = message.from_user.id if message.from_user else None
+        if not await is_admin_user(bot, uid_c):
             return
         try:
             await bot.download(message.document, destination=str(COOKIES_PATH))
@@ -2636,7 +2661,7 @@ async def handle_text_search(message: Message):
         buttons.append([InlineKeyboardButton(text="🎧 Открыть сайт APATHY", url=link)])
 
     await status_msg.edit_text(
-        f"Найдено по запросу <b>«{query}»</b> (только аудио):",
+        f"Найдено по запросу <b>«{query}»</b>:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
@@ -2689,8 +2714,8 @@ async def handle_pick_callback(callback: CallbackQuery, bot: Bot):
             except Exception:
                 pass
     else:
-        hint = " (YouTube запросил проверку — попробуй вариант с ☁️ или 🎧, либо выполни /test)" if err == "youtube_bot_check" else f" ({err})"
-        await callback.message.answer(f"Не удалось загрузить этот вариант{hint}. Выбери другой трек из списка.")
+        log.warning("Pick download failed for %s: %s", item.get("id"), err)
+        await callback.message.answer("Не удалось загрузить этот вариант. Выбери другой трек из списка.")
 
 
 # -------------------- HTTP API ДЛЯ САЙТА https://awuro.sergeyhownan.workers.dev/ --------------------
@@ -2770,11 +2795,14 @@ async def api_auth_poll(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "status": "expired"})
     pub_user = _user_row_to_public(row)
     cloud_state = load_user_cloud_state(pub_user["tgId"], pub_user["theme"])
+    tok = str(entry.get("token") or row["session_token"] or "")
+    if not verify_long_lived_token(tok):
+        tok = issue_long_lived_token(pub_user["tgId"])
     return web.json_response(
         {
             "ok": True,
             "status": "authorized",
-            "token": row["session_token"],
+            "token": tok,
             "user": pub_user,
             "state": cloud_state,
         }
@@ -2785,17 +2813,20 @@ async def api_user_me(request: web.Request) -> web.Response:
     token = extract_bearer_token(request)
     row = get_user_by_token(token)
     if not row:
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return web.json_response({"ok": False, "error": "token_revoked"}, status=401)
     if not row["tg_avatar_file_id"] and not row["custom_avatar"]:
         await sync_tg_profile_photo(request.app["bot"], int(row["tg_id"]), force=False)
         row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(row["tg_id"]),)).fetchone() or row
     pub_user = _user_row_to_public(row)
+    # Скользящее продление: если токен старого формата или осталось меньше 180 дней — продлеваем на 365 дней!
+    fresh_token = token
+    parsed = verify_long_lived_token(token)
+    if not parsed or (parsed[2] - int(time.time()) < 180 * 86400):
+        fresh_token = issue_long_lived_token(pub_user["tgId"])
+        DB.execute("UPDATE users SET session_token = ?, updated_at = ? WHERE tg_id = ?", (fresh_token, int(time.time()), pub_user["tgId"]))
+        DB.commit()
     cloud_state = load_user_cloud_state(pub_user["tgId"], pub_user["theme"])
-    refreshed = maybe_refresh_session_token(row, token)
-    resp_obj: Dict[str, Any] = {"ok": True, "user": pub_user, "state": cloud_state}
-    if refreshed:
-        resp_obj["refreshedToken"] = refreshed
-    return web.json_response(resp_obj)
+    return web.json_response({"ok": True, "token": fresh_token, "user": pub_user, "state": cloud_state})
 
 
 async def api_user_avatar_get(request: web.Request) -> web.StreamResponse:
@@ -2861,7 +2892,7 @@ async def api_user_avatar_upload(request: web.Request) -> web.Response:
     token = extract_bearer_token(request)
     row = get_user_by_token(token)
     if not row:
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return web.json_response({"ok": False, "error": "token_revoked"}, status=401)
     try:
         body = await request.json()
     except Exception:
@@ -2902,7 +2933,7 @@ async def api_user_avatar_delete(request: web.Request) -> web.Response:
     token = extract_bearer_token(request)
     row = get_user_by_token(token)
     if not row:
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return web.json_response({"ok": False, "error": "token_revoked"}, status=401)
     tg_id = int(row["tg_id"])
     now = int(time.time())
     DB.execute(
@@ -2921,7 +2952,7 @@ async def api_user_sync(request: web.Request) -> web.Response:
     token = extract_bearer_token(request)
     row = get_user_by_token(token)
     if not row:
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+        return web.json_response({"ok": False, "error": "token_revoked"}, status=401)
     try:
         body = await request.json()
     except Exception:
@@ -2931,23 +2962,31 @@ async def api_user_sync(request: web.Request) -> web.Response:
     saved_tracks = (body or {}).get("savedTracks") or []
     theme = str((body or {}).get("theme") or "").strip()
     ts = save_user_cloud_state(int(row["tg_id"]), playlists, liked_ids, saved_tracks, theme)
-    refreshed = maybe_refresh_session_token(row, token)
-    resp_obj: Dict[str, Any] = {
-        "ok": True,
-        "syncedAt": ts,
-        "counts": {
-            "playlists": len(playlists) if isinstance(playlists, list) else 0,
-            "liked": len(liked_ids) if isinstance(liked_ids, list) else 0,
-            "tracks": len(saved_tracks) if isinstance(saved_tracks, list) else 0,
-        },
-    }
-    if refreshed:
-        resp_obj["refreshedToken"] = refreshed
-    return web.json_response(resp_obj)
+    return web.json_response(
+        {
+            "ok": True,
+            "syncedAt": ts,
+            "counts": {
+                "playlists": len(playlists) if isinstance(playlists, list) else 0,
+                "liked": len(liked_ids) if isinstance(liked_ids, list) else 0,
+                "tracks": len(saved_tracks) if isinstance(saved_tracks, list) else 0,
+            },
+        }
+    )
 
 
 async def api_user_logout(request: web.Request) -> web.Response:
-    # Выход очищает сессию на текущем устройстве, не разлогинивая остальные устройства пользователя
+    token = extract_bearer_token(request)
+    row = get_user_by_token(token)
+    if row:
+        now_ts = int(time.time())
+        new_tok = secrets.token_urlsafe(32)
+        DB.execute(
+            "UPDATE users SET session_token = ?, revoked_before = ?, updated_at = ? WHERE tg_id = ?",
+            (new_tok, now_ts, now_ts, int(row["tg_id"])),
+        )
+        DB.commit()
+        mark_db_dirty()
     return web.json_response({"ok": True})
 
 
@@ -3233,6 +3272,15 @@ async def main():
 
     me = await bot.get_me()
     BOT_USERNAME_CACHE = f"@{me.username}" if me.username else str(me.id)
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Открыть плеер APATHY"),
+                BotCommand(command="playlists", description="Мои плейлисты"),
+            ]
+        )
+    except Exception as e:
+        log.warning("set_my_commands skipped: %s", e)
 
     # Автовосстановление базы из закреплённого бэкапа в STORAGE_CHAT_ID (если контейнер пустой после пересборки)
     restored, rst_err, rst_stats = await restore_db_from_telegram(bot, force=False)

@@ -13,33 +13,6 @@
         }
       };
 
-      // Persistent first-party cookie mirror (180 days) so Telegram session survives localStorage eviction
-      const SESSION_COOKIE_NAME = 'apathy_tg_tok_v1';
-      const SESSION_COOKIE_MAX_AGE = 180 * 24 * 60 * 60;
-
-      function readSessionCookie() {
-        try {
-          const m = document.cookie.match(new RegExp('(?:^|;\\s*)' + SESSION_COOKIE_NAME + '=([^;]+)'));
-          return m ? decodeURIComponent(m[1]) : '';
-        } catch (e) { return ''; }
-      }
-
-      function writeSessionCookie(token) {
-        try {
-          const sec = location.protocol === 'https:' ? '; Secure' : '';
-          if (token) {
-            document.cookie = `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Max-Age=${SESSION_COOKIE_MAX_AGE}; Path=/; SameSite=Lax${sec}`;
-          } else {
-            document.cookie = `${SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; SameSite=Lax${sec}`;
-          }
-        } catch (e) {}
-      }
-
-      const initialRestoredToken = String(store.get('tgAuthToken', '') || readSessionCookie() || '').trim();
-      if (initialRestoredToken && !store.get('tgAuthToken', '')) {
-        store.set('tgAuthToken', initialRestoredToken);
-      }
-
       // ================= STATE =================
       const savedCatalogTracks = store.get('savedCatalogTracks', []);
       const defaultPlaylists = [
@@ -54,7 +27,7 @@
         playlists: store.get('playlists', defaultPlaylists),
         likedIds: new Set(store.get('liked', [])),
         user: store.get('user', null),
-        tgToken: initialRestoredToken,
+        tgToken: store.get('tgAuthToken', ''),
         theme: store.get('theme', 'chrome'),
         activeTab: 'viewSearch',
         libFilter: 'all',
@@ -511,7 +484,7 @@
       // ================= OFFLINE AUDIO ENGINE (INDEXEDDB + SERVICE WORKER v32) =================
       const OFFLINE_DB_NAME = 'apathy_offline_v1';
       const OFFLINE_STORE = 'tracks';
-      const SESSION_KV_STORE = 'kv';
+      const AUTH_IDB_STORE = 'auth';
       const MAX_AUTO_OFFLINE_TRACKS = 60;
       let offlineDbPromise = null;
       let activeOfflineBlobUrl = '';
@@ -539,8 +512,8 @@
                 const st = db.createObjectStore(OFFLINE_STORE, { keyPath: 'id' });
                 st.createIndex('savedAt', 'savedAt', { unique: false });
               }
-              if (!db.objectStoreNames.contains(SESSION_KV_STORE)) {
-                db.createObjectStore(SESSION_KV_STORE, { keyPath: 'k' });
+              if (!db.objectStoreNames.contains(AUTH_IDB_STORE)) {
+                db.createObjectStore(AUTH_IDB_STORE, { keyPath: 'k' });
               }
             };
             req.onsuccess = () => resolve(req.result);
@@ -598,36 +571,6 @@
           try {
             const tx = db.transaction(OFFLINE_STORE, 'readwrite');
             tx.objectStore(OFFLINE_STORE).clear();
-            tx.oncomplete = () => resolve(true);
-            tx.onerror = () => resolve(false);
-          } catch (e) { resolve(false); }
-        });
-      }
-
-      async function idbKvGet(k) {
-        const db = await openOfflineDb();
-        if (!db || !db.objectStoreNames.contains(SESSION_KV_STORE)) return null;
-        return await new Promise((resolve) => {
-          try {
-            const tx = db.transaction(SESSION_KV_STORE, 'readonly');
-            const req = tx.objectStore(SESSION_KV_STORE).get(String(k));
-            req.onsuccess = () => resolve(req.result ? req.result.v : null);
-            req.onerror = () => resolve(null);
-          } catch (e) { resolve(null); }
-        });
-      }
-
-      async function idbKvSet(k, v) {
-        const db = await openOfflineDb();
-        if (!db || !db.objectStoreNames.contains(SESSION_KV_STORE)) return false;
-        return await new Promise((resolve) => {
-          try {
-            const tx = db.transaction(SESSION_KV_STORE, 'readwrite');
-            if (v === null || v === undefined || v === '') {
-              tx.objectStore(SESSION_KV_STORE).delete(String(k));
-            } else {
-              tx.objectStore(SESSION_KV_STORE).put({ k: String(k), v });
-            }
             tx.oncomplete = () => resolve(true);
             tx.onerror = () => resolve(false);
           } catch (e) { resolve(false); }
@@ -1785,69 +1728,16 @@
         }
       }
 
-      // ================= NAVIGATION & TELEGRAM AUTH GATE (v37) =================
-      let pendingProtectedTab = '';
-      let authPulseTimer = null;
-
-      function isTelegramAuthorized() {
-        return Boolean(state.tgToken && state.user && state.user.tgId);
-      }
-
-      function updateAuthGateUI() {
-        const authed = isTelegramAuthorized();
-        const gate = $('tracksGuestGate');
-        const wrap = $('tracksAuthedWrap');
-        const navBtn = $('navTracksBtn');
-        const notice = $('authRedirectNotice');
-        const cntEl = $('libTotalCount');
-
-        if (gate) gate.style.display = authed ? 'none' : 'block';
-        if (wrap) wrap.style.display = authed ? 'block' : 'none';
-        if (navBtn) navBtn.classList.toggle('is-locked', !authed);
-        if (cntEl && !authed) cntEl.textContent = 'Требуется вход';
-        if (notice && authed) notice.classList.remove('show');
-      }
-
-      function promptTelegramAuthForTracks() {
-        pendingProtectedTab = 'viewTracks';
-        state.activeTab = 'viewProfile';
-        document.querySelectorAll('.tab-view').forEach(v => v.classList.toggle('active', v.id === 'viewProfile'));
-        document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'viewProfile'));
-        renderProfile();
-        const notice = $('authRedirectNotice');
-        if (notice) notice.classList.add('show');
-        const card = $('authCard');
-        if (card) {
-          card.classList.add('auth-pulse');
-          clearTimeout(authPulseTimer);
-          authPulseTimer = setTimeout(() => card.classList.remove('auth-pulse'), 2200);
-        }
-        const vp = $('viewProfile');
-        if (vp) vp.scrollTo({ top: 0, behavior: 'smooth' });
-        showToast('Авторизуйтесь через Telegram, чтобы открыть «Ваши треки»');
-      }
-
+      // ================= NAVIGATION =================
       function switchTab(tabId) {
-        if (tabId === 'viewTracks' && !isTelegramAuthorized()) {
-          promptTelegramAuthForTracks();
-          return;
-        }
         state.activeTab = tabId;
         document.querySelectorAll('.tab-view').forEach(v => v.classList.toggle('active', v.id === tabId));
         document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
         if (tabId === 'viewSearch' && !searchInput.value.trim() && (favRecsDirty || getFavoriteArtistsSignature() !== favRecsLastSig)) {
           performSearch(false);
         }
-        if (tabId === 'viewTracks') {
-          updateAuthGateUI();
-          renderLibrary();
-          refreshCloudAccountState(false);
-        }
-        if (tabId === 'viewProfile') {
-          const notice = $('authRedirectNotice');
-          if (notice && pendingProtectedTab !== 'viewTracks') notice.classList.remove('show');
-          renderProfile();
-        }
+        if (tabId === 'viewTracks') { updateLibraryAuthGate(); if (isUserAuthenticated()) { renderLibrary(); refreshCloudAccountState(false); } }
+        if (tabId === 'viewProfile') renderProfile();
       }
       document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
       topProfileBtn.addEventListener('click', () => switchTab('viewProfile'));
@@ -1978,8 +1868,8 @@
       }
 
       function renderLibrary() {
-        updateAuthGateUI();
-        if (!isTelegramAuthorized()) return;
+        updateLibraryAuthGate();
+        if (!isUserAuthenticated()) return;
         $('libTotalCount').textContent = `${state.libraryTracks.length} треков`;
         $('plCountLabel').textContent = String(state.playlists.length);
 
@@ -3157,7 +3047,72 @@
         requestAnimationFrame(tick);
       }
 
-      // ================= PROFILE, TELEGRAM ACCOUNT, AVATAR & CLOUD SYNC (v30) =================
+      // ================= PROFILE, TELEGRAM ACCOUNT, AVATAR & CLOUD SYNC (v37) =================
+      function isUserAuthenticated() {
+        return Boolean(state.tgToken && state.user && state.user.tgId);
+      }
+
+      function readCookieValue(name) {
+        try {
+          const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+          return m ? decodeURIComponent(m[1]) : '';
+        } catch (e) { return ''; }
+      }
+
+      function writeLongCookie(name, value, days = 365) {
+        try {
+          const maxAge = days > 0 ? (days * 86400) : 0;
+          const sec = location.protocol === 'https:' ? '; Secure' : '';
+          document.cookie = `${name}=${encodeURIComponent(value || '')}; path=/; max-age=${maxAge}; SameSite=Lax${sec}`;
+        } catch (e) {}
+      }
+
+      async function saveSessionToIdb(token, user) {
+        const db = await openOfflineDb();
+        if (!db || !db.objectStoreNames.contains(AUTH_IDB_STORE)) return;
+        try {
+          const tx = db.transaction(AUTH_IDB_STORE, 'readwrite');
+          tx.objectStore(AUTH_IDB_STORE).put({ k: 'session', token: token || '', user: user || null, savedAt: Date.now() });
+        } catch (e) {}
+      }
+
+      async function loadSessionFromIdb() {
+        const db = await openOfflineDb();
+        if (!db || !db.objectStoreNames.contains(AUTH_IDB_STORE)) return null;
+        return await new Promise((resolve) => {
+          try {
+            const tx = db.transaction(AUTH_IDB_STORE, 'readonly');
+            const req = tx.objectStore(AUTH_IDB_STORE).get('session');
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => resolve(null);
+          } catch (e) { resolve(null); }
+        });
+      }
+
+      function persistAuthSession(token, user) {
+        state.tgToken = token || '';
+        state.user = user || null;
+        store.set('tgAuthToken', state.tgToken);
+        store.set('user', state.user);
+        if (state.tgToken) {
+          writeLongCookie('apathy_tg_tok', state.tgToken, 365);
+        } else {
+          writeLongCookie('apathy_tg_tok', '', 0);
+        }
+        saveSessionToIdb(state.tgToken, state.user);
+      }
+
+      function updateLibraryAuthGate() {
+        const gate = $('libraryAuthGate');
+        const content = $('libraryAuthContent');
+        const cntEl = $('libTotalCount');
+        const authed = isUserAuthenticated();
+        if (gate) gate.style.display = authed ? 'none' : 'block';
+        if (content) content.style.display = authed ? 'block' : 'none';
+        if (cntEl) cntEl.style.visibility = authed ? 'visible' : 'hidden';
+      }
+
+
       let authPollTimer = null;
       let syncDebounceTimer = null;
       let isApplyingCloudState = false;
@@ -3383,18 +3338,14 @@
             body: JSON.stringify(payload)
           });
           if (resp.status === 401) {
-            const recovered = await tryRecoverSessionViaMiniApp();
-            if (recovered) return pushCloudSyncNow(notify);
-            let errData = null;
-            try { errData = await resp.json(); } catch (e) {}
-            if (errData && (errData.error === 'unauthorized' || errData.error === 'token_expired')) {
-              clearTgSession(false);
+            const errBody = await resp.json().catch(() => null);
+            if (errBody && errBody.error === 'token_revoked') {
+              clearTgSession(false, false);
             }
             return false;
           }
           const data = resp.ok ? await resp.json() : null;
           if (data && data.ok) {
-            if (data.refreshedToken) persistSessionCredentials(data.refreshedToken, state.user);
             if (data.syncedAt) lastCloudUpdatedAt = Number(data.syncedAt);
             const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
             setSyncStatus(`Синхронизировано · ${nowStr}`, false);
@@ -3414,21 +3365,18 @@
             headers: { 'Authorization': 'Bearer ' + state.tgToken }
           });
           if (resp.status === 401) {
-            const recovered = await tryRecoverSessionViaMiniApp();
-            if (recovered) return true;
-            let errData = null;
-            try { errData = await resp.json(); } catch (e) {}
-            if (errData && (errData.error === 'unauthorized' || errData.error === 'token_expired')) {
-              clearTgSession(false);
+            const errBody = await resp.json().catch(() => null);
+            if (errBody && errBody.error === 'token_revoked') {
+              clearTgSession(false, false);
             }
             return false;
           }
           const data = resp.ok ? await resp.json() : null;
           if (data && data.ok && data.user) {
-            const nextTok = data.refreshedToken || state.tgToken;
-            persistSessionCredentials(nextTok, data.user);
+            const nextTok = (data.token && typeof data.token === 'string') ? data.token : state.tgToken;
+            persistAuthSession(nextTok, data.user);
             renderProfile();
-            updateAuthGateUI();
+            updateLibraryAuthGate();
             applyCloudState(data.state || {}, 'pull');
             if (notify) showToast('Медиатека аккаунта обновлена');
             return true;
@@ -3449,94 +3397,41 @@
           clearInterval(authPollTimer);
           authPollTimer = null;
         }
-        const pBox = $('tgAuthPendingBox');
-        if (pBox) pBox.classList.remove('show');
-        const btn = $('tgLoginBtn');
-        if (btn) btn.disabled = false;
-      }
-
-      function persistSessionCredentials(token, user) {
-        if (typeof token === 'string') {
-          state.tgToken = token;
-          store.set('tgAuthToken', token);
-          writeSessionCookie(token);
-          idbKvSet('tgAuthToken', token).catch(() => {});
-        }
-        if (user !== undefined) {
-          state.user = user;
-          store.set('user', user);
-          idbKvSet('tgUser', user || null).catch(() => {});
-        }
-      }
-
-      async function hydrateSessionFromBackupStorage() {
-        let tok = state.tgToken || readSessionCookie() || '';
-        let usr = state.user;
-        if (!tok) {
-          const idbTok = await idbKvGet('tgAuthToken');
-          if (idbTok && typeof idbTok === 'string') tok = idbTok;
-        }
-        if (!usr || !usr.tgId) {
-          const idbUsr = await idbKvGet('tgUser');
-          if (idbUsr && idbUsr.tgId) usr = idbUsr;
-        }
-        if (tok) {
-          persistSessionCredentials(tok, usr || state.user);
-        }
-      }
-
-      async function tryRecoverSessionViaMiniApp() {
-        try {
-          const tgWebApp = window.Telegram && window.Telegram.WebApp;
-          if (!tgWebApp || !tgWebApp.initData || tgWebApp.initData.length < 20) return false;
-          const resp = await fetch(`${tgApiUrl('/api/auth/webapp')}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ initData: tgWebApp.initData })
-          });
-          const data = resp.ok ? await resp.json() : null;
-          if (data && data.ok && data.token && data.user) {
-            applyAuthorizedSession(data, false);
-            setSyncStatus('Подключено через Telegram Mini App', false);
-            return true;
-          }
-        } catch (e) {}
-        return false;
+        ['tgAuthPendingBox', 'libAuthPendingBox'].forEach(id => {
+          const el = $(id);
+          if (el) el.classList.remove('show');
+        });
+        ['tgLoginBtn', 'libGateLoginBtn'].forEach(id => {
+          const btn = $(id);
+          if (btn) btn.disabled = false;
+        });
       }
 
       function applyAuthorizedSession(data, notify = true) {
         if (!data || !data.token || !data.user) return;
         stopAuthPolling();
         lastCloudUpdatedAt = 0;
-        persistSessionCredentials(data.token, data.user);
-        $('authMsg').textContent = '';
-        const notice = $('authRedirectNotice');
-        if (notice) notice.classList.remove('show');
+        persistAuthSession(data.token, data.user);
+        if ($('authMsg')) $('authMsg').textContent = '';
+        if ($('libAuthMsg')) $('libAuthMsg').textContent = '';
         renderProfile();
-        updateAuthGateUI();
+        updateLibraryAuthGate();
         applyCloudState(data.state || {}, 'login_merge');
+        renderLibrary();
         if (notify) {
           const uname = data.user.username ? ('@' + data.user.username) : (data.user.firstName || 'Telegram');
           showToast('Вход через Telegram выполнен: ' + uname);
         }
-        if (pendingProtectedTab === 'viewTracks') {
-          pendingProtectedTab = '';
-          switchTab('viewTracks');
-        }
       }
 
-      function clearTgSession(notify = true) {
+      function clearTgSession(notify = true, revokeOnServer = true) {
         const oldToken = state.tgToken;
         stopAuthPolling();
         lastCloudUpdatedAt = 0;
-        pendingProtectedTab = '';
-        persistSessionCredentials('', null);
+        persistAuthSession('', null);
         renderProfile();
-        updateAuthGateUI();
-        if (state.activeTab === 'viewTracks') {
-          switchTab('viewProfile');
-        }
-        if (oldToken) {
+        updateLibraryAuthGate();
+        if (revokeOnServer && oldToken) {
           fetch(`${tgApiUrl('/api/user/logout')}`, {
             method: 'POST',
             headers: { 'Authorization': 'Bearer ' + oldToken }
@@ -3546,32 +3441,67 @@
       }
 
       async function initTelegramAuth() {
-        await hydrateSessionFromBackupStorage();
-        renderProfile();
-        updateAuthGateUI();
-
-        if (isOfflineEffective()) {
-          if (isTelegramAuthorized()) setSyncStatus('Оффлайн · аккаунт сохранён', false);
-          return;
+        if (!state.tgToken) {
+          const cookieTok = readCookieValue('apathy_tg_tok');
+          if (cookieTok && cookieTok.length >= 16) {
+            state.tgToken = cookieTok;
+            store.set('tgAuthToken', cookieTok);
+          }
+        }
+        if (!state.tgToken || !state.user) {
+          const idbSess = await loadSessionFromIdb();
+          if (idbSess && idbSess.token) {
+            if (!state.tgToken) {
+              state.tgToken = idbSess.token;
+              store.set('tgAuthToken', idbSess.token);
+            }
+            if (!state.user && idbSess.user) {
+              state.user = idbSess.user;
+              store.set('user', idbSess.user);
+            }
+          }
+        }
+        if (state.tgToken && state.user) {
+          renderProfile();
+          updateLibraryAuthGate();
         }
 
-        // 1) Auto-login inside Telegram Mini App
-        if (await tryRecoverSessionViaMiniApp()) return;
+        try {
+          const tgWebApp = window.Telegram && window.Telegram.WebApp;
+          if (tgWebApp && tgWebApp.initData && tgWebApp.initData.length > 20) {
+            const resp = await fetch(`${tgApiUrl('/api/auth/webapp')}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ initData: tgWebApp.initData })
+            });
+            const data = resp.ok ? await resp.json() : null;
+            if (data && data.ok && data.token && data.user) {
+              applyAuthorizedSession(data, false);
+              setSyncStatus('Подключено через Telegram Mini App', false);
+              return;
+            }
+          }
+        } catch (e) {}
 
-        // 2) Restore existing long-lived session (180 days, auto-refreshed)
         if (state.tgToken) {
           const ok = await refreshCloudAccountState(false);
           if (ok) {
             setSyncStatus('Синхронизировано с Telegram', false);
             return;
           }
+          if (state.user && state.user.tgId) {
+            renderProfile();
+            updateLibraryAuthGate();
+            setSyncStatus('Сессия сохранена локально', false);
+            return;
+          }
         }
 
         if (state.user && !state.user.tgId) {
-          persistSessionCredentials('', null);
+          persistAuthSession('', null);
           renderProfile();
-          updateAuthGateUI();
         }
+        updateLibraryAuthGate();
       }
 
       // ---- Custom Avatar Crop & Upload (320x320 JPEG, fast & crisp) ----
@@ -3678,23 +3608,18 @@
         switchTab('viewProfile');
       });
 
-      const tracksGateBtn = $('tracksGateLoginBtn');
-      if (tracksGateBtn) {
-        tracksGateBtn.addEventListener('click', () => {
-          pendingProtectedTab = 'viewTracks';
-          switchTab('viewProfile');
-          const btn = $('tgLoginBtn');
-          if (btn && !btn.disabled) btn.click();
-        });
-      }
+      async function startTelegramLoginFlow(source = 'profile') {
+        const isLib = (source === 'lib');
+        const msg = $(isLib ? 'libAuthMsg' : 'authMsg');
+        const btn = $(isLib ? 'libGateLoginBtn' : 'tgLoginBtn');
+        const pendingBox = $(isLib ? 'libAuthPendingBox' : 'tgAuthPendingBox');
+        const openLink = $(isLib ? 'libOpenBotLink' : 'tgOpenBotLink');
 
-      $('tgLoginBtn').addEventListener('click', async () => {
-        const msg = $('authMsg');
-        msg.textContent = '';
+        if (msg) msg.textContent = '';
 
         const tgWebApp = window.Telegram && window.Telegram.WebApp;
         if (tgWebApp && tgWebApp.initData && tgWebApp.initData.length > 20) {
-          $('tgLoginBtn').disabled = true;
+          if (btn) btn.disabled = true;
           try {
             const r = await fetch(`${tgApiUrl('/api/auth/webapp')}`, {
               method: 'POST',
@@ -3707,22 +3632,21 @@
               return;
             }
           } catch (e) {}
-          $('tgLoginBtn').disabled = false;
+          if (btn) btn.disabled = false;
         }
 
-        $('tgLoginBtn').disabled = true;
+        if (btn) btn.disabled = true;
         try {
           const resp = await fetch(`${tgApiUrl('/api/auth/start')}`, { method: 'POST' });
           const data = resp.ok ? await resp.json() : null;
           if (!data || !data.ok || !data.code || !data.botUrl) {
-            msg.textContent = 'Не удалось получить ссылку от сервера бота. Проверьте, что бот запущен.';
-            $('tgLoginBtn').disabled = false;
+            if (msg) msg.textContent = 'Не удалось получить ссылку от сервера бота. Проверьте соединение.';
+            if (btn) btn.disabled = false;
             return;
           }
 
-          const openLink = $('tgOpenBotLink');
-          openLink.href = data.botUrl;
-          $('tgAuthPendingBox').classList.add('show');
+          if (openLink) openLink.href = data.botUrl;
+          if (pendingBox) pendingBox.classList.add('show');
 
           try { window.open(data.botUrl, '_blank', 'noopener'); } catch (e) {}
 
@@ -3732,7 +3656,7 @@
           authPollTimer = setInterval(async () => {
             if (Date.now() - startedAt > 300000) {
               stopAuthPolling();
-              msg.textContent = 'Время ожидания истекло — нажмите «Войти через Telegram» снова.';
+              if (msg) msg.textContent = 'Время ожидания истекло — нажмите «Войти через Telegram» снова.';
               return;
             }
             const poll = await fetchJsonTimeout(`${tgApiUrl('/api/auth/poll')}?code=${encodeURIComponent(authCode)}&_=${Date.now()}`, 3000);
@@ -3741,18 +3665,25 @@
               applyAuthorizedSession(poll, true);
             } else if (poll.status === 'expired') {
               stopAuthPolling();
-              msg.textContent = 'Код входа истёк — попробуйте ещё раз.';
+              if (msg) msg.textContent = 'Код входа истёк — попробуйте ещё раз.';
             }
           }, 1600);
         } catch (e) {
-          msg.textContent = 'Ошибка соединения с сервером бота.';
-          $('tgLoginBtn').disabled = false;
+          if (msg) msg.textContent = 'Ошибка соединения с сервером бота.';
+          if (btn) btn.disabled = false;
         }
-      });
+      }
+
+      $('tgLoginBtn').addEventListener('click', () => startTelegramLoginFlow('profile'));
+      $('libGateLoginBtn').addEventListener('click', () => startTelegramLoginFlow('lib'));
 
       $('tgCancelAuthBtn').addEventListener('click', () => {
         stopAuthPolling();
-        $('authMsg').textContent = '';
+        if ($('authMsg')) $('authMsg').textContent = '';
+      });
+      $('libCancelAuthBtn').addEventListener('click', () => {
+        stopAuthPolling();
+        if ($('libAuthMsg')) $('libAuthMsg').textContent = '';
       });
 
       $('manualSyncBtn').addEventListener('click', async () => {
@@ -3765,7 +3696,7 @@
       });
 
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && state.tgToken && !isOfflineEffective()) {
+        if (!document.hidden && state.tgToken) {
           refreshCloudAccountState(false);
         }
       });
