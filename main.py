@@ -21,6 +21,7 @@ import base64
 import gzip
 from datetime import datetime, timezone
 import hashlib
+import html as html_mod
 import hmac
 import secrets
 import json
@@ -252,16 +253,16 @@ def init_db() -> sqlite3.Connection:
             source_pl_id TEXT NOT NULL,
             name TEXT NOT NULL,
             tracks_json TEXT DEFAULT '[]',
-            covers_json TEXT DEFAULT '[]',
             track_count INTEGER DEFAULT 0,
-            likes_count INTEGER DEFAULT 0,
-            subs_count INTEGER DEFAULT 0,
+            covers_json TEXT DEFAULT '[]',
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             UNIQUE(owner_tg_id, source_pl_id)
         );
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_pl_owner ON public_playlists(owner_tg_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_pl_updated ON public_playlists(updated_at DESC);")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS public_playlist_likes (
@@ -272,6 +273,7 @@ def init_db() -> sqlite3.Connection:
         );
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_likes_pl ON public_playlist_likes(playlist_id);")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS public_playlist_subs (
@@ -282,9 +284,8 @@ def init_db() -> sqlite3.Connection:
         );
         """
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_pl_owner ON public_playlists(owner_tg_id);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_pl_pop ON public_playlists(likes_count DESC, subs_count DESC, updated_at DESC);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_pl_subs_user ON public_playlist_subs(tg_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_subs_user ON public_playlist_subs(tg_id, created_at DESC);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pub_subs_pl ON public_playlist_subs(playlist_id);")
     if STORAGE_CHAT_ID_ENV:
         conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('storage_chat_id', ?)", (STORAGE_CHAT_ID_ENV,))
     if BOT_API_URL_ENV:
@@ -331,11 +332,10 @@ def get_db_stats() -> Dict[str, int]:
                     pl_total += len(pls)
             except Exception:
                 pass
-        pub_pl_c = 0
         try:
             pub_pl_c = int(DB.execute("SELECT COUNT(*) AS c FROM public_playlists").fetchone()["c"])
         except Exception:
-            pass
+            pub_pl_c = 0
         return {
             "users": users_c,
             "tracks": tracks_c,
@@ -1102,33 +1102,38 @@ def extract_bearer_token(request: web.Request) -> str:
     return request.headers.get("X-Auth-Token", "").strip()
 
 
-MAX_PUBLIC_PLAYLISTS_PER_USER = 10
-MIN_TRACKS_FOR_PUBLIC_PLAYLIST = 3
+
+PUBLIC_PLAYLIST_MIN_TRACKS = 3
+PUBLIC_PLAYLIST_MAX_PER_USER = 10
 
 
-def _ensure_track_persisted_for_public(t: Dict[str, Any], added_by: int) -> Optional[Dict[str, Any]]:
+def _normalize_public_track_item(t: Any, owner_tg_id: int) -> Optional[Dict[str, Any]]:
     if not isinstance(t, dict):
         return None
+    tid = str(t.get("id") or "").strip()
     raw_tid = str(t.get("tgTrackId") or "").strip()
     if not raw_tid:
-        tid_str = str(t.get("id") or "").strip()
-        raw_tid = tid_str[3:] if tid_str.startswith("tg_") else tid_str
-    if not raw_tid or raw_tid.startswith("local_"):
+        raw_tid = tid[3:] if tid.startswith("tg_") else tid
+    if not raw_tid:
+        return None
+    if not tid:
+        tid = f"tg_{raw_tid}" if not raw_tid.startswith("tg_") else raw_tid
+    if tid.startswith("local_"):
         return None
 
-    title = str(t.get("title") or "Без названия").strip()[:140] or "Без названия"
-    artist = str(t.get("artist") or "Исполнитель").strip()[:120] or "Исполнитель"
-    album = str(t.get("album") or "Telegram Бот").strip()[:120]
+    title = str(t.get("title") or "Без названия").strip()[:160] or "Без названия"
+    artist = str(t.get("artist") or "Исполнитель").strip()[:140] or "Исполнитель"
+    album = str(t.get("album") or "Telegram Бот").strip()[:120] or "Telegram Бот"
     try:
         duration = max(1, int(float(t.get("duration") or 180)))
     except Exception:
         duration = 180
-    artwork = str(t.get("artwork") or "").strip()
-    cover_grad = str(t.get("coverGrad") or "").strip()
-    source = str(t.get("source") or "Telegram").strip()
+    artwork = str(t.get("artwork") or "").strip()[:500]
+    cover_grad = str(t.get("coverGrad") or "").strip()[:240]
+    source = str(t.get("source") or "Telegram").strip()[:40]
     in_tg = bool(t.get("inTelegram"))
 
-    exists = DB.execute("SELECT id, title, artist, duration, artwork, source, tg_file_id FROM tracks WHERE id = ?", (raw_tid,)).fetchone()
+    exists = DB.execute("SELECT id, artwork, title, artist, duration FROM tracks WHERE id = ?", (raw_tid,)).fetchone()
     if not exists:
         temp = TEMP_TRACKS.get(raw_tid)
         if temp:
@@ -1144,7 +1149,7 @@ def _ensure_track_persisted_for_public(t: Dict[str, Any], added_by: int) -> Opti
                 tg_file_id=str(temp.get("tg_file_id") or ""),
                 tg_thumb_id=str(temp.get("tg_thumb_id") or ""),
                 mime_type=str(temp.get("mime_type") or "audio/mpeg"),
-                added_by=int(added_by),
+                added_by=int(owner_tg_id),
             )
             if not artwork and temp.get("artwork"):
                 artwork = str(temp.get("artwork") or "")
@@ -1161,17 +1166,13 @@ def _ensure_track_persisted_for_public(t: Dict[str, Any], added_by: int) -> Opti
                 source=src_name,
                 source_id=src_id,
                 source_url=src_url,
-                added_by=int(added_by),
+                added_by=int(owner_tg_id),
             )
-    else:
-        if not artwork and exists["artwork"]:
-            artwork = str(exists["artwork"] or "")
-        if exists["tg_file_id"]:
-            in_tg = True
+    elif not artwork and exists["artwork"]:
+        artwork = str(exists["artwork"] or "")
 
-    canonical_id = str(t.get("id") or "").strip() or (raw_tid if raw_tid.startswith("tg_") else f"tg_{raw_tid}")
     return {
-        "id": canonical_id,
+        "id": tid,
         "tgTrackId": raw_tid,
         "title": title,
         "artist": artist,
@@ -1186,12 +1187,10 @@ def _ensure_track_persisted_for_public(t: Dict[str, Any], added_by: int) -> Opti
     }
 
 
-def _extract_playlist_covers(tracks: list) -> list:
-    covers = []
+def _extract_covers_from_tracks(tracks: List[Dict[str, Any]]) -> List[str]:
+    covers: List[str] = []
     seen = set()
     for t in tracks:
-        if not isinstance(t, dict):
-            continue
         art = str(t.get("artwork") or "").strip()
         if art and art not in seen:
             seen.add(art)
@@ -1201,78 +1200,132 @@ def _extract_playlist_covers(tracks: list) -> list:
     return covers
 
 
-def _author_info_for_tg_id(tg_id: int) -> Dict[str, Any]:
-    row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
-    if not row:
-        return {"tgId": int(tg_id), "displayName": "Пользователь", "username": "", "photoUrl": ""}
-    pub = _user_row_to_public(row)
-    display_name = " ".join(x for x in [pub.get("firstName", ""), pub.get("lastName", "")] if x).strip()
-    if not display_name:
-        display_name = f"@{pub['username']}" if pub.get("username") else "Пользователь"
-    return {
-        "tgId": pub["tgId"],
-        "displayName": display_name,
-        "username": pub.get("username") or "",
-        "photoUrl": pub.get("photoUrl") or "",
-    }
-
-
-def serialize_public_playlist(
-    row: sqlite3.Row,
-    viewer_tg_id: int = 0,
-    include_tracks: bool = False,
-) -> Dict[str, Any]:
-    pub_id = str(row["id"])
-    owner_tg_id = int(row["owner_tg_id"])
-    try:
-        covers = json.loads(row["covers_json"] or "[]")
-        if not isinstance(covers, list):
-            covers = []
-    except Exception:
-        covers = []
-
-    is_liked = False
-    is_subbed = False
-    if viewer_tg_id:
-        is_liked = bool(
-            DB.execute(
-                "SELECT 1 FROM public_playlist_likes WHERE playlist_id = ? AND tg_id = ?",
-                (pub_id, int(viewer_tg_id)),
-            ).fetchone()
-        )
-        is_subbed = bool(
-            DB.execute(
-                "SELECT 1 FROM public_playlist_subs WHERE playlist_id = ? AND tg_id = ?",
-                (pub_id, int(viewer_tg_id)),
-            ).fetchone()
-        )
-
-    out: Dict[str, Any] = {
-        "id": pub_id,
-        "sourcePlId": str(row["source_pl_id"] or ""),
-        "name": str(row["name"] or "Плейлист"),
-        "ownerTgId": owner_tg_id,
-        "author": _author_info_for_tg_id(owner_tg_id),
-        "trackCount": int(row["track_count"] or 0),
-        "covers": covers[:4],
-        "likesCount": int(row["likes_count"] or 0),
-        "subsCount": int(row["subs_count"] or 0),
-        "isLiked": is_liked,
-        "isSubscribed": is_subbed,
-        "isOwner": bool(viewer_tg_id and int(viewer_tg_id) == owner_tg_id),
-        "createdAt": int(row["created_at"] or 0),
-        "updatedAt": int(row["updated_at"] or 0),
-    }
-    if include_tracks:
-        try:
-            tracks = json.loads(row["tracks_json"] or "[]")
-            if not isinstance(tracks, list):
-                tracks = []
-        except Exception:
-            tracks = []
-        out["tracks"] = tracks
-        out["trackCount"] = len(tracks)
+def _get_authors_map(tg_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    unique_ids = sorted({int(x) for x in tg_ids if x})
+    if not unique_ids:
+        return {}
+    placeholders = ",".join("?" for _ in unique_ids)
+    rows = DB.execute(
+        f"""
+        SELECT tg_id, username, first_name, last_name, photo_url,
+               (custom_avatar IS NOT NULL) AS has_custom,
+               tg_avatar_file_id, avatar_version, updated_at
+        FROM users
+        WHERE tg_id IN ({placeholders})
+        """,
+        tuple(unique_ids),
+    ).fetchall()
+    out: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        uid = int(r["tg_id"])
+        uname = str(r["username"] or "").strip()
+        fname = str(r["first_name"] or "").strip()
+        lname = str(r["last_name"] or "").strip()
+        display = " ".join(x for x in (fname, lname) if x).strip() or (f"@{uname}" if uname else f"User {uid}")
+        has_custom = bool(r["has_custom"])
+        has_tg = bool(r["tg_avatar_file_id"])
+        ver = int(r["avatar_version"] or r["updated_at"] or 1)
+        if has_custom or has_tg:
+            photo_url = f"/api/user/avatar/{uid}?v={ver}"
+        else:
+            photo_url = str(r["photo_url"] or "")
+        out[uid] = {
+            "tgId": uid,
+            "displayName": display,
+            "username": uname,
+            "photoUrl": photo_url,
+        }
     return out
+
+
+def _get_public_playlists_social_meta(pl_ids: List[str], viewer_tg_id: Optional[int]) -> Tuple[Dict[str, int], Dict[str, int], set, set]:
+    unique_ids = [str(x) for x in set(pl_ids) if x]
+    if not unique_ids:
+        return {}, {}, set(), set()
+    placeholders = ",".join("?" for _ in unique_ids)
+    likes_counts: Dict[str, int] = {}
+    for r in DB.execute(
+        f"SELECT playlist_id, COUNT(*) AS c FROM public_playlist_likes WHERE playlist_id IN ({placeholders}) GROUP BY playlist_id",
+        tuple(unique_ids),
+    ).fetchall():
+        likes_counts[str(r["playlist_id"])] = int(r["c"])
+
+    subs_counts: Dict[str, int] = {}
+    for r in DB.execute(
+        f"SELECT playlist_id, COUNT(*) AS c FROM public_playlist_subs WHERE playlist_id IN ({placeholders}) GROUP BY playlist_id",
+        tuple(unique_ids),
+    ).fetchall():
+        subs_counts[str(r["playlist_id"])] = int(r["c"])
+
+    liked_set = set()
+    subbed_set = set()
+    if viewer_tg_id:
+        for r in DB.execute(
+            f"SELECT playlist_id FROM public_playlist_likes WHERE tg_id = ? AND playlist_id IN ({placeholders})",
+            (int(viewer_tg_id), *unique_ids),
+        ).fetchall():
+            liked_set.add(str(r["playlist_id"]))
+        for r in DB.execute(
+            f"SELECT playlist_id FROM public_playlist_subs WHERE tg_id = ? AND playlist_id IN ({placeholders})",
+            (int(viewer_tg_id), *unique_ids),
+        ).fetchall():
+            subbed_set.add(str(r["playlist_id"]))
+    return likes_counts, subs_counts, liked_set, subbed_set
+
+
+def serialize_public_playlists(
+    rows: List[sqlite3.Row],
+    viewer_tg_id: Optional[int] = None,
+    include_tracks: bool = False,
+) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    pl_ids = [str(r["id"]) for r in rows]
+    owner_ids = [int(r["owner_tg_id"]) for r in rows]
+    authors_map = _get_authors_map(owner_ids)
+    likes_counts, subs_counts, liked_set, subbed_set = _get_public_playlists_social_meta(pl_ids, viewer_tg_id)
+
+    result: List[Dict[str, Any]] = []
+    for r in rows:
+        pid = str(r["id"])
+        oid = int(r["owner_tg_id"])
+        try:
+            covers = json.loads(r["covers_json"] or "[]")
+            if not isinstance(covers, list):
+                covers = []
+        except Exception:
+            covers = []
+        author = authors_map.get(
+            oid,
+            {"tgId": oid, "displayName": f"User {oid}", "username": "", "photoUrl": ""},
+        )
+        item: Dict[str, Any] = {
+            "id": pid,
+            "sourcePlId": str(r["source_pl_id"] or ""),
+            "name": str(r["name"] or "Плейлист"),
+            "ownerTgId": oid,
+            "author": author,
+            "trackCount": int(r["track_count"] or 0),
+            "covers": covers[:4],
+            "likesCount": likes_counts.get(pid, 0),
+            "subsCount": subs_counts.get(pid, 0),
+            "isLiked": pid in liked_set,
+            "isSubscribed": pid in subbed_set,
+            "isOwner": bool(viewer_tg_id and int(viewer_tg_id) == oid),
+            "createdAt": int(r["created_at"] or 0),
+            "updatedAt": int(r["updated_at"] or 0),
+        }
+        if include_tracks:
+            try:
+                tracks = json.loads(r["tracks_json"] or "[]")
+                if not isinstance(tracks, list):
+                    tracks = []
+            except Exception:
+                tracks = []
+            item["tracks"] = tracks
+            item["trackCount"] = len(tracks)
+        result.append(item)
+    return result
 
 
 def get_user_published_map(tg_id: int) -> Dict[str, str]:
@@ -1280,7 +1333,7 @@ def get_user_published_map(tg_id: int) -> Dict[str, str]:
         "SELECT source_pl_id, id FROM public_playlists WHERE owner_tg_id = ?",
         (int(tg_id),),
     ).fetchall()
-    return {str(r["source_pl_id"]): str(r["id"]) for r in rows if r["source_pl_id"] and r["id"]}
+    return {str(r["source_pl_id"]): str(r["id"]) for r in rows}
 
 
 def get_user_subscribed_playlists(tg_id: int) -> List[Dict[str, Any]]:
@@ -1295,100 +1348,92 @@ def get_user_subscribed_playlists(tg_id: int) -> List[Dict[str, Any]]:
         """,
         (int(tg_id),),
     ).fetchall()
-    return [serialize_public_playlist(r, viewer_tg_id=int(tg_id), include_tracks=True) for r in rows]
+    return serialize_public_playlists(rows, viewer_tg_id=int(tg_id), include_tracks=True)
 
 
-def _sync_owner_published_playlists(tg_id: int, clean_playlists: list, clean_tracks: list, now: int) -> None:
+def delete_public_playlist_by_id(pub_id: str) -> bool:
+    pid = str(pub_id or "").strip()
+    if not pid:
+        return False
+    exists = DB.execute("SELECT id FROM public_playlists WHERE id = ?", (pid,)).fetchone()
+    if not exists:
+        return False
+    DB.execute("DELETE FROM public_playlist_likes WHERE playlist_id = ?", (pid,))
+    DB.execute("DELETE FROM public_playlist_subs WHERE playlist_id = ?", (pid,))
+    DB.execute("DELETE FROM public_playlists WHERE id = ?", (pid,))
+    DB.commit()
+    mark_db_dirty()
+    return True
+
+
+def sync_owner_published_playlists(tg_id: int, clean_playlists: list, clean_tracks: list, now: int) -> None:
+    """Автоматически обновляет опубликованные плейлисты автора, чтобы подписчики сразу получали новые треки!"""
     pub_rows = DB.execute(
-        "SELECT * FROM public_playlists WHERE owner_tg_id = ?",
+        "SELECT id, source_pl_id, name, tracks_json FROM public_playlists WHERE owner_tg_id = ?",
         (int(tg_id),),
     ).fetchall()
     if not pub_rows:
         return
 
-    pl_by_id = {}
-    for p in clean_playlists:
-        if isinstance(p, dict) and p.get("id"):
-            pl_by_id[str(p["id"])] = p
-
-    track_by_id = {}
-    for t in clean_tracks:
-        if isinstance(t, dict) and t.get("id"):
-            track_by_id[str(t["id"])] = t
+    pl_by_id = {
+        str(p.get("id")): p
+        for p in clean_playlists
+        if isinstance(p, dict) and p.get("id")
+    }
+    track_by_id = {
+        str(t.get("id")): t
+        for t in clean_tracks
+        if isinstance(t, dict) and t.get("id")
+    }
 
     for pr in pub_rows:
         pub_id = str(pr["id"])
-        src_pl_id = str(pr["source_pl_id"])
-        user_pl = pl_by_id.get(src_pl_id)
-        if not user_pl:
-            # Автор удалил плейлист из своей медиатеки — убираем и публичную запись
-            DB.execute("DELETE FROM public_playlists WHERE id = ?", (pub_id,))
+        src_id = str(pr["source_pl_id"])
+        src_pl = pl_by_id.get(src_id)
+        if not src_pl:
             DB.execute("DELETE FROM public_playlist_likes WHERE playlist_id = ?", (pub_id,))
             DB.execute("DELETE FROM public_playlist_subs WHERE playlist_id = ?", (pub_id,))
+            DB.execute("DELETE FROM public_playlists WHERE id = ?", (pub_id,))
             continue
 
-        # Подтягиваем предыдущий кэш треков этого плейлиста на случай, если часть треков не попала в clean_tracks
-        prev_track_map = {}
         try:
-            for pt in json.loads(pr["tracks_json"] or "[]"):
-                if isinstance(pt, dict) and pt.get("id"):
-                    prev_track_map[str(pt["id"])] = pt
+            old_tracks = json.loads(pr["tracks_json"] or "[]")
+            old_by_id = {str(t.get("id")): t for t in old_tracks if isinstance(t, dict) and t.get("id")}
         except Exception:
-            pass
+            old_by_id = {}
 
-        new_tracks = []
-        seen_ids = set()
-        raw_tids = user_pl.get("trackIds") if isinstance(user_pl.get("trackIds"), list) else []
-        for tid in raw_tids[:200]:
-            tid_s = str(tid)
-            if tid_s in seen_ids:
+        new_name = str(src_pl.get("name") or pr["name"] or "Плейлист").strip()[:80] or "Плейлист"
+        raw_tids = src_pl.get("trackIds") if isinstance(src_pl.get("trackIds"), list) else []
+        synced_tracks: List[Dict[str, Any]] = []
+        seen_tids = set()
+        for raw_tid in raw_tids[:200]:
+            tid_s = str(raw_tid)
+            if tid_s in seen_tids:
                 continue
-            seen_ids.add(tid_s)
-            t_obj = track_by_id.get(tid_s) or prev_track_map.get(tid_s)
-            if not t_obj:
-                raw_db_id = tid_s[3:] if tid_s.startswith("tg_") else tid_s
-                db_tr = DB.execute("SELECT * FROM tracks WHERE id = ?", (raw_db_id,)).fetchone()
-                if db_tr:
-                    t_obj = {
-                        "id": tid_s,
-                        "tgTrackId": str(db_tr["id"]),
-                        "title": db_tr["title"],
-                        "artist": db_tr["artist"],
-                        "duration": int(db_tr["duration"] or 180),
-                        "artwork": db_tr["artwork"] or "",
-                        "source": db_tr["source"] or "Telegram",
-                        "inTelegram": bool(db_tr["tg_file_id"]),
-                    }
-            if t_obj:
-                clean_t = _ensure_track_persisted_for_public(t_obj, int(tg_id))
-                if clean_t:
-                    new_tracks.append(clean_t)
+            seen_tids.add(tid_s)
+            src_t = track_by_id.get(tid_s) or old_by_id.get(tid_s)
+            if not src_t:
+                continue
+            norm = _normalize_public_track_item(src_t, tg_id)
+            if norm:
+                synced_tracks.append(norm)
 
-        new_name = str(user_pl.get("name") or pr["name"] or "Плейлист").strip()[:64] or "Плейлист"
-        new_covers = _extract_playlist_covers(new_tracks)
+        covers = _extract_covers_from_tracks(synced_tracks)
         DB.execute(
             """
             UPDATE public_playlists
-            SET name = ?, tracks_json = ?, covers_json = ?, track_count = ?, updated_at = ?
+            SET name = ?, tracks_json = ?, track_count = ?, covers_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
                 new_name,
-                json.dumps(new_tracks, ensure_ascii=False),
-                json.dumps(new_covers, ensure_ascii=False),
-                len(new_tracks),
+                json.dumps(synced_tracks, ensure_ascii=False),
+                len(synced_tracks),
+                json.dumps(covers, ensure_ascii=False),
                 now,
                 pub_id,
             ),
         )
-
-
-def delete_public_playlist_by_id(pub_id: str) -> None:
-    DB.execute("DELETE FROM public_playlists WHERE id = ?", (pub_id,))
-    DB.execute("DELETE FROM public_playlist_likes WHERE playlist_id = ?", (pub_id,))
-    DB.execute("DELETE FROM public_playlist_subs WHERE playlist_id = ?", (pub_id,))
-    DB.commit()
-    mark_db_dirty()
 
 
 def load_user_cloud_state(tg_id: int, theme: str = "chrome") -> Dict[str, Any]:
@@ -1400,10 +1445,10 @@ def load_user_cloud_state(tg_id: int, theme: str = "chrome") -> Dict[str, Any]:
             "playlists": [],
             "likedIds": [],
             "savedTracks": [],
-            "theme": theme or "chrome",
-            "updatedAt": 0,
             "publishedMap": pub_map,
             "subscribedPlaylists": sub_pls,
+            "theme": theme or "chrome",
+            "updatedAt": 0,
         }
     try:
         playlists = json.loads(row["playlists_json"] or "[]")
@@ -1421,10 +1466,10 @@ def load_user_cloud_state(tg_id: int, theme: str = "chrome") -> Dict[str, Any]:
         "playlists": playlists if isinstance(playlists, list) else [],
         "likedIds": liked_ids if isinstance(liked_ids, list) else [],
         "savedTracks": saved_tracks if isinstance(saved_tracks, list) else [],
-        "theme": theme or "chrome",
-        "updatedAt": int(row["updated_at"] or 0),
         "publishedMap": pub_map,
         "subscribedPlaylists": sub_pls,
+        "theme": theme or "chrome",
+        "updatedAt": int(row["updated_at"] or 0),
     }
 
 
@@ -1498,12 +1543,9 @@ def save_user_cloud_state(tg_id: int, playlists: list, liked_ids: list, saved_tr
             now,
         ),
     )
+    sync_owner_published_playlists(int(tg_id), clean_playlists, clean_tracks, now)
     if theme in ("chrome", "purple", "red"):
         DB.execute("UPDATE users SET theme = ?, updated_at = ? WHERE tg_id = ?", (theme, now, int(tg_id)))
-    try:
-        _sync_owner_published_playlists(int(tg_id), clean_playlists, clean_tracks, now)
-    except Exception as e:
-        log.warning("sync owner published playlists err for %s: %s", tg_id, e)
     DB.commit()
     mark_db_dirty()
     return now
@@ -2687,7 +2729,7 @@ async def cmd_admin_help(message: Message, bot: Bot):
         "• /test — диагностика источников, ffmpeg и бэкапа\n"
         "• /list — последние треки в базе\n"
         "• /del название — удалить трек из базы\n"
-        "• /delpl ID или название — удалить публичный плейлист\n"
+        "• /delpl [id или название] — список или удаление публичного плейлиста\n"
         "• /setapi URL — задать публичный URL бота\n"
         "• /setstorage — привязать канал-хранилище\n"
         "• /setapp 2 2 1.1.0 | описание — версия и Force Update APK\n"
@@ -2975,7 +3017,6 @@ async def cmd_delete_track(message: Message, bot: Bot):
             return
     await message.answer("Трек не найден в базе.")
 
-
 @router.message(Command("delpl"))
 async def cmd_delete_public_playlist(message: Message, bot: Bot):
     uid = message.from_user.id if message.from_user else None
@@ -2984,32 +3025,34 @@ async def cmd_delete_public_playlist(message: Message, bot: Bot):
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         rows = DB.execute(
-            "SELECT id, name, owner_tg_id, track_count, likes_count, subs_count FROM public_playlists ORDER BY updated_at DESC LIMIT 15"
+            "SELECT * FROM public_playlists ORDER BY updated_at DESC LIMIT 15"
         ).fetchall()
         if not rows:
             await message.answer("Публичных плейлистов пока нет.")
             return
-        lines = ["<b>Публичные плейлисты (последние 15):</b>"]
-        for r in rows:
-            author = _author_info_for_tg_id(int(r["owner_tg_id"]))
-            aname = f"@{author['username']}" if author.get("username") else author["displayName"]
+        items = serialize_public_playlists(rows, viewer_tg_id=None, include_tracks=False)
+        lines = [f"<b>Публичные плейлисты ({len(items)}):</b>"]
+        for idx, it in enumerate(items, 1):
+            au = it["author"]
+            au_lbl = f"@{au['username']}" if au.get("username") else au.get("displayName", "User")
             lines.append(
-                f"• <code>{r['id']}</code> — <b>{r['name']}</b> ({aname}, {r['track_count']} тр., ♥{r['likes_count']}, +{r['subs_count']})"
+                f"{idx}. <code>{it['id']}</code> — <b>{html_mod.escape(it['name'])}</b> "
+                f"({html_mod.escape(au_lbl)}, {it['trackCount']} тр., ♥ {it['likesCount']}, +{it['subsCount']})"
             )
-        lines.append("\nУдалить: <code>/delpl ID или название</code>")
+        lines.append("\nДля удаления: <code>/delpl ID</code> или <code>/delpl название</code>")
         await message.answer("\n".join(lines), parse_mode="HTML")
         return
 
     raw_q = parts[1].strip()
     q_fold = fold_ru(raw_q)
-    rows = DB.execute("SELECT id, name, owner_tg_id FROM public_playlists ORDER BY updated_at DESC LIMIT 300").fetchall()
+    rows = DB.execute("SELECT * FROM public_playlists ORDER BY updated_at DESC LIMIT 200").fetchall()
     for r in rows:
-        if raw_q.lower() == str(r["id"]).lower() or (q_fold and q_fold in fold_ru(r["name"])):
-            author = _author_info_for_tg_id(int(r["owner_tg_id"]))
-            aname = f"@{author['username']}" if author.get("username") else author["displayName"]
-            delete_public_playlist_by_id(str(r["id"]))
+        if raw_q == str(r["id"]) or raw_q.lower() == str(r["id"]).lower() or (q_fold and q_fold in fold_ru(str(r["name"] or ""))):
+            pid = str(r["id"])
+            pname = str(r["name"] or "")
+            delete_public_playlist_by_id(pid)
             await message.answer(
-                f"🗑 Публичный плейлист удалён: <b>{r['name']}</b> (автор: {aname}, ID: <code>{r['id']}</code>)",
+                f"🗑 Публичный плейлист удалён: <b>{html_mod.escape(pname)}</b> (<code>{pid}</code>)",
                 parse_mode="HTML",
             )
             return
@@ -3532,157 +3575,150 @@ async def api_user_logout(request: web.Request) -> web.Response:
         mark_db_dirty()
     return web.json_response({"ok": True})
 
-
-
-# ================= PUBLIC USER PLAYLISTS, LIKES & SUBSCRIPTIONS API (v41) =================
 async def api_public_playlists_list(request: web.Request) -> web.Response:
     token = extract_bearer_token(request)
     viewer_row = get_user_by_token(token) if token else None
-    viewer_tg_id = int(viewer_row["tg_id"]) if viewer_row else 0
+    viewer_tg_id = int(viewer_row["tg_id"]) if viewer_row else None
 
     q_raw = (request.query.get("q") or "").strip()
-    q_fold = fold_ru(q_raw)
-    q_low = q_raw.lower().lstrip("@")
-    sort = (request.query.get("sort") or "popular").strip().lower()
+    q_fold = fold_ru(q_raw) if q_raw else ""
+    sort_mode = (request.query.get("sort") or "popular").strip().lower()
     try:
         limit = max(1, min(60, int(request.query.get("limit") or 40)))
     except Exception:
         limit = 40
 
-    order_sql = (
-        "created_at DESC, updated_at DESC"
-        if sort == "new"
-        else "likes_count DESC, subs_count DESC, updated_at DESC"
-    )
     rows = DB.execute(
-        f"SELECT * FROM public_playlists WHERE track_count >= 1 ORDER BY {order_sql} LIMIT 250"
+        "SELECT * FROM public_playlists WHERE track_count >= 1 ORDER BY updated_at DESC LIMIT 300"
     ).fetchall()
+    items = serialize_public_playlists(rows, viewer_tg_id=viewer_tg_id, include_tracks=False)
 
-    results = []
-    for r in rows:
-        item = serialize_public_playlist(r, viewer_tg_id=viewer_tg_id, include_tracks=False)
-        if q_raw:
-            author = item["author"]
-            haystack_fold = fold_ru(f"{item['name']} {author.get('displayName', '')} {author.get('username', '')}")
-            uname_low = str(author.get("username") or "").lower()
-            name_low = str(item["name"] or "").lower()
-            if not (
-                (q_fold and q_fold in haystack_fold)
-                or (q_low and (q_low in uname_low or q_low in name_low))
-            ):
-                continue
-        results.append(item)
-        if len(results) >= limit:
-            break
+    if q_fold:
+        filtered = []
+        for it in items:
+            au = it.get("author") or {}
+            haystack = fold_ru(f"{it.get('name', '')} {au.get('displayName', '')} {au.get('username', '')}")
+            if q_fold in haystack:
+                filtered.append(it)
+        items = filtered
 
-    return web.json_response({"ok": True, "playlists": results})
+    if sort_mode == "new":
+        items.sort(key=lambda x: (x.get("createdAt", 0), x.get("updatedAt", 0)), reverse=True)
+    else:
+        items.sort(
+            key=lambda x: (
+                x.get("likesCount", 0) * 2 + x.get("subsCount", 0) * 3,
+                x.get("likesCount", 0),
+                x.get("subsCount", 0),
+                x.get("updatedAt", 0),
+            ),
+            reverse=True,
+        )
+
+    return web.json_response({"ok": True, "playlists": items[:limit]})
 
 
-async def api_public_playlist_detail(request: web.Request) -> web.Response:
+async def api_public_playlist_get(request: web.Request) -> web.Response:
     pub_id = (request.match_info.get("pub_id") or "").strip()
     if not pub_id:
-        return web.json_response({"ok": False, "error": "missing_id"}, status=400)
+        return web.json_response({"ok": False, "error": "not_found"}, status=404)
     token = extract_bearer_token(request)
     viewer_row = get_user_by_token(token) if token else None
-    viewer_tg_id = int(viewer_row["tg_id"]) if viewer_row else 0
+    viewer_tg_id = int(viewer_row["tg_id"]) if viewer_row else None
 
     row = DB.execute("SELECT * FROM public_playlists WHERE id = ?", (pub_id,)).fetchone()
     if not row:
         return web.json_response({"ok": False, "error": "not_found"}, status=404)
-    return web.json_response(
-        {
-            "ok": True,
-            "playlist": serialize_public_playlist(row, viewer_tg_id=viewer_tg_id, include_tracks=True),
-        }
-    )
+
+    items = serialize_public_playlists([row], viewer_tg_id=viewer_tg_id, include_tracks=True)
+    return web.json_response({"ok": True, "playlist": items[0]})
 
 
 async def api_public_playlist_publish(request: web.Request) -> web.Response:
     token = extract_bearer_token(request)
-    row = get_user_by_token(token)
-    if not row:
+    user_row = get_user_by_token(token)
+    if not user_row:
         return web.json_response({"ok": False, "error": "token_revoked"}, status=401)
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
 
-    tg_id = int(row["tg_id"])
+    tg_id = int(user_row["tg_id"])
     source_pl_id = str((body or {}).get("sourcePlId") or "").strip()[:80]
-    name = str((body or {}).get("name") or "").strip()[:64]
+    name = str((body or {}).get("name") or "").strip()[:80]
     raw_tracks = (body or {}).get("tracks") or []
 
     if not source_pl_id or not name:
         return web.json_response({"ok": False, "error": "invalid_playlist"}, status=400)
     if not isinstance(raw_tracks, list):
-        return web.json_response({"ok": False, "error": "invalid_tracks"}, status=400)
+        raw_tracks = []
 
-    clean_tracks = []
-    seen = set()
+    norm_tracks: List[Dict[str, Any]] = []
+    seen_ids = set()
     for t in raw_tracks[:200]:
-        ct = _ensure_track_persisted_for_public(t, tg_id)
-        if ct and ct["id"] not in seen:
-            seen.add(ct["id"])
-            clean_tracks.append(ct)
+        nt = _normalize_public_track_item(t, tg_id)
+        if nt and nt["id"] not in seen_ids:
+            seen_ids.add(nt["id"])
+            norm_tracks.append(nt)
 
-    if len(clean_tracks) < MIN_TRACKS_FOR_PUBLIC_PLAYLIST:
-        return web.json_response(
-            {"ok": False, "error": "min_tracks_required", "minTracks": MIN_TRACKS_FOR_PUBLIC_PLAYLIST},
-            status=400,
-        )
+    if len(norm_tracks) < PUBLIC_PLAYLIST_MIN_TRACKS:
+        return web.json_response({"ok": False, "error": "min_tracks_required"}, status=400)
 
     existing = DB.execute(
-        "SELECT id FROM public_playlists WHERE owner_tg_id = ? AND source_pl_id = ?",
+        "SELECT id, created_at FROM public_playlists WHERE owner_tg_id = ? AND source_pl_id = ?",
         (tg_id, source_pl_id),
     ).fetchone()
 
-    if not existing:
-        cur_count = int(
-            DB.execute("SELECT COUNT(*) AS c FROM public_playlists WHERE owner_tg_id = ?", (tg_id,)).fetchone()["c"]
-        )
-        if cur_count >= MAX_PUBLIC_PLAYLISTS_PER_USER:
-            return web.json_response(
-                {"ok": False, "error": "max_public_playlists_reached", "limit": MAX_PUBLIC_PLAYLISTS_PER_USER},
-                status=400,
-            )
-
     now = int(time.time())
-    covers = _extract_playlist_covers(clean_tracks)
+    covers = _extract_covers_from_tracks(norm_tracks)
 
     if existing:
         pub_id = str(existing["id"])
         DB.execute(
             """
             UPDATE public_playlists
-            SET name = ?, tracks_json = ?, covers_json = ?, track_count = ?, updated_at = ?
+            SET name = ?, tracks_json = ?, track_count = ?, covers_json = ?, updated_at = ?
             WHERE id = ?
             """,
             (
                 name,
-                json.dumps(clean_tracks, ensure_ascii=False),
+                json.dumps(norm_tracks, ensure_ascii=False),
+                len(norm_tracks),
                 json.dumps(covers, ensure_ascii=False),
-                len(clean_tracks),
                 now,
                 pub_id,
             ),
         )
     else:
-        pub_id = "p_" + secrets.token_hex(5)
+        cur_count = int(
+            DB.execute("SELECT COUNT(*) AS c FROM public_playlists WHERE owner_tg_id = ?", (tg_id,)).fetchone()["c"]
+        )
+        if cur_count >= PUBLIC_PLAYLIST_MAX_PER_USER:
+            return web.json_response({"ok": False, "error": "max_public_playlists_reached"}, status=400)
+
+        pub_id = ""
+        for _ in range(8):
+            cand = secrets.token_urlsafe(6).replace("-", "x").replace("_", "z")
+            if not DB.execute("SELECT id FROM public_playlists WHERE id = ?", (cand,)).fetchone():
+                pub_id = cand
+                break
+        if not pub_id:
+            pub_id = secrets.token_hex(6)
+
         DB.execute(
             """
-            INSERT INTO public_playlists(
-                id, owner_tg_id, source_pl_id, name, tracks_json, covers_json,
-                track_count, likes_count, subs_count, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+            INSERT INTO public_playlists(id, owner_tg_id, source_pl_id, name, tracks_json, track_count, covers_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pub_id,
                 tg_id,
                 source_pl_id,
                 name,
-                json.dumps(clean_tracks, ensure_ascii=False),
+                json.dumps(norm_tracks, ensure_ascii=False),
+                len(norm_tracks),
                 json.dumps(covers, ensure_ascii=False),
-                len(clean_tracks),
                 now,
                 now,
             ),
@@ -3691,11 +3727,12 @@ async def api_public_playlist_publish(request: web.Request) -> web.Response:
     DB.commit()
     mark_db_dirty()
 
-    fresh = DB.execute("SELECT * FROM public_playlists WHERE id = ?", (pub_id,)).fetchone()
+    row = DB.execute("SELECT * FROM public_playlists WHERE id = ?", (pub_id,)).fetchone()
+    pl_obj = serialize_public_playlists([row], viewer_tg_id=tg_id, include_tracks=True)[0]
     return web.json_response(
         {
             "ok": True,
-            "playlist": serialize_public_playlist(fresh, viewer_tg_id=tg_id, include_tracks=True),
+            "playlist": pl_obj,
             "publishedMap": get_user_published_map(tg_id),
         }
     )
@@ -3703,115 +3740,114 @@ async def api_public_playlist_publish(request: web.Request) -> web.Response:
 
 async def api_public_playlist_unpublish(request: web.Request) -> web.Response:
     token = extract_bearer_token(request)
-    row = get_user_by_token(token)
-    if not row:
+    user_row = get_user_by_token(token)
+    if not user_row:
         return web.json_response({"ok": False, "error": "token_revoked"}, status=401)
     try:
         body = await request.json()
     except Exception:
         body = {}
 
-    tg_id = int(row["tg_id"])
+    tg_id = int(user_row["tg_id"])
     source_pl_id = str((body or {}).get("sourcePlId") or "").strip()
-    pub_id = str((body or {}).get("id") or "").strip()
+    pub_id = str((body or {}).get("playlistId") or "").strip()
 
-    target = None
+    row = None
     if source_pl_id:
-        target = DB.execute(
+        row = DB.execute(
             "SELECT id FROM public_playlists WHERE owner_tg_id = ? AND source_pl_id = ?",
             (tg_id, source_pl_id),
         ).fetchone()
     elif pub_id:
-        target = DB.execute(
+        row = DB.execute(
             "SELECT id FROM public_playlists WHERE owner_tg_id = ? AND id = ?",
             (tg_id, pub_id),
         ).fetchone()
 
-    if target:
-        delete_public_playlist_by_id(str(target["id"]))
+    if row:
+        delete_public_playlist_by_id(str(row["id"]))
 
     return web.json_response({"ok": True, "publishedMap": get_user_published_map(tg_id)})
 
 
-async def api_public_playlist_toggle_like(request: web.Request) -> web.Response:
+async def api_public_playlist_like(request: web.Request) -> web.Response:
     token = extract_bearer_token(request)
-    row = get_user_by_token(token)
-    if not row:
+    user_row = get_user_by_token(token)
+    if not user_row:
         return web.json_response({"ok": False, "error": "token_revoked"}, status=401)
+
     pub_id = (request.match_info.get("pub_id") or "").strip()
-    pl_row = DB.execute("SELECT id FROM public_playlists WHERE id = ?", (pub_id,)).fetchone()
-    if not pl_row:
+    row = DB.execute("SELECT id FROM public_playlists WHERE id = ?", (pub_id,)).fetchone()
+    if not row:
         return web.json_response({"ok": False, "error": "not_found"}, status=404)
 
-    tg_id = int(row["tg_id"])
-    ex = DB.execute(
+    tg_id = int(user_row["tg_id"])
+    liked = DB.execute(
         "SELECT 1 FROM public_playlist_likes WHERE playlist_id = ? AND tg_id = ?",
         (pub_id, tg_id),
     ).fetchone()
-    if ex:
+    if liked:
         DB.execute("DELETE FROM public_playlist_likes WHERE playlist_id = ? AND tg_id = ?", (pub_id, tg_id))
         is_liked = False
     else:
         DB.execute(
-            "INSERT OR IGNORE INTO public_playlist_likes(playlist_id, tg_id, created_at) VALUES(?, ?, ?)",
+            "INSERT OR IGNORE INTO public_playlist_likes(playlist_id, tg_id, created_at) VALUES (?, ?, ?)",
             (pub_id, tg_id, int(time.time())),
         )
         is_liked = True
-
-    likes_c = int(
-        DB.execute("SELECT COUNT(*) AS c FROM public_playlist_likes WHERE playlist_id = ?", (pub_id,)).fetchone()["c"]
-    )
-    DB.execute("UPDATE public_playlists SET likes_count = ? WHERE id = ?", (likes_c, pub_id))
     DB.commit()
     mark_db_dirty()
-    return web.json_response({"ok": True, "isLiked": is_liked, "likesCount": likes_c})
+
+    likes_count = int(
+        DB.execute("SELECT COUNT(*) AS c FROM public_playlist_likes WHERE playlist_id = ?", (pub_id,)).fetchone()["c"]
+    )
+    return web.json_response({"ok": True, "isLiked": is_liked, "likesCount": likes_count})
 
 
-async def api_public_playlist_toggle_subscribe(request: web.Request) -> web.Response:
+async def api_public_playlist_subscribe(request: web.Request) -> web.Response:
     token = extract_bearer_token(request)
-    row = get_user_by_token(token)
-    if not row:
+    user_row = get_user_by_token(token)
+    if not user_row:
         return web.json_response({"ok": False, "error": "token_revoked"}, status=401)
+
     pub_id = (request.match_info.get("pub_id") or "").strip()
-    pl_row = DB.execute("SELECT * FROM public_playlists WHERE id = ?", (pub_id,)).fetchone()
-    if not pl_row:
+    row = DB.execute("SELECT * FROM public_playlists WHERE id = ?", (pub_id,)).fetchone()
+    if not row:
         return web.json_response({"ok": False, "error": "not_found"}, status=404)
 
-    tg_id = int(row["tg_id"])
-    if int(pl_row["owner_tg_id"]) == tg_id:
+    tg_id = int(user_row["tg_id"])
+    if int(row["owner_tg_id"]) == tg_id:
         return web.json_response({"ok": False, "error": "own_playlist"}, status=400)
 
-    ex = DB.execute(
+    subbed = DB.execute(
         "SELECT 1 FROM public_playlist_subs WHERE playlist_id = ? AND tg_id = ?",
         (pub_id, tg_id),
     ).fetchone()
-    if ex:
+    if subbed:
         DB.execute("DELETE FROM public_playlist_subs WHERE playlist_id = ? AND tg_id = ?", (pub_id, tg_id))
-        is_sub = False
+        is_subbed = False
     else:
         DB.execute(
-            "INSERT OR IGNORE INTO public_playlist_subs(playlist_id, tg_id, created_at) VALUES(?, ?, ?)",
+            "INSERT OR IGNORE INTO public_playlist_subs(playlist_id, tg_id, created_at) VALUES (?, ?, ?)",
             (pub_id, tg_id, int(time.time())),
         )
-        is_sub = True
-
-    subs_c = int(
-        DB.execute("SELECT COUNT(*) AS c FROM public_playlist_subs WHERE playlist_id = ?", (pub_id,)).fetchone()["c"]
-    )
-    DB.execute("UPDATE public_playlists SET subs_count = ? WHERE id = ?", (subs_c, pub_id))
+        is_subbed = True
     DB.commit()
     mark_db_dirty()
 
-    fresh = DB.execute("SELECT * FROM public_playlists WHERE id = ?", (pub_id,)).fetchone()
-    pl_payload = serialize_public_playlist(fresh, viewer_tg_id=tg_id, include_tracks=True) if (is_sub and fresh) else None
+    subs_count = int(
+        DB.execute("SELECT COUNT(*) AS c FROM public_playlist_subs WHERE playlist_id = ?", (pub_id,)).fetchone()["c"]
+    )
+    pl_obj = serialize_public_playlists([row], viewer_tg_id=tg_id, include_tracks=True)[0] if is_subbed else None
     return web.json_response(
         {
             "ok": True,
-            "isSubscribed": is_sub,
-            "subsCount": subs_c,
-            "playlist": pl_payload,
+            "isSubscribed": is_subbed,
+            "subsCount": subs_count,
+            "playlist": pl_obj,
         }
     )
+
 
 
 async def api_app_version(request: web.Request) -> web.Response:
@@ -4182,11 +4218,11 @@ async def main():
     app.router.add_post("/api/user/avatar", api_user_avatar_upload)
     app.router.add_delete("/api/user/avatar", api_user_avatar_delete)
     app.router.add_get("/api/playlists/public", api_public_playlists_list)
-    app.router.add_get("/api/playlists/public/{pub_id}", api_public_playlist_detail)
+    app.router.add_get("/api/playlists/public/{pub_id}", api_public_playlist_get)
     app.router.add_post("/api/playlists/publish", api_public_playlist_publish)
     app.router.add_post("/api/playlists/unpublish", api_public_playlist_unpublish)
-    app.router.add_post("/api/playlists/public/{pub_id}/like", api_public_playlist_toggle_like)
-    app.router.add_post("/api/playlists/public/{pub_id}/subscribe", api_public_playlist_toggle_subscribe)
+    app.router.add_post("/api/playlists/public/{pub_id}/like", api_public_playlist_like)
+    app.router.add_post("/api/playlists/public/{pub_id}/subscribe", api_public_playlist_subscribe)
     app.router.add_get("/api/tg/ping", api_ping)
     app.router.add_get("/api/tg/library", api_library)
     app.router.add_get("/api/tg/search", api_search)
