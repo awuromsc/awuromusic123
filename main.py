@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-APATHY v36 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
+APATHY v37 — Надёжный лёгкий Telegram-бот (ТОЛЬКО АУДИО) + API для https://awuro.sergeyhownan.workers.dev/
 ===========================================================================================================
-Исправлено в v36 (обход блокировок YouTube на Docker/VPS-серверах):
+Исправлено в v37 (обход блокировок YouTube на Docker/VPS-серверах):
   1. Мульти-поиск строго по аудиоисточникам одновременно:
        • SoundCloud API v2 (полные треки, прогрессивный MP3 без блокировок дата-центров — идеально для ру-рэпа/андерграунда)
        • Прямые РФ MP3-порталы (Hitmo, Hitmotop, Muzofond, Mp3Party, LightAudio — мгновенный MP3, 0% CPU)
@@ -396,7 +396,7 @@ async def backup_db_to_telegram(bot: Bot, reason: str = "auto") -> Tuple[bool, s
             reason_lbl = {"manual": "Ручной бэкап", "shutdown": "Бэкап при остановке", "auto": "Автобэкап"}.get(reason, "Бэкап")
             caption = (
                 "#apathy_db_backup\n"
-                f"💾 <b>{reason_lbl} базы APATHY</b> (v36)\n"
+                f"💾 <b>{reason_lbl} базы APATHY</b> (v37)\n"
                 f"👤 Пользователей: <b>{stats['users']}</b> · 🎵 Треков: <b>{stats['all_tracks']}</b> · 📋 Плейлистов: <b>{stats['playlists']}</b>\n"
                 f"📦 Размер: <b>{size_bytes / 1024:.1f} КБ</b> · 🕒 {ts_str}"
             )
@@ -779,7 +779,7 @@ def lookup_track_record(track_id: str) -> Optional[Dict[str, Any]]:
 
 
 
-# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v36) ====================
+# ==================== АККАУНТЫ TELEGRAM И ОБЛАЧНЫЕ ПЛЕЙЛИСТЫ (v37) ====================
 def _user_row_to_public(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
     tg_id = int(d["tg_id"])
@@ -885,6 +885,75 @@ def add_track_to_user_playlist(tg_id: int, track_api: Dict[str, Any], tg_user: A
     return str(target_pl.get("name") or "Мой плейлист")
 
 
+SESSION_TTL_SEC = 180 * 86400        # 180 дней (6 месяцев)
+SESSION_REFRESH_AFTER_SEC = 7 * 86400  # автопродление каждые 7 дней
+
+
+def _session_signing_key() -> bytes:
+    secret_src = f"apathy-session-v1:{BOT_TOKEN or 'fallback-local'}"
+    return hashlib.sha256(secret_src.encode("utf-8")).digest()
+
+
+def issue_signed_session_token(
+    tg_id: int,
+    username: str = "",
+    first_name: str = "",
+    last_name: str = "",
+) -> str:
+    """Выдаёт криптографически подписанный токен на 180 дней (переживает перезапуски/пересборки контейнера)."""
+    now = int(time.time())
+    payload = {
+        "uid": int(tg_id),
+        "u": str(username or "")[:64],
+        "fn": str(first_name or "")[:64],
+        "ln": str(last_name or "")[:64],
+        "iat": now,
+        "exp": now + SESSION_TTL_SEC,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    sig = hmac.new(_session_signing_key(), b64.encode("ascii"), hashlib.sha256).hexdigest()[:40]
+    return f"ap1.{b64}.{sig}"
+
+
+def verify_signed_session_token(token: str) -> Optional[Dict[str, Any]]:
+    tok = str(token or "").strip()
+    if not tok.startswith("ap1."):
+        return None
+    parts = tok.split(".")
+    if len(parts) != 3:
+        return None
+    _, b64, sig = parts
+    expected = hmac.new(_session_signing_key(), b64.encode("ascii"), hashlib.sha256).hexdigest()[:40]
+    if not hmac.compare_digest(expected, sig):
+        return None
+    try:
+        pad = "=" * ((4 - len(b64) % 4) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(b64 + pad).decode("utf-8"))
+        if not isinstance(payload, dict) or not payload.get("uid"):
+            return None
+        exp = int(payload.get("exp") or 0)
+        if exp and exp < int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def maybe_refresh_session_token(row: sqlite3.Row, incoming_token: str) -> Optional[str]:
+    """Тихо продлевает старые случайные токены или токены старше 7 дней ещё на 180 дней."""
+    payload = verify_signed_session_token(incoming_token)
+    now = int(time.time())
+    if payload is None or (now - int(payload.get("iat") or 0)) >= SESSION_REFRESH_AFTER_SEC:
+        return issue_signed_session_token(
+            tg_id=int(row["tg_id"]),
+            username=str(row["username"] or ""),
+            first_name=str(row["first_name"] or ""),
+            last_name=str(row["last_name"] or ""),
+        )
+    return None
+
+
 def upsert_telegram_user(
     tg_id: int,
     username: str = "",
@@ -894,8 +963,12 @@ def upsert_telegram_user(
 ) -> Tuple[Dict[str, Any], str]:
     now = int(time.time())
     existing = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
+    eff_u = username or (existing["username"] if existing else "") or ""
+    eff_fn = first_name or (existing["first_name"] if existing else "") or ""
+    eff_ln = last_name if last_name else ((existing["last_name"] if existing else "") or "")
+    signed_tok = issue_signed_session_token(int(tg_id), eff_u, eff_fn, eff_ln)
+
     if existing:
-        token = existing["session_token"] or secrets.token_urlsafe(32)
         DB.execute(
             """
             UPDATE users SET
@@ -908,34 +981,52 @@ def upsert_telegram_user(
             WHERE tg_id = ?
             """,
             (
-                username or "",
-                first_name or "",
-                last_name or "",
+                eff_u,
+                eff_fn,
+                eff_ln,
                 photo_url or "",
-                token,
+                signed_tok,
                 now,
                 int(tg_id),
             ),
         )
     else:
-        token = secrets.token_urlsafe(32)
         DB.execute(
             """
             INSERT INTO users(tg_id, username, first_name, last_name, photo_url, session_token, theme, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, 'chrome', ?, ?)
             """,
-            (int(tg_id), username or "", first_name or "", last_name or "", photo_url or "", token, now, now),
+            (int(tg_id), eff_u, eff_fn, eff_ln, photo_url or "", signed_tok, now, now),
         )
     DB.commit()
     mark_db_dirty()
     row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
-    return _user_row_to_public(row), row["session_token"]
+    return _user_row_to_public(row), signed_tok
 
 
 def get_user_by_token(token: str) -> Optional[sqlite3.Row]:
     tok = str(token or "").strip()
     if not tok or len(tok) < 16:
         return None
+
+    # 1) Криптографически подписанный долгоживущий токен (180 дней) — работает на нескольких устройствах
+    #    и автоматически восстанавливает запись пользователя даже после сброса/пересборки контейнера!
+    payload = verify_signed_session_token(tok)
+    if payload:
+        uid = int(payload["uid"])
+        row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (uid,)).fetchone()
+        if row:
+            return row
+        # Самовосстановление пользователя в БД по подписанному токену
+        upsert_telegram_user(
+            tg_id=uid,
+            username=str(payload.get("u") or ""),
+            first_name=str(payload.get("fn") or ""),
+            last_name=str(payload.get("ln") or ""),
+        )
+        return DB.execute("SELECT * FROM users WHERE tg_id = ?", (uid,)).fetchone()
+
+    # 2) Обратная совместимость со старыми случайными токенами v29–v37
     return DB.execute("SELECT * FROM users WHERE session_token = ?", (tok,)).fetchone()
 
 
@@ -1058,7 +1149,7 @@ def verify_telegram_webapp_init_data(init_data: str) -> Optional[Dict[str, Any]]
         if not received_hash:
             return None
         auth_date = int(pairs.get("auth_date") or 0)
-        if auth_date and abs(time.time() - auth_date) > 86400:
+        if auth_date and abs(time.time() - auth_date) > 7 * 86400:
             return None
         data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
         secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
@@ -2198,7 +2289,7 @@ async def cmd_start(message: Message, bot: Bot):
 
     total = DB.execute("SELECT COUNT(*) AS c FROM tracks WHERE tg_file_id != ''").fetchone()["c"]
     text = (
-        "<b>APATHY v36 · Музыкальный бот и личные плейлисты</b>\n\n"
+        "<b>APATHY v37 · Музыкальный бот и личные плейлисты</b>\n\n"
         f"🌐 Сайт плеера: {SITE_URL}/\n"
         f"💾 Общих треков в базе: <b>{total}</b>\n\n"
         "• <b>Напиши название трека</b> — ищу по SoundCloud, РФ MP3-порталам и YouTube (строго .mp3).\n"
@@ -2323,7 +2414,7 @@ async def cmd_test_sources(message: Message, bot: Bot):
             st_txt = f"❌ <code>{st_id}</code> (нет доступа: {str(e)[:40]})"
     db_s = get_db_stats()
     await m.edit_text(
-        "<b>Диагностика источников сервера (v36):</b>\n\n"
+        "<b>Диагностика источников сервера (v37):</b>\n\n"
         + "\n".join(lines)
         + f"\n\n🎛 ffmpeg: {ff_st}"
         + f"\n💾 Бэкап-канал: {st_txt}"
@@ -2700,7 +2791,11 @@ async def api_user_me(request: web.Request) -> web.Response:
         row = DB.execute("SELECT * FROM users WHERE tg_id = ?", (int(row["tg_id"]),)).fetchone() or row
     pub_user = _user_row_to_public(row)
     cloud_state = load_user_cloud_state(pub_user["tgId"], pub_user["theme"])
-    return web.json_response({"ok": True, "user": pub_user, "state": cloud_state})
+    refreshed = maybe_refresh_session_token(row, token)
+    resp_obj: Dict[str, Any] = {"ok": True, "user": pub_user, "state": cloud_state}
+    if refreshed:
+        resp_obj["refreshedToken"] = refreshed
+    return web.json_response(resp_obj)
 
 
 async def api_user_avatar_get(request: web.Request) -> web.StreamResponse:
@@ -2836,27 +2931,23 @@ async def api_user_sync(request: web.Request) -> web.Response:
     saved_tracks = (body or {}).get("savedTracks") or []
     theme = str((body or {}).get("theme") or "").strip()
     ts = save_user_cloud_state(int(row["tg_id"]), playlists, liked_ids, saved_tracks, theme)
-    return web.json_response(
-        {
-            "ok": True,
-            "syncedAt": ts,
-            "counts": {
-                "playlists": len(playlists) if isinstance(playlists, list) else 0,
-                "liked": len(liked_ids) if isinstance(liked_ids, list) else 0,
-                "tracks": len(saved_tracks) if isinstance(saved_tracks, list) else 0,
-            },
-        }
-    )
+    refreshed = maybe_refresh_session_token(row, token)
+    resp_obj: Dict[str, Any] = {
+        "ok": True,
+        "syncedAt": ts,
+        "counts": {
+            "playlists": len(playlists) if isinstance(playlists, list) else 0,
+            "liked": len(liked_ids) if isinstance(liked_ids, list) else 0,
+            "tracks": len(saved_tracks) if isinstance(saved_tracks, list) else 0,
+        },
+    }
+    if refreshed:
+        resp_obj["refreshedToken"] = refreshed
+    return web.json_response(resp_obj)
 
 
 async def api_user_logout(request: web.Request) -> web.Response:
-    token = extract_bearer_token(request)
-    row = get_user_by_token(token)
-    if row:
-        new_tok = secrets.token_urlsafe(32)
-        DB.execute("UPDATE users SET session_token = ?, updated_at = ? WHERE tg_id = ?", (new_tok, int(time.time()), int(row["tg_id"])))
-        DB.commit()
-        mark_db_dirty()
+    # Выход очищает сессию на текущем устройстве, не разлогинивая остальные устройства пользователя
     return web.json_response({"ok": True})
 
 
@@ -2865,8 +2956,8 @@ async def api_ping(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "ok": True,
-            "service": "apathy-tg-audio-v36",
-            "version": "v36",
+            "service": "apathy-tg-audio-v37",
+            "version": "v37",
             "bot": BOT_USERNAME_CACHE,
             "siteUrl": SITE_URL,
             "tracksCount": total,
@@ -3151,7 +3242,7 @@ async def main():
         log.warning("Auto-restore skipped with status: %s", rst_err)
 
     log.info(
-        "APATHY v36 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s | storage=%s",
+        "APATHY v37 Audio-Only Bot started: %s | Site: %s | ffmpeg=%s | storage=%s",
         BOT_USERNAME_CACHE, SITE_URL, HAS_FFMPEG, get_storage_chat_id(),
     )
 

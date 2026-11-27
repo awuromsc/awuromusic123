@@ -13,6 +13,33 @@
         }
       };
 
+      // Persistent first-party cookie mirror (180 days) so Telegram session survives localStorage eviction
+      const SESSION_COOKIE_NAME = 'apathy_tg_tok_v1';
+      const SESSION_COOKIE_MAX_AGE = 180 * 24 * 60 * 60;
+
+      function readSessionCookie() {
+        try {
+          const m = document.cookie.match(new RegExp('(?:^|;\\s*)' + SESSION_COOKIE_NAME + '=([^;]+)'));
+          return m ? decodeURIComponent(m[1]) : '';
+        } catch (e) { return ''; }
+      }
+
+      function writeSessionCookie(token) {
+        try {
+          const sec = location.protocol === 'https:' ? '; Secure' : '';
+          if (token) {
+            document.cookie = `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Max-Age=${SESSION_COOKIE_MAX_AGE}; Path=/; SameSite=Lax${sec}`;
+          } else {
+            document.cookie = `${SESSION_COOKIE_NAME}=; Max-Age=0; Path=/; SameSite=Lax${sec}`;
+          }
+        } catch (e) {}
+      }
+
+      const initialRestoredToken = String(store.get('tgAuthToken', '') || readSessionCookie() || '').trim();
+      if (initialRestoredToken && !store.get('tgAuthToken', '')) {
+        store.set('tgAuthToken', initialRestoredToken);
+      }
+
       // ================= STATE =================
       const savedCatalogTracks = store.get('savedCatalogTracks', []);
       const defaultPlaylists = [
@@ -27,7 +54,7 @@
         playlists: store.get('playlists', defaultPlaylists),
         likedIds: new Set(store.get('liked', [])),
         user: store.get('user', null),
-        tgToken: store.get('tgAuthToken', ''),
+        tgToken: initialRestoredToken,
         theme: store.get('theme', 'chrome'),
         activeTab: 'viewSearch',
         libFilter: 'all',
@@ -484,6 +511,7 @@
       // ================= OFFLINE AUDIO ENGINE (INDEXEDDB + SERVICE WORKER v32) =================
       const OFFLINE_DB_NAME = 'apathy_offline_v1';
       const OFFLINE_STORE = 'tracks';
+      const SESSION_KV_STORE = 'kv';
       const MAX_AUTO_OFFLINE_TRACKS = 60;
       let offlineDbPromise = null;
       let activeOfflineBlobUrl = '';
@@ -504,12 +532,15 @@
         if (typeof indexedDB === 'undefined') return Promise.resolve(null);
         offlineDbPromise = new Promise((resolve) => {
           try {
-            const req = indexedDB.open(OFFLINE_DB_NAME, 1);
+            const req = indexedDB.open(OFFLINE_DB_NAME, 2);
             req.onupgradeneeded = (ev) => {
               const db = ev.target.result;
               if (!db.objectStoreNames.contains(OFFLINE_STORE)) {
                 const st = db.createObjectStore(OFFLINE_STORE, { keyPath: 'id' });
                 st.createIndex('savedAt', 'savedAt', { unique: false });
+              }
+              if (!db.objectStoreNames.contains(SESSION_KV_STORE)) {
+                db.createObjectStore(SESSION_KV_STORE, { keyPath: 'k' });
               }
             };
             req.onsuccess = () => resolve(req.result);
@@ -567,6 +598,36 @@
           try {
             const tx = db.transaction(OFFLINE_STORE, 'readwrite');
             tx.objectStore(OFFLINE_STORE).clear();
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+          } catch (e) { resolve(false); }
+        });
+      }
+
+      async function idbKvGet(k) {
+        const db = await openOfflineDb();
+        if (!db || !db.objectStoreNames.contains(SESSION_KV_STORE)) return null;
+        return await new Promise((resolve) => {
+          try {
+            const tx = db.transaction(SESSION_KV_STORE, 'readonly');
+            const req = tx.objectStore(SESSION_KV_STORE).get(String(k));
+            req.onsuccess = () => resolve(req.result ? req.result.v : null);
+            req.onerror = () => resolve(null);
+          } catch (e) { resolve(null); }
+        });
+      }
+
+      async function idbKvSet(k, v) {
+        const db = await openOfflineDb();
+        if (!db || !db.objectStoreNames.contains(SESSION_KV_STORE)) return false;
+        return await new Promise((resolve) => {
+          try {
+            const tx = db.transaction(SESSION_KV_STORE, 'readwrite');
+            if (v === null || v === undefined || v === '') {
+              tx.objectStore(SESSION_KV_STORE).delete(String(k));
+            } else {
+              tx.objectStore(SESSION_KV_STORE).put({ k: String(k), v });
+            }
             tx.oncomplete = () => resolve(true);
             tx.onerror = () => resolve(false);
           } catch (e) { resolve(false); }
@@ -1724,16 +1785,69 @@
         }
       }
 
-      // ================= NAVIGATION =================
+      // ================= NAVIGATION & TELEGRAM AUTH GATE (v37) =================
+      let pendingProtectedTab = '';
+      let authPulseTimer = null;
+
+      function isTelegramAuthorized() {
+        return Boolean(state.tgToken && state.user && state.user.tgId);
+      }
+
+      function updateAuthGateUI() {
+        const authed = isTelegramAuthorized();
+        const gate = $('tracksGuestGate');
+        const wrap = $('tracksAuthedWrap');
+        const navBtn = $('navTracksBtn');
+        const notice = $('authRedirectNotice');
+        const cntEl = $('libTotalCount');
+
+        if (gate) gate.style.display = authed ? 'none' : 'block';
+        if (wrap) wrap.style.display = authed ? 'block' : 'none';
+        if (navBtn) navBtn.classList.toggle('is-locked', !authed);
+        if (cntEl && !authed) cntEl.textContent = 'Требуется вход';
+        if (notice && authed) notice.classList.remove('show');
+      }
+
+      function promptTelegramAuthForTracks() {
+        pendingProtectedTab = 'viewTracks';
+        state.activeTab = 'viewProfile';
+        document.querySelectorAll('.tab-view').forEach(v => v.classList.toggle('active', v.id === 'viewProfile'));
+        document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'viewProfile'));
+        renderProfile();
+        const notice = $('authRedirectNotice');
+        if (notice) notice.classList.add('show');
+        const card = $('authCard');
+        if (card) {
+          card.classList.add('auth-pulse');
+          clearTimeout(authPulseTimer);
+          authPulseTimer = setTimeout(() => card.classList.remove('auth-pulse'), 2200);
+        }
+        const vp = $('viewProfile');
+        if (vp) vp.scrollTo({ top: 0, behavior: 'smooth' });
+        showToast('Авторизуйтесь через Telegram, чтобы открыть «Ваши треки»');
+      }
+
       function switchTab(tabId) {
+        if (tabId === 'viewTracks' && !isTelegramAuthorized()) {
+          promptTelegramAuthForTracks();
+          return;
+        }
         state.activeTab = tabId;
         document.querySelectorAll('.tab-view').forEach(v => v.classList.toggle('active', v.id === tabId));
         document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
         if (tabId === 'viewSearch' && !searchInput.value.trim() && (favRecsDirty || getFavoriteArtistsSignature() !== favRecsLastSig)) {
           performSearch(false);
         }
-        if (tabId === 'viewTracks') { renderLibrary(); refreshCloudAccountState(false); }
-        if (tabId === 'viewProfile') renderProfile();
+        if (tabId === 'viewTracks') {
+          updateAuthGateUI();
+          renderLibrary();
+          refreshCloudAccountState(false);
+        }
+        if (tabId === 'viewProfile') {
+          const notice = $('authRedirectNotice');
+          if (notice && pendingProtectedTab !== 'viewTracks') notice.classList.remove('show');
+          renderProfile();
+        }
       }
       document.querySelectorAll('.nav-btn').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
       topProfileBtn.addEventListener('click', () => switchTab('viewProfile'));
@@ -1864,6 +1978,8 @@
       }
 
       function renderLibrary() {
+        updateAuthGateUI();
+        if (!isTelegramAuthorized()) return;
         $('libTotalCount').textContent = `${state.libraryTracks.length} треков`;
         $('plCountLabel').textContent = String(state.playlists.length);
 
@@ -3267,11 +3383,18 @@
             body: JSON.stringify(payload)
           });
           if (resp.status === 401) {
-            clearTgSession(false);
+            const recovered = await tryRecoverSessionViaMiniApp();
+            if (recovered) return pushCloudSyncNow(notify);
+            let errData = null;
+            try { errData = await resp.json(); } catch (e) {}
+            if (errData && (errData.error === 'unauthorized' || errData.error === 'token_expired')) {
+              clearTgSession(false);
+            }
             return false;
           }
           const data = resp.ok ? await resp.json() : null;
           if (data && data.ok) {
+            if (data.refreshedToken) persistSessionCredentials(data.refreshedToken, state.user);
             if (data.syncedAt) lastCloudUpdatedAt = Number(data.syncedAt);
             const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
             setSyncStatus(`Синхронизировано · ${nowStr}`, false);
@@ -3291,14 +3414,21 @@
             headers: { 'Authorization': 'Bearer ' + state.tgToken }
           });
           if (resp.status === 401) {
-            clearTgSession(false);
+            const recovered = await tryRecoverSessionViaMiniApp();
+            if (recovered) return true;
+            let errData = null;
+            try { errData = await resp.json(); } catch (e) {}
+            if (errData && (errData.error === 'unauthorized' || errData.error === 'token_expired')) {
+              clearTgSession(false);
+            }
             return false;
           }
           const data = resp.ok ? await resp.json() : null;
           if (data && data.ok && data.user) {
-            state.user = data.user;
-            store.set('user', data.user);
+            const nextTok = data.refreshedToken || state.tgToken;
+            persistSessionCredentials(nextTok, data.user);
             renderProfile();
+            updateAuthGateUI();
             applyCloudState(data.state || {}, 'pull');
             if (notify) showToast('Медиатека аккаунта обновлена');
             return true;
@@ -3325,20 +3455,73 @@
         if (btn) btn.disabled = false;
       }
 
+      function persistSessionCredentials(token, user) {
+        if (typeof token === 'string') {
+          state.tgToken = token;
+          store.set('tgAuthToken', token);
+          writeSessionCookie(token);
+          idbKvSet('tgAuthToken', token).catch(() => {});
+        }
+        if (user !== undefined) {
+          state.user = user;
+          store.set('user', user);
+          idbKvSet('tgUser', user || null).catch(() => {});
+        }
+      }
+
+      async function hydrateSessionFromBackupStorage() {
+        let tok = state.tgToken || readSessionCookie() || '';
+        let usr = state.user;
+        if (!tok) {
+          const idbTok = await idbKvGet('tgAuthToken');
+          if (idbTok && typeof idbTok === 'string') tok = idbTok;
+        }
+        if (!usr || !usr.tgId) {
+          const idbUsr = await idbKvGet('tgUser');
+          if (idbUsr && idbUsr.tgId) usr = idbUsr;
+        }
+        if (tok) {
+          persistSessionCredentials(tok, usr || state.user);
+        }
+      }
+
+      async function tryRecoverSessionViaMiniApp() {
+        try {
+          const tgWebApp = window.Telegram && window.Telegram.WebApp;
+          if (!tgWebApp || !tgWebApp.initData || tgWebApp.initData.length < 20) return false;
+          const resp = await fetch(`${tgApiUrl('/api/auth/webapp')}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ initData: tgWebApp.initData })
+          });
+          const data = resp.ok ? await resp.json() : null;
+          if (data && data.ok && data.token && data.user) {
+            applyAuthorizedSession(data, false);
+            setSyncStatus('Подключено через Telegram Mini App', false);
+            return true;
+          }
+        } catch (e) {}
+        return false;
+      }
+
       function applyAuthorizedSession(data, notify = true) {
         if (!data || !data.token || !data.user) return;
         stopAuthPolling();
         lastCloudUpdatedAt = 0;
-        state.tgToken = data.token;
-        state.user = data.user;
-        store.set('tgAuthToken', data.token);
-        store.set('user', data.user);
+        persistSessionCredentials(data.token, data.user);
         $('authMsg').textContent = '';
+        const notice = $('authRedirectNotice');
+        if (notice) notice.classList.remove('show');
         renderProfile();
+        updateAuthGateUI();
         applyCloudState(data.state || {}, 'login_merge');
         if (notify) {
           const uname = data.user.username ? ('@' + data.user.username) : (data.user.firstName || 'Telegram');
           showToast('Вход через Telegram выполнен: ' + uname);
+        }
+        if (pendingProtectedTab === 'viewTracks') {
+          pendingProtectedTab = '';
+          switchTab('viewTracks');
         }
       }
 
@@ -3346,11 +3529,13 @@
         const oldToken = state.tgToken;
         stopAuthPolling();
         lastCloudUpdatedAt = 0;
-        state.tgToken = '';
-        state.user = null;
-        store.set('tgAuthToken', '');
-        store.set('user', null);
+        pendingProtectedTab = '';
+        persistSessionCredentials('', null);
         renderProfile();
+        updateAuthGateUI();
+        if (state.activeTab === 'viewTracks') {
+          switchTab('viewProfile');
+        }
         if (oldToken) {
           fetch(`${tgApiUrl('/api/user/logout')}`, {
             method: 'POST',
@@ -3361,25 +3546,19 @@
       }
 
       async function initTelegramAuth() {
-        // 1) Auto-login inside Telegram Mini App
-        try {
-          const tgWebApp = window.Telegram && window.Telegram.WebApp;
-          if (tgWebApp && tgWebApp.initData && tgWebApp.initData.length > 20) {
-            const resp = await fetch(`${tgApiUrl('/api/auth/webapp')}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ initData: tgWebApp.initData })
-            });
-            const data = resp.ok ? await resp.json() : null;
-            if (data && data.ok && data.token && data.user) {
-              applyAuthorizedSession(data, false);
-              setSyncStatus('Подключено через Telegram Mini App', false);
-              return;
-            }
-          }
-        } catch (e) {}
+        await hydrateSessionFromBackupStorage();
+        renderProfile();
+        updateAuthGateUI();
 
-        // 2) Restore existing browser session via saved token
+        if (isOfflineEffective()) {
+          if (isTelegramAuthorized()) setSyncStatus('Оффлайн · аккаунт сохранён', false);
+          return;
+        }
+
+        // 1) Auto-login inside Telegram Mini App
+        if (await tryRecoverSessionViaMiniApp()) return;
+
+        // 2) Restore existing long-lived session (180 days, auto-refreshed)
         if (state.tgToken) {
           const ok = await refreshCloudAccountState(false);
           if (ok) {
@@ -3389,9 +3568,9 @@
         }
 
         if (state.user && !state.user.tgId) {
-          state.user = null;
-          store.set('user', null);
+          persistSessionCredentials('', null);
           renderProfile();
+          updateAuthGateUI();
         }
       }
 
@@ -3499,6 +3678,16 @@
         switchTab('viewProfile');
       });
 
+      const tracksGateBtn = $('tracksGateLoginBtn');
+      if (tracksGateBtn) {
+        tracksGateBtn.addEventListener('click', () => {
+          pendingProtectedTab = 'viewTracks';
+          switchTab('viewProfile');
+          const btn = $('tgLoginBtn');
+          if (btn && !btn.disabled) btn.click();
+        });
+      }
+
       $('tgLoginBtn').addEventListener('click', async () => {
         const msg = $('authMsg');
         msg.textContent = '';
@@ -3576,7 +3765,7 @@
       });
 
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && state.tgToken) {
+        if (!document.hidden && state.tgToken && !isOfflineEffective()) {
           refreshCloudAccountState(false);
         }
       });
@@ -3794,11 +3983,11 @@
       initCrossSwipe();
       initPlayerLoopAndVisualizer();
       initTelegramMiniApp();
-      initOfflineStorage().then(() => {
+      initOfflineStorage().then(async () => {
         updateOfflineUI();
+        await initTelegramAuth();
         if (!isOfflineEffective()) {
           checkTgBotStatus();
-          initTelegramAuth();
         }
         performSearch();
       });
