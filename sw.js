@@ -1,23 +1,49 @@
-/* APATHY Chrome Music Player — Service Worker (v39 Offline Shell & Artwork Cache) */
-const SHELL_CACHE = 'apathy-shell-v39';
-const ART_CACHE = 'apathy-art-v39';
+/* APATHY Chrome Music Player — Service Worker (v45 iOS Standalone Offline Fix) */
+const SHELL_CACHE = 'apathy-shell-v45';
+const ART_CACHE = 'apathy-art-v45';
 
 const SHELL_ASSETS = [
-  './',
-  './index.html',
-  './style.css?v=32',
-  './app.js?v=32',
-  './manifest.json',
-  './icon.png',
-  './bg-chrome.jpg',
-  './bg-purple.jpg',
-  './bg-red.jpg'
+  '/',
+  '/style.css?v=41',
+  '/app.js?v=41',
+  '/manifest.json',
+  '/icon.png',
+  '/icon-512.png',
+  '/bg-chrome.jpg',
+  '/bg-purple.jpg',
+  '/bg-red.jpg'
 ];
+
+// iOS WebKit strictly rejects cached responses with redirected === true during navigation.
+// Rebuilding into a fresh Response strips the redirected flag safely.
+async function stripRedirect(resp) {
+  if (!resp) return resp;
+  if (!resp.redirected && resp.status === 200) return resp;
+  try {
+    const body = await resp.arrayBuffer();
+    const headers = new Headers(resp.headers);
+    return new Response(body, {
+      status: resp.status || 200,
+      statusText: resp.statusText || 'OK',
+      headers
+    });
+  } catch (e) {
+    return resp;
+  }
+}
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(SHELL_CACHE)
-      .then((cache) => Promise.allSettled(SHELL_ASSETS.map((u) => cache.add(u))))
+      .then((cache) => Promise.allSettled(
+        SHELL_ASSETS.map(async (u) => {
+          const resp = await fetch(u, { cache: 'reload' });
+          if (resp && resp.ok) {
+            const clean = await stripRedirect(resp);
+            await cache.put(u, clean);
+          }
+        })
+      ))
       .then(() => self.skipWaiting())
   );
 });
@@ -38,15 +64,19 @@ async function networkFirstNavigation(request) {
   const cache = await caches.open(SHELL_CACHE);
   try {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 3000);
+    const timer = setTimeout(() => ctrl.abort(), 2800);
     const resp = await fetch(request, { signal: ctrl.signal });
     clearTimeout(timer);
     if (resp && resp.ok) {
-      cache.put('./index.html', resp.clone()).catch(() => {});
-      return resp;
+      const clean = await stripRedirect(resp.clone());
+      cache.put('/', clean.clone()).catch(() => {});
+      return resp.redirected ? clean : resp;
     }
   } catch (e) {}
-  return (await cache.match('./index.html')) || (await cache.match('./')) || new Response('Offline', { status: 503 });
+
+  const cached = (await cache.match('/')) || (await cache.match('/index.html')) || (await cache.match(request, { ignoreSearch: true }));
+  if (cached) return await stripRedirect(cached);
+  return new Response('Offline', { status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
 }
 
 async function cacheFirstAsset(request, cacheName, maxEntries = 0) {
@@ -56,7 +86,8 @@ async function cacheFirstAsset(request, cacheName, maxEntries = 0) {
   try {
     const resp = await fetch(request);
     if (resp && (resp.ok || resp.type === 'opaque')) {
-      cache.put(request, resp.clone()).then(async () => {
+      const toStore = resp.type === 'opaque' ? resp.clone() : await stripRedirect(resp.clone());
+      cache.put(request, toStore).then(async () => {
         if (maxEntries > 0) {
           const keys = await cache.keys();
           if (keys.length > maxEntries) {
@@ -92,13 +123,15 @@ self.addEventListener('fetch', (event) => {
     url.pathname.startsWith('/api/user/me') ||
     url.pathname.startsWith('/api/user/sync') ||
     url.pathname.startsWith('/api/user/logout') ||
+    url.pathname.startsWith('/api/app/') ||
+    url.pathname.startsWith('/api/playlists/') ||
     url.hostname.includes('lrclib.net') ||
     url.hostname.includes('telegram.org')
   ) {
     return;
   }
 
-  // Page navigations -> network-first with instant offline fallback to index.html
+  // Page navigations -> network-first with instant non-redirected offline fallback
   if (req.mode === 'navigate') {
     event.respondWith(networkFirstNavigation(req));
     return;

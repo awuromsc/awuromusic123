@@ -46,7 +46,14 @@
         offlineDownloadingIds: new Set(),
         offlineBytes: 0,
         offlineMode: Boolean(store.get('offlineMode', false)),
-        autoOfflineCache: store.get('autoOfflineCache', true) !== false
+        autoOfflineCache: store.get('autoOfflineCache', true) !== false,
+        searchMode: 'tracks',
+        publicPlSort: 'popular',
+        publicPlaylists: [],
+        publishedMap: store.get('publishedMap', {}) || {},
+        subscribedPlaylists: Array.isArray(store.get('subscribedPlaylists', [])) ? store.get('subscribedPlaylists', []) : [],
+        selectedSubPlaylistId: null,
+        activePublicModalPl: null
       };
 
       savedCatalogTracks.forEach(t => {
@@ -164,6 +171,8 @@
         }
       };
       let activeVizPalette = THEME_META.chrome;
+      let syncVizLoopState = () => {};
+      let rebuildVizStaticLayer = () => {};
 
       function applyTheme(themeKey, notify = false) {
         if (!THEME_META[themeKey]) themeKey = 'chrome';
@@ -176,6 +185,7 @@
           btn.classList.toggle('active', btn.dataset.setTheme === themeKey);
         });
         store.set('theme', themeKey);
+        rebuildVizStaticLayer();
         if (notify) { showToast('Тема: ' + THEME_META[themeKey].label); scheduleCloudSync(); }
       }
 
@@ -496,7 +506,7 @@
 
       function registerServiceWorker() {
         if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
-          navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => {});
+          navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
         }
       }
 
@@ -1064,7 +1074,11 @@
       async function performSearch(forceFresh = false) {
         const q = searchInput.value.trim();
         searchClear.classList.toggle('show', q.length > 0);
-        viewSearch.classList.toggle('has-results', q.length > 0);
+        viewSearch.classList.toggle('has-results', q.length > 0 || state.searchMode === 'playlists');
+        if (state.searchMode === 'playlists') {
+          await fetchPublicPlaylists(q, state.publicPlSort);
+          return;
+        }
 
         const seq = ++searchSeq;
         const favArtists = !q ? getFavoriteArtistsList(10) : [];
@@ -1240,8 +1254,17 @@
       let streamWatchdogTimer = null;
       let retryCountForTrack = 0;
 
+      let audioCtxSuspendTimer = null;
+
+      function suspendAudioCtxIfIdle() {
+        clearTimeout(audioCtxSuspendTimer);
+        audioCtxSuspendTimer = null;
+        if (audioCtx && audioCtx.state === 'running' && (!state.isPlaying || currentAudioMode !== 'synth')) {
+          try { audioCtx.suspend().catch(() => {}); } catch (e) {}
+        }
+      }
+
       function unlockAudioForIos() {
-        ensureAudioCtx();
         if (iosHtmlAudioUnlocked) return;
         try {
           if (!htmlAudio.src || htmlAudio.paused) {
@@ -1335,10 +1358,17 @@
           osc.connect(gain); gain.connect(masterGain);
           osc.start(now + i * 0.045); osc.stop(now + i * 0.045 + 0.6);
         });
+        clearTimeout(audioCtxSuspendTimer);
+        audioCtxSuspendTimer = setTimeout(suspendAudioCtxIfIdle, 800);
       }
 
       function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
-      function stopSynthLoop() { if (synthTimer) { clearInterval(synthTimer); synthTimer = null; } }
+      let synthClockTimer = null;
+      function stopSynthLoop() {
+        if (synthTimer) { clearInterval(synthTimer); synthTimer = null; }
+        if (synthClockTimer) { clearInterval(synthClockTimer); synthClockTimer = null; }
+        suspendAudioCtxIfIdle();
+      }
 
       function startSynthLoop(track) {
         stopSynthLoop();
@@ -1406,6 +1436,16 @@
         };
         triggerStep();
         synthTimer = setInterval(triggerStep, stepMs);
+        synthClockTimer = setInterval(() => {
+          if (!state.isPlaying || currentAudioMode !== 'synth' || !state.currentTrack) return;
+          state.currentTime += 0.25;
+          if (state.currentTime >= (state.currentTrack.duration || 180)) {
+            if (state.repeat) { state.currentTime = 0; startSynthLoop(state.currentTrack); }
+            else nextTrack();
+            return;
+          }
+          syncTimeAndLyrics(false);
+        }, 250);
       }
 
       function clearStreamWatchdog() {
@@ -1434,6 +1474,34 @@
           if (ev === 'playing' && state.currentTrack) {
             updatePlayerUI();
             scheduleAutoCacheCurrentTrack(state.currentTrack);
+            syncVizLoopState();
+            syncAndroidMediaNotification(true);
+          } else if (ev === 'pause') {
+            syncVizLoopState();
+            syncAndroidMediaNotification(true);
+          } else if (ev === 'ended' && state.isPlaying && state.currentTrack && currentAudioMode === 'stream') {
+            if (htmlAudio.src && htmlAudio.src !== SILENT_WAV_URI) {
+              if (state.repeat) { seekTo(0); htmlAudio.play().catch(() => {}); }
+              else nextTrack();
+            }
+          }
+        });
+      });
+
+      ['loadedmetadata', 'durationchange', 'timeupdate'].forEach(ev => {
+        htmlAudio.addEventListener(ev, () => {
+          if (!state.currentTrack || currentAudioMode !== 'stream') return;
+          if (!htmlAudio.src || htmlAudio.src === SILENT_WAV_URI) return;
+          const track = state.currentTrack;
+          if (isFinite(htmlAudio.duration) && htmlAudio.duration > 1 && Math.abs((track.duration || 0) - htmlAudio.duration) > 1) {
+            track.duration = htmlAudio.duration;
+            $('totTime').textContent = fmtTime(track.duration);
+            $('playerScrubber').max = track.duration;
+            syncAndroidMediaNotification(true);
+          }
+          if (ev === 'timeupdate' && state.isPlaying) {
+            state.currentTime = htmlAudio.currentTime || 0;
+            if (!document.hidden) syncTimeAndLyrics(false);
           }
         });
       });
@@ -1469,6 +1537,93 @@
 
       htmlAudio.addEventListener('error', () => handleBotStreamError('error'));
 
+      let lastAndroidMediaSig = '';
+
+      function resolveAbsMediaUrl(rawUrl) {
+        const u = String(rawUrl || '').trim();
+        if (!u) return '';
+        if (/^https?:\/\//i.test(u)) return u;
+        try { return new URL(u, location.origin).href; } catch (e) { return ''; }
+      }
+
+      function syncAndroidMediaNotification(force = false) {
+        const track = state.currentTrack;
+        if (!track) return;
+
+        const isPlaying = Boolean(state.isPlaying);
+        const rawDur = (currentAudioMode === 'stream' && isFinite(htmlAudio.duration) && htmlAudio.duration > 0)
+          ? htmlAudio.duration
+          : (track.duration || 0);
+        const rawPos = (currentAudioMode === 'stream' && htmlAudio.src && htmlAudio.src !== SILENT_WAV_URI && isFinite(htmlAudio.currentTime))
+          ? htmlAudio.currentTime
+          : (state.currentTime || 0);
+
+        const durationMs = Math.max(0, Math.round(rawDur * 1000));
+        const positionMs = Math.max(0, Math.min(durationMs > 0 ? durationMs : 86400000, Math.round(rawPos * 1000)));
+
+        // Sync standard browser MediaSession playback & timeline state (iOS / Desktop / Chrome)
+        if ('mediaSession' in navigator) {
+          try {
+            navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+            if (typeof navigator.mediaSession.setPositionState === 'function' && rawDur > 0 && isFinite(rawDur)) {
+              navigator.mediaSession.setPositionState({
+                duration: rawDur,
+                playbackRate: 1,
+                position: Math.max(0, Math.min(rawDur, rawPos))
+              });
+            }
+          } catch (e) {}
+        }
+
+        // Sync native Android APK MediaSession notification shade & lockscreen widget
+        const bridge = window.ApathyAndroid;
+        if (!bridge || typeof bridge.updateMediaState !== 'function') return;
+
+        const title = String(track.title || 'APATHY');
+        const artist = String(track.artist || 'APATHY Music');
+        const artworkUrl = resolveAbsMediaUrl(track.artwork || '');
+        const sig = `${track.id}|${isPlaying ? 1 : 0}|${Math.round(durationMs / 1000)}|${Math.round(positionMs / 1000)}|${artworkUrl}`;
+        if (!force && sig === lastAndroidMediaSig) return;
+        lastAndroidMediaSig = sig;
+
+        try {
+          bridge.updateMediaState(title, artist, artworkUrl, isPlaying, positionMs, durationMs);
+        } catch (e) {}
+      }
+
+      // Entrypoint invoked by Android MediaSessionCompat (notification buttons, lockscreen, Bluetooth headset)
+      window.__apathyMediaCommand = function(action, argMs) {
+        try {
+          switch (action) {
+            case 'play':
+              if (state.currentTrack) {
+                if (!state.isPlaying) resumePlayback();
+              } else {
+                togglePlayPause();
+              }
+              break;
+            case 'pause':
+            case 'stop':
+              if (state.isPlaying) pausePlayback();
+              break;
+            case 'toggle':
+              togglePlayPause();
+              break;
+            case 'next':
+              nextTrack();
+              break;
+            case 'prev':
+              prevTrack();
+              break;
+            case 'seek':
+              if (typeof argMs === 'number' && isFinite(argMs) && state.currentTrack) {
+                seekTo(argMs / 1000);
+              }
+              break;
+          }
+        } catch (e) {}
+      };
+
       function updateMediaSession(track) {
         if ('mediaSession' in navigator && track) {
           try {
@@ -1482,8 +1637,16 @@
             navigator.mediaSession.setActionHandler('pause', pausePlayback);
             navigator.mediaSession.setActionHandler('nexttrack', nextTrack);
             navigator.mediaSession.setActionHandler('previoustrack', prevTrack);
+            try {
+              navigator.mediaSession.setActionHandler('seekto', (details) => {
+                if (details && typeof details.seekTime === 'number' && isFinite(details.seekTime)) {
+                  seekTo(details.seekTime);
+                }
+              });
+            } catch (e) {}
           } catch (e) {}
         }
+        syncAndroidMediaNotification(true);
       }
 
       // ================= SPLASH SCREEN (ULTRA-SMOOTH GPU UNLOCK v33) =================
@@ -1495,29 +1658,35 @@
         const canvas = $('splashParticles');
         if (!canvas) return;
         const ctx = canvas.getContext('2d', { alpha: true });
-        let w = 0, h = 0, dpr = 1;
-        const pts = Array.from({ length: 26 }, () => ({
-          x: Math.random(), y: Math.random(), r: Math.random() * 1.5 + 0.55,
-          vx: (Math.random() - 0.5) * 0.00042, vy: -Math.random() * 0.00062 - 0.00018, a: Math.random() * 0.45 + 0.18
+        let w = 0, h = 0;
+        let lastFrameMs = 0;
+        const FRAME_MS = 1000 / 30;
+        const pts = Array.from({ length: 20 }, () => ({
+          x: Math.random(), y: Math.random(), r: Math.random() * 1.4 + 0.55,
+          vx: (Math.random() - 0.5) * 0.0007, vy: -Math.random() * 0.0010 - 0.0003, a: Math.random() * 0.45 + 0.18
         }));
 
         function resize() {
           const rect = splashScreen.getBoundingClientRect();
-          dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-          w = canvas.width = Math.max(1, Math.round(rect.width * dpr));
-          h = canvas.height = Math.max(1, Math.round(rect.height * dpr));
+          w = canvas.width = Math.max(1, Math.round(rect.width));
+          h = canvas.height = Math.max(1, Math.round(rect.height));
         }
         resize();
         window.addEventListener('resize', () => {
           if (!splashScreen.classList.contains('hidden')) resize();
         });
 
-        function draw() {
+        function draw(now) {
           if (!splashParticlesActive || splashScreen.classList.contains('hidden') || document.hidden) {
             splashParticlesActive = false;
             splashParticlesRaf = 0;
             return;
           }
+          if (now - lastFrameMs < FRAME_MS) {
+            splashParticlesRaf = requestAnimationFrame(draw);
+            return;
+          }
+          lastFrameMs = now;
           ctx.clearRect(0, 0, w, h);
           ctx.fillStyle = activeVizPalette.hi;
           for (let i = 0; i < pts.length; i++) {
@@ -1529,23 +1698,21 @@
             else if (p.x > 1) p.x = 0;
             ctx.globalAlpha = p.a;
             ctx.beginPath();
-            ctx.arc(p.x * w, p.y * h, p.r * dpr, 0, Math.PI * 2);
+            ctx.arc(p.x * w, p.y * h, p.r, 0, Math.PI * 2);
             ctx.fill();
           }
           ctx.globalAlpha = 1;
           splashParticlesRaf = requestAnimationFrame(draw);
         }
 
-        startSplashParticlesLoop = () => {
-          if (splashParticlesActive) return;
-          resize();
+        startSplashParticles = () => {
+          if (splashParticlesActive || splashScreen.classList.contains('hidden') || document.hidden) return;
           splashParticlesActive = true;
+          lastFrameMs = 0;
+          resize();
           splashParticlesRaf = requestAnimationFrame(draw);
         };
-
-        if (!splashScreen.classList.contains('hidden')) {
-          startSplashParticlesLoop();
-        }
+        startSplashParticles();
       }
 
       let chromeFlashTimer = null;
@@ -1845,6 +2012,9 @@
           if (e.target.closest('[data-delete-lib]')) { e.stopPropagation(); deleteTrackFromLibrary(track); return; }
           if (e.target.closest('[data-like]')) { e.stopPropagation(); toggleLike(track); return; }
           if (context === 'search') state.activeQueue = [...state.searchResults];
+          else if (context === 'public' && state.activePublicModalPl && Array.isArray(state.activePublicModalPl.tracks)) {
+            state.activeQueue = [...state.activePublicModalPl.tracks];
+          }
           else state.activeQueue = getVisibleLibraryTracks();
           playTrack(track, true);
         });
@@ -1853,6 +2023,10 @@
 
       // ================= PLAYLISTS & LIBRARY =================
       function getVisibleLibraryTracks() {
+        if (state.selectedSubPlaylistId) {
+          const sub = (state.subscribedPlaylists || []).find(p => p && p.id === state.selectedSubPlaylistId);
+          return (sub && Array.isArray(sub.tracks)) ? sub.tracks : [];
+        }
         if (state.selectedPlaylistId) {
           const pl = state.playlists.find(p => p.id === state.selectedPlaylistId);
           if (!pl) return [];
@@ -1870,8 +2044,9 @@
       function renderLibrary() {
         updateLibraryAuthGate();
         if (!isUserAuthenticated()) return;
+        const subs = Array.isArray(state.subscribedPlaylists) ? state.subscribedPlaylists : [];
         $('libTotalCount').textContent = `${state.libraryTracks.length} треков`;
-        $('plCountLabel').textContent = String(state.playlists.length);
+        $('plCountLabel').textContent = String(state.playlists.length + subs.length);
 
         const strip = $('playlistStrip');
         strip.innerHTML = '';
@@ -1887,34 +2062,109 @@
         createCard.addEventListener('click', () => openPlaylistModal(null));
         strip.appendChild(createCard);
 
+        // 1) User's own playlists
         state.playlists.forEach(pl => {
           const card = document.createElement('button');
-          const active = state.selectedPlaylistId === pl.id;
-          card.className = 'pl-card' + (active ? ' active' : '');
+          const active = state.selectedPlaylistId === pl.id && !state.selectedSubPlaylistId;
+          const isPub = Boolean(state.publishedMap && state.publishedMap[pl.id]);
+          card.className = 'pl-card' + (active ? ' active' : '') + (isPub ? ' is-public' : '');
           card.innerHTML = `
-            <div class="pl-card-name">${escapeHtml(pl.name)}</div>
+            <div class="pl-card-top-row">
+              <div class="pl-card-name">${escapeHtml(pl.name)}</div>
+              ${isPub ? '<span class="pl-card-badge">Публ.</span>' : ''}
+            </div>
             <div class="pl-card-meta"><span>${pl.trackIds.length} трек.</span><span>›</span></div>
           `;
           card.addEventListener('click', () => {
+            state.selectedSubPlaylistId = null;
             state.selectedPlaylistId = (state.selectedPlaylistId === pl.id) ? null : pl.id;
             renderLibrary();
           });
           strip.appendChild(card);
         });
 
+        // 2) Live-subscribed community playlists
+        subs.forEach(sub => {
+          if (!sub || !sub.id) return;
+          const card = document.createElement('button');
+          const active = state.selectedSubPlaylistId === sub.id;
+          const authorLabel = sub.author && sub.author.username
+            ? '@' + sub.author.username
+            : ((sub.author && sub.author.displayName) || 'Автор');
+          const trCount = Array.isArray(sub.tracks) ? sub.tracks.length : (sub.trackCount || 0);
+          card.className = 'pl-card is-sub' + (active ? ' active' : '');
+          card.innerHTML = `
+            <div class="pl-card-top-row">
+              <div class="pl-card-name">${escapeHtml(sub.name)}</div>
+              <span class="pl-card-badge">Подп.</span>
+            </div>
+            <div class="pl-card-author">${escapeHtml(authorLabel)}</div>
+            <div class="pl-card-meta"><span>${trCount} трек.</span><span>♥ ${sub.likesCount || 0}</span></div>
+          `;
+          card.addEventListener('click', () => {
+            state.selectedPlaylistId = null;
+            state.selectedSubPlaylistId = (state.selectedSubPlaylistId === sub.id) ? null : sub.id;
+            renderLibrary();
+          });
+          strip.appendChild(card);
+        });
+
         const activePlBar = $('activePlBar'), libFilterChips = $('libFilterChips');
-        if (state.selectedPlaylistId) {
+        const pubBtn = $('publishActivePlBtn');
+        const likeSubBtn = $('likeSubPlBtn');
+        const shareBtn = $('shareActivePlBtn');
+        const unsubBtn = $('unsubActivePlBtn');
+        const delBtn = $('deleteActivePlBtn');
+        const badgeEl = $('activePlBadge');
+
+        if (state.selectedSubPlaylistId) {
+          const sub = subs.find(p => p && p.id === state.selectedSubPlaylistId);
+          if (sub) {
+            const authorLabel = sub.author && sub.author.username
+              ? '@' + sub.author.username
+              : ((sub.author && sub.author.displayName) || 'Пользователь');
+            const trCount = Array.isArray(sub.tracks) ? sub.tracks.length : (sub.trackCount || 0);
+            activePlBar.classList.add('show');
+            libFilterChips.style.display = 'none';
+            $('activePlTitle').textContent = sub.name;
+            $('activePlSub').textContent = `${authorLabel} · ${trCount} трек. · обновляется автором`;
+            badgeEl.textContent = 'Подписка';
+            badgeEl.style.display = 'inline-flex';
+            pubBtn.style.display = 'none';
+            delBtn.style.display = 'none';
+            likeSubBtn.style.display = 'inline-flex';
+            likeSubBtn.textContent = `${sub.isLiked ? '♥' : '♡'} ${sub.likesCount || 0}`;
+            likeSubBtn.classList.toggle('is-liked', Boolean(sub.isLiked));
+            shareBtn.style.display = 'inline-flex';
+            unsubBtn.style.display = 'inline-flex';
+          } else {
+            state.selectedSubPlaylistId = null;
+          }
+        } else if (state.selectedPlaylistId) {
           const pl = state.playlists.find(p => p.id === state.selectedPlaylistId);
           if (pl) {
+            const pubId = state.publishedMap && state.publishedMap[pl.id];
             activePlBar.classList.add('show');
             libFilterChips.style.display = 'none';
             $('activePlTitle').textContent = pl.name;
-            $('activePlSub').textContent = `${pl.trackIds.length} трек(ов)`;
+            $('activePlSub').textContent = pubId
+              ? `${pl.trackIds.length} трек(ов) · доступен всем в поиске`
+              : `${pl.trackIds.length} трек(ов) · личный плейлист`;
+            badgeEl.textContent = 'Публичный';
+            badgeEl.style.display = pubId ? 'inline-flex' : 'none';
+            pubBtn.style.display = 'inline-flex';
+            pubBtn.textContent = pubId ? '✓ Опубликован' : 'Опубликовать';
+            pubBtn.classList.toggle('is-active-pub', Boolean(pubId));
+            shareBtn.style.display = pubId ? 'inline-flex' : 'none';
+            likeSubBtn.style.display = 'none';
+            unsubBtn.style.display = 'none';
+            delBtn.style.display = 'flex';
           } else {
             state.selectedPlaylistId = null;
           }
         }
-        if (!state.selectedPlaylistId) {
+
+        if (!state.selectedPlaylistId && !state.selectedSubPlaylistId) {
           activePlBar.classList.remove('show');
           libFilterChips.style.display = 'flex';
         }
@@ -1923,18 +2173,19 @@
         libraryTrackList.innerHTML = '';
         if (!list.length) {
           libraryTrackList.innerHTML = `<div style="text-align:center;padding:30px 12px;color:var(--text-dim);font-size:13px;">
-            ${state.selectedPlaylistId
-              ? 'В этом плейлисте пока нет треков — найдите музыку в «Поиске» и нажмите «+»'
-              : 'Здесь пока пусто — добавьте треки из поиска, через Telegram-бота или загрузите свои MP3'}
+            ${state.selectedSubPlaylistId
+              ? 'В этом плейлисте пока нет доступных треков.'
+              : (state.selectedPlaylistId
+                ? 'В этом плейлисте пока нет треков — найдите песню в Поиске и нажмите «+».'
+                : 'Список пуст. Найдите трек в Поиске или загрузите MP3/M4A с устройства.')}
           </div>`;
           return;
         }
-        const ctx = state.selectedPlaylistId ? 'playlist' : 'library';
+        const ctx = state.selectedSubPlaylistId
+          ? 'sub_playlist'
+          : (state.selectedPlaylistId ? 'playlist' : 'library');
         list.forEach(t => libraryTrackList.appendChild(buildTrackRow(t, ctx)));
       }
-
-      // ================= PLAYLIST PICKER MODAL =================
-      const playlistModal = $('playlistModal');
 
       function openPlaylistModal(track) {
         state.modalTrack = track || null;
@@ -2126,8 +2377,12 @@
 
       $('deleteActivePlBtn').addEventListener('click', () => {
         if (!state.selectedPlaylistId) return;
-        const pl = state.playlists.find(p => p.id === state.selectedPlaylistId);
-        state.playlists = state.playlists.filter(p => p.id !== state.selectedPlaylistId);
+        const plId = state.selectedPlaylistId;
+        const pl = state.playlists.find(p => p.id === plId);
+        if (state.publishedMap && state.publishedMap[plId]) {
+          unpublishPlaylistBySourceId(plId, true);
+        }
+        state.playlists = state.playlists.filter(p => p.id !== plId);
         state.selectedPlaylistId = null;
         persistPlaylists(true);
         renderLibrary();
@@ -2309,6 +2564,8 @@
           startSynthLoop(track);
         }
         updatePlayerUI();
+        syncVizLoopState();
+        syncAndroidMediaNotification(true);
         renderSearchResultsList();
         renderLibrary();
       }
@@ -2319,6 +2576,8 @@
         stopSynthLoop();
         if (currentAudioMode === 'stream') htmlAudio.pause();
         updatePlayerUI();
+        syncVizLoopState();
+        syncAndroidMediaNotification(true);
         renderSearchResultsList();
         renderLibrary();
       }
@@ -2372,17 +2631,20 @@
           startSynthLoop(track);
         }
         syncTimeAndLyrics(true);
+        syncAndroidMediaNotification(true);
       }
 
       function openPlayerOverlay() {
         triggerChromeFlash();
         playerOverlay.classList.add('open');
         playerOverlay.setAttribute('aria-hidden', 'false');
+        syncVizLoopState();
         setTimeout(() => syncTimeAndLyrics(true), 120);
       }
       function closePlayerOverlay() {
         playerOverlay.classList.remove('open');
         playerOverlay.setAttribute('aria-hidden', 'true');
+        syncVizLoopState();
       }
 
       function updatePlayerLikeUI() {
@@ -2461,16 +2723,37 @@
         });
       }
 
+      let lastRenderedTimeStr = '';
+      let lastMiniPctKey = -1;
+      let lastScrubVal = -1;
+
       function syncTimeAndLyrics(forceScroll = false) {
         const track = state.currentTrack;
         if (!track) return;
         const dur = track.duration || 1;
         const pct = Math.min(100, (state.currentTime / dur) * 100);
-        $('curTime').textContent = fmtTime(state.currentTime);
-        $('playerScrubber').value = state.currentTime;
-        $('miniProgress').style.width = pct + '%';
+        const pctKey = Math.round(pct * 2);
+        if (pctKey !== lastMiniPctKey || forceScroll) {
+          lastMiniPctKey = pctKey;
+          $('miniProgress').style.width = (pctKey / 2) + '%';
+        }
+
+        const isOverlayOpen = playerOverlay.classList.contains('open');
+        if (!isOverlayOpen && !forceScroll) return;
+
+        const tStr = fmtTime(state.currentTime);
+        if (tStr !== lastRenderedTimeStr || forceScroll) {
+          lastRenderedTimeStr = tStr;
+          $('curTime').textContent = tStr;
+        }
+        const scrubQ = Math.round(state.currentTime * 4) / 4;
+        if (scrubQ !== lastScrubVal || forceScroll) {
+          lastScrubVal = scrubQ;
+          $('playerScrubber').value = state.currentTime;
+        }
 
         const lines = track.lyrics || [];
+        if (!lines.length) return;
         const effectiveTime = state.currentTime + state.lyricsOffset;
         let activeIdx = -1;
         for (let i = 0; i < lines.length; i++) {
@@ -2495,11 +2778,19 @@
       function initPlayerLoopAndVisualizer() {
         const canvas = $('playerVizCanvas');
         const ctx = canvas.getContext('2d', { alpha: true });
-        let cw = 0, ch = 0, dpr = 1;
+        const staticCanvas = document.createElement('canvas');
+        const staticCtx = staticCanvas.getContext('2d', { alpha: true });
+
+        let cw = 0, ch = 0;
         let windTime = 0;
-        let windSpeedCur = 0.12;
-        let windAmpCur = 0.18;
+        let windSpeedCur = 0.14;
+        let windAmpCur = 0.22;
         let pulseCur = 0;
+        let vizRaf = 0;
+        let lastFrameAt = 0;
+        let veilGrad = null;
+        let analyserBins = null;
+        const TARGET_FRAME_MS = 1000 / 24;
 
         function mulberry32(seed) {
           let a = seed >>> 0;
@@ -2511,7 +2802,6 @@
           };
         }
 
-        // Pre-built bare gnarled branching trees (flat node arrays for 60fps zero-GC traversal)
         let treesBack = [];
         let treesMid = [];
         let treesFore = [];
@@ -2527,7 +2817,6 @@
             baseAngle, spread, layer, phase, swayScale, hasLeaves
           } = opts;
 
-          // Recursive builder into flat array: parentIdx, relAngle, len, width, curve, flex, depth, leafClusters
           function grow(parentIdx, relAngle, len, width, depth) {
             const idx = nodes.length;
             const curve = (rand() - 0.5) * 0.42;
@@ -2556,35 +2845,29 @@
               depth,
               phaseOff: rand() * 1.8,
               leaves,
-              // Runtime scratchpad (no allocations per frame!)
               x0: 0, y0: 0, x1: 0, y1: 0, cx: 0, cy: 0, absAng: 0
             });
 
             if (depth >= maxDepth) return;
 
-            // Main fork count (organic bare winter tree silhouette like reference photo)
             const children = depth === 0
               ? (2 + (rand() < 0.72 ? 1 : 0))
               : (depth === 1 ? (2 + (rand() < 0.55 ? 1 : 0)) : 2);
 
             for (let c = 0; c < children; c++) {
               const tSlot = children === 1 ? 0 : (c / (children - 1) - 0.5);
-              // Spread outward naturally with crooked natural jitter
               const fan = spread * (depth === 0 ? 1.15 : (depth === 1 ? 1.0 : 0.86));
               const childRel = tSlot * fan + (rand() - 0.5) * 0.34;
-              const lenScale = depth === 0
-                ? (0.58 + rand() * 0.22)
-                : (0.64 + rand() * 0.22);
+              const lenScale = depth === 0 ? (0.58 + rand() * 0.22) : (0.64 + rand() * 0.22);
               const childLen = len * lenScale;
-              const childW = Math.max(0.55, width * (0.58 + rand() * 0.14));
+              const childW = Math.max(0.65, width * (0.58 + rand() * 0.14));
               if (childLen < 0.012) continue;
               grow(idx, childRel, childLen, childW, depth + 1);
             }
 
-            // Extra subtle side twig emerging mid-limb on primary/secondary branches
-            if (depth <= 1 && rand() < 0.65 && nodes.length < 72) {
+            if (depth <= 1 && rand() < 0.60 && nodes.length < 62) {
               const sideSign = rand() < 0.5 ? -1 : 1;
-              grow(idx, sideSign * (0.48 + rand() * 0.38), len * (0.42 + rand() * 0.16), Math.max(0.55, width * 0.48), depth + 2);
+              grow(idx, sideSign * (0.48 + rand() * 0.38), len * (0.42 + rand() * 0.16), Math.max(0.65, width * 0.48), depth + 2);
             }
           }
 
@@ -2601,7 +2884,6 @@
           driftingCrosses = [];
           windMotes = [];
 
-          // Subtle rolling dark hill silhouette along bottom 14%
           hillPoints = [];
           for (let i = 0; i <= 16; i++) {
             const xn = i / 16;
@@ -2609,7 +2891,6 @@
             hillPoints.push({ xn, yn });
           }
 
-          // 1) Distant misty bare silhouettes (smaller, softer, deeper in fog)
           const backXs = [0.06, 0.17, 0.29, 0.41, 0.54, 0.67, 0.79, 0.91];
           backXs.forEach((bx) => {
             const xNorm = bx + (rand() - 0.5) * 0.05;
@@ -2628,7 +2909,6 @@
             }));
           });
 
-          // 2) Main mid-ground gnarled leafless trees (center-right & left-mid, matching reference silhouettes)
           const midSpecs = [
             { x: 0.14, len: 0.20, w: 4.2, spread: 1.05, leaves: true },
             { x: 0.34, len: 0.18, w: 3.6, spread: 1.12, leaves: false },
@@ -2653,7 +2933,6 @@
             }));
           });
 
-          // 3) Foreground framing gnarled dark branches (left tree with dark sparse autumn leaves + upper-left & right overhanging limbs)
           treesFore.push(createBranchingTree(rand, {
             rootX: 0.03,
             rootY: 1.01,
@@ -2667,7 +2946,6 @@
             swayScale: 1.05,
             hasLeaves: true
           }));
-          // Overhanging bare bough entering from top-left edge (just like the reference photo!)
           treesFore.push(createBranchingTree(rand, {
             rootX: -0.04,
             rootY: 0.16,
@@ -2681,7 +2959,6 @@
             swayScale: 1.1,
             hasLeaves: false
           }));
-          // Subtle right-edge dark bare branches
           treesFore.push(createBranchingTree(rand, {
             rootX: 1.02,
             rootY: 0.96,
@@ -2696,7 +2973,6 @@
             hasLeaves: false
           }));
 
-          // Subtle darkened gothic chrome crosses standing quietly in the dark mist
           [0.21, 0.44, 0.62, 0.78].forEach((xp, idx) => {
             standingCrosses.push({
               xNorm: xp + (rand() - 0.5) * 0.03,
@@ -2708,7 +2984,6 @@
             });
           });
 
-          // Very subtle tiny dark-chrome drifting crosses in the fog
           for (let i = 0; i < 6; i++) {
             driftingCrosses.push({
               x: rand(),
@@ -2722,8 +2997,7 @@
             });
           }
 
-          // Subtle dark mist / wind dust motes
-          for (let i = 0; i < 24; i++) {
+          for (let i = 0; i < 16; i++) {
             windMotes.push({
               x: rand(),
               y: 0.15 + rand() * 0.78,
@@ -2735,7 +3009,7 @@
           }
         }
 
-        function drawDarkChromeCross(cx, cy, hPx, tiltRad, alpha, pal, shimmer) {
+        function drawDarkChromeCross(targetCtx, cx, cy, hPx, tiltRad, alpha, pal, shimmer) {
           const wPx = hPx * 0.64;
           const armY = -hPx * 0.66;
           const topY = -hPx;
@@ -2743,45 +3017,38 @@
           const armHalf = wPx * 0.5;
           const coreHalf = Math.max(1.8, hPx * 0.088);
 
-          ctx.save();
-          ctx.translate(cx, cy);
-          ctx.rotate(tiltRad);
-          ctx.globalAlpha = alpha;
+          targetCtx.save();
+          targetCtx.translate(cx, cy);
+          targetCtx.rotate(tiltRad);
+          targetCtx.globalAlpha = alpha;
 
-          const grad = ctx.createLinearGradient(-armHalf, topY, armHalf, 0);
-          grad.addColorStop(0, pal.mid);
-          grad.addColorStop(0.35, pal.dark);
-          grad.addColorStop(0.7, pal.midTree);
-          grad.addColorStop(1, pal.deep);
+          targetCtx.beginPath();
+          targetCtx.moveTo(0, topY);
+          targetCtx.lineTo(neckW, armY - neckW * 1.4);
+          targetCtx.lineTo(coreHalf, armY - neckW * 0.55);
+          targetCtx.lineTo(armHalf, armY);
+          targetCtx.lineTo(coreHalf, armY + neckW * 0.55);
+          targetCtx.lineTo(neckW, armY + neckW * 1.5);
+          targetCtx.lineTo(0, 0);
+          targetCtx.lineTo(-neckW, armY + neckW * 1.5);
+          targetCtx.lineTo(-coreHalf, armY + neckW * 0.55);
+          targetCtx.lineTo(-armHalf, armY);
+          targetCtx.lineTo(-coreHalf, armY - neckW * 0.55);
+          targetCtx.lineTo(-neckW, armY - neckW * 1.4);
+          targetCtx.closePath();
 
-          ctx.beginPath();
-          ctx.moveTo(0, topY);
-          ctx.lineTo(neckW, armY - neckW * 1.4);
-          ctx.lineTo(coreHalf, armY - neckW * 0.55);
-          ctx.lineTo(armHalf, armY);
-          ctx.lineTo(coreHalf, armY + neckW * 0.55);
-          ctx.lineTo(neckW, armY + neckW * 1.5);
-          ctx.lineTo(0, 0);
-          ctx.lineTo(-neckW, armY + neckW * 1.5);
-          ctx.lineTo(-coreHalf, armY + neckW * 0.55);
-          ctx.lineTo(-armHalf, armY);
-          ctx.lineTo(-coreHalf, armY - neckW * 0.55);
-          ctx.lineTo(-neckW, armY - neckW * 1.4);
-          ctx.closePath();
+          targetCtx.fillStyle = pal.dark;
+          targetCtx.fill();
 
-          ctx.fillStyle = grad;
-          ctx.fill();
+          targetCtx.strokeStyle = pal.hi;
+          targetCtx.globalAlpha = alpha * (0.22 + shimmer * 0.22);
+          targetCtx.lineWidth = 0.8;
+          targetCtx.stroke();
 
-          // Very soft muted metallic rim (never bright or glaring)
-          ctx.strokeStyle = pal.hi;
-          ctx.globalAlpha = alpha * (0.22 + shimmer * 0.24);
-          ctx.lineWidth = Math.max(0.7, dpr * 0.75);
-          ctx.stroke();
-
-          ctx.restore();
+          targetCtx.restore();
         }
 
-        function drawBranchingTree(tree, windT, windAmp, pal) {
+        function drawBranchingTree(targetCtx, tree, windT, windAmp, pal) {
           const nodes = tree.nodes;
           if (!nodes.length) return;
 
@@ -2790,7 +3057,6 @@
             + 0.45 * Math.sin(windT * 2.35 - tree.rootX * 8.1 + tree.phase * 1.3)
             + 0.25 * Math.cos(windT * 0.58 + tree.phase);
 
-          // 1) Forward-kinematics pass: root -> twigs with cumulative wind bend
           for (let i = 0; i < nodes.length; i++) {
             const n = nodes[i];
             const twigFlutter = n.depth >= 2
@@ -2813,7 +3079,6 @@
             n.x1 = n.x0 + Math.cos(n.absAng) * segPx;
             n.y1 = n.y0 + Math.sin(n.absAng) * segPx;
 
-            // Organic crooked midpoint control point perpendicular to branch direction
             const perpX = -Math.sin(n.absAng);
             const perpY = Math.cos(n.absAng);
             const crook = n.curve * segPx * 0.28;
@@ -2821,230 +3086,273 @@
             n.cy = (n.y0 + n.y1) * 0.5 + perpY * crook;
           }
 
-          // 2) Draw dark silhouette limbs & intricate bare twigs
           const strokeCol = tree.layer === 0 ? pal.backTree : (tree.layer === 1 ? pal.midTree : pal.dark);
           const baseAlpha = tree.layer === 0 ? 0.56 : (tree.layer === 1 ? 0.84 : 0.94);
 
-          ctx.lineCap = 'round';
-          ctx.lineJoin = 'round';
+          targetCtx.lineCap = 'round';
+          targetCtx.lineJoin = 'round';
 
-          // Subtle muted chrome edge shimmer behind main trunks/boughs only (depth <= 1)
           if (tree.layer >= 1) {
-            ctx.strokeStyle = pal.rim;
-            ctx.globalAlpha = tree.layer === 2 ? 0.42 : 0.28;
+            targetCtx.strokeStyle = pal.rim;
+            targetCtx.globalAlpha = tree.layer === 2 ? 0.40 : 0.26;
+            targetCtx.lineWidth = tree.layer === 2 ? 3.8 : 2.8;
+            targetCtx.beginPath();
             for (let i = 0; i < nodes.length; i++) {
               const n = nodes[i];
               if (n.depth > 1) continue;
-              ctx.lineWidth = Math.max(0.8, n.width * dpr * 0.95);
-              ctx.beginPath();
-              ctx.moveTo(n.x0 - 0.8 * dpr, n.y0);
-              ctx.quadraticCurveTo(n.cx - 0.8 * dpr, n.cy, n.x1 - 0.6 * dpr, n.y1);
-              ctx.stroke();
+              targetCtx.moveTo(n.x0 - 0.8, n.y0);
+              targetCtx.quadraticCurveTo(n.cx - 0.8, n.cy, n.x1 - 0.6, n.y1);
             }
+            targetCtx.stroke();
           }
 
-          // Dark shadowed branches (all depths)
-          ctx.strokeStyle = strokeCol;
-          ctx.globalAlpha = baseAlpha;
-          for (let i = 0; i < nodes.length; i++) {
-            const n = nodes[i];
-            ctx.lineWidth = Math.max(0.55 * dpr, n.width * dpr);
-            ctx.beginPath();
-            ctx.moveTo(n.x0, n.y0);
-            ctx.quadraticCurveTo(n.cx, n.cy, n.x1, n.y1);
-            ctx.stroke();
+          targetCtx.strokeStyle = strokeCol;
+          targetCtx.globalAlpha = baseAlpha;
+          const trunkW = nodes[0].width;
+          const tiers = [
+            { minD: 0, maxD: 0, w: trunkW },
+            { minD: 1, maxD: 2, w: Math.max(1.4, trunkW * 0.48) },
+            { minD: 3, maxD: 9, w: Math.max(0.7, trunkW * 0.20) }
+          ];
+          for (let t = 0; t < tiers.length; t++) {
+            const tier = tiers[t];
+            targetCtx.lineWidth = tier.w;
+            targetCtx.beginPath();
+            let hasAny = false;
+            for (let i = 0; i < nodes.length; i++) {
+              const n = nodes[i];
+              if (n.depth >= tier.minD && n.depth <= tier.maxD) {
+                targetCtx.moveTo(n.x0, n.y0);
+                targetCtx.quadraticCurveTo(n.cx, n.cy, n.x1, n.y1);
+                hasAny = true;
+              }
+            }
+            if (hasAny) targetCtx.stroke();
           }
 
-          // Sparse dark shadowed autumn leaf specks on foreground left tree (matching image_35b842.jpg!)
-          ctx.fillStyle = pal.leaf;
+          let hasLeaves = false;
           for (let i = 0; i < nodes.length; i++) {
-            const n = nodes[i];
-            if (!n.leaves.length) continue;
-            for (let k = 0; k < n.leaves.length; k++) {
-              const lf = n.leaves[k];
-              const lx = n.x0 + (n.x1 - n.x0) * lf.t + lf.ox * dpr;
-              const ly = n.y0 + (n.y1 - n.y0) * lf.t + lf.oy * dpr;
-              ctx.globalAlpha = baseAlpha * 0.72;
-              ctx.beginPath();
-              ctx.ellipse(lx, ly, lf.rx * dpr, lf.ry * dpr, lf.rot + gustBase * 0.25 * windAmp, 0, Math.PI * 2);
-              ctx.fill();
+            if (nodes[i].leaves.length) { hasLeaves = true; break; }
+          }
+          if (hasLeaves) {
+            targetCtx.fillStyle = pal.leaf;
+            targetCtx.globalAlpha = baseAlpha * 0.72;
+            targetCtx.beginPath();
+            for (let i = 0; i < nodes.length; i++) {
+              const n = nodes[i];
+              if (!n.leaves.length) continue;
+              for (let k = 0; k < n.leaves.length; k++) {
+                const lf = n.leaves[k];
+                const lx = n.x0 + (n.x1 - n.x0) * lf.t + lf.ox;
+                const ly = n.y0 + (n.y1 - n.y0) * lf.t + lf.oy;
+                targetCtx.moveTo(lx + lf.rx, ly);
+                targetCtx.ellipse(lx, ly, lf.rx, lf.ry, lf.rot + gustBase * 0.22 * windAmp, 0, Math.PI * 2);
+              }
             }
+            targetCtx.fill();
           }
         }
 
-        function drawHillSilhouette(pal) {
-          if (!hillPoints.length) return;
+        function bakeStaticForestLayer() {
+          if (cw <= 1 || ch <= 1) return;
+          const pal = activeVizPalette;
+          staticCanvas.width = cw;
+          staticCanvas.height = ch;
+          staticCtx.clearRect(0, 0, cw, ch);
+
+          const fogGlow = staticCtx.createRadialGradient(cw * 0.58, ch * 0.54, cw * 0.05, cw * 0.55, ch * 0.56, cw * 0.78);
+          fogGlow.addColorStop(0, pal.glow);
+          fogGlow.addColorStop(0.5, pal.mist);
+          fogGlow.addColorStop(1, 'rgba(0,0,0,0)');
+          staticCtx.globalAlpha = 1;
+          staticCtx.fillStyle = fogGlow;
+          staticCtx.fillRect(0, 0, cw, ch);
+
+          for (let i = 0; i < treesBack.length; i++) {
+            drawBranchingTree(staticCtx, treesBack[i], 0.4, 0.15, pal);
+          }
+
+          const midFog = staticCtx.createLinearGradient(0, ch * 0.52, 0, ch);
+          midFog.addColorStop(0, 'rgba(0,0,0,0)');
+          midFog.addColorStop(0.58, pal.mist);
+          midFog.addColorStop(1, 'rgba(3,4,6,0.72)');
+          staticCtx.globalAlpha = 0.85;
+          staticCtx.fillStyle = midFog;
+          staticCtx.fillRect(0, ch * 0.50, cw, ch * 0.50);
+
+          if (hillPoints.length) {
+            staticCtx.beginPath();
+            staticCtx.moveTo(0, ch);
+            for (let i = 0; i < hillPoints.length; i++) {
+              const pt = hillPoints[i];
+              staticCtx.lineTo(pt.xn * cw, pt.yn * ch);
+            }
+            staticCtx.lineTo(cw, ch);
+            staticCtx.closePath();
+            staticCtx.globalAlpha = 0.88;
+            staticCtx.fillStyle = pal.deep;
+            staticCtx.fill();
+          }
+
+          veilGrad = ctx.createLinearGradient(0, 0, 0, ch);
+          veilGrad.addColorStop(0, 'rgba(3, 4, 7, 0.52)');
+          veilGrad.addColorStop(0.45, 'rgba(3, 4, 7, 0.28)');
+          veilGrad.addColorStop(0.84, 'rgba(3, 4, 7, 0.48)');
+          veilGrad.addColorStop(1, 'rgba(2, 3, 5, 0.84)');
+        }
+
+        function renderForestFrame(dt) {
+          if (cw <= 1 || ch <= 1) return;
+          const pal = activeVizPalette;
+
+          const targetSpeed = state.isPlaying ? 1.32 : 0.14;
+          const targetAmp = state.isPlaying ? 0.96 : 0.18;
+          const easeRate = Math.min(1, dt * 3.0);
+          windSpeedCur += (targetSpeed - windSpeedCur) * easeRate;
+          windAmpCur += (targetAmp - windAmpCur) * easeRate;
+          windTime += dt * windSpeedCur;
+
+          let beatBoost = 0;
+          if (state.isPlaying) {
+            if (analyser && currentAudioMode === 'synth') {
+              if (!analyserBins || analyserBins.length !== analyser.frequencyBinCount) {
+                analyserBins = new Uint8Array(analyser.frequencyBinCount);
+              }
+              analyser.getByteFrequencyData(analyserBins);
+              beatBoost = ((analyserBins[1] + analyserBins[2] + analyserBins[3]) / (3 * 255)) * 0.28;
+            } else {
+              beatBoost = 0.11 * Math.abs(Math.sin(windTime * 1.7));
+            }
+          }
+          pulseCur += (beatBoost - pulseCur) * Math.min(1, dt * 5.5);
+          const effAmp = windAmpCur + pulseCur;
+
+          ctx.clearRect(0, 0, cw, ch);
+
+          ctx.globalAlpha = 1;
+          ctx.drawImage(staticCanvas, 0, 0);
+
+          for (let i = 0; i < driftingCrosses.length; i++) {
+            const dc = driftingCrosses[i];
+            dc.x += dc.speedX * dt * windSpeedCur;
+            dc.y += dc.speedY * dt * (0.35 + windSpeedCur * 0.45) + Math.sin(windTime + dc.phase) * 0.0002;
+            if (dc.x > 1.06) { dc.x = -0.06; dc.y = 0.16 + ((i * 0.19) % 0.55); }
+            if (dc.y < 0.08) dc.y = 0.68;
+            const tilt = dc.rot + Math.sin(windTime * 0.8 + dc.phase) * 0.14 * effAmp;
+            const shimmer = 0.5 + 0.5 * Math.sin(windTime * 1.9 + dc.phase);
+            drawDarkChromeCross(ctx, dc.x * cw, dc.y * ch, dc.size, tilt, dc.alpha, pal, shimmer);
+          }
+
+          for (let i = 0; i < treesMid.length; i++) {
+            drawBranchingTree(ctx, treesMid[i], windTime, effAmp, pal);
+          }
+          for (let i = 0; i < standingCrosses.length; i++) {
+            const sc = standingCrosses[i];
+            if (sc.layer !== 1) continue;
+            const swayTilt = sc.tiltBase + Math.sin(windTime * 1.05 - sc.xNorm * 4 + sc.phase) * 0.04 * effAmp;
+            const shimmer = 0.5 + 0.5 * Math.sin(windTime * 1.8 + sc.shimmerPhase);
+            drawDarkChromeCross(ctx, sc.xNorm * cw, ch * 0.94, sc.hNorm * ch, swayTilt, 0.42, pal, shimmer);
+          }
+
+          ctx.strokeStyle = pal.hi;
+          ctx.lineWidth = 0.8;
+          ctx.globalAlpha = state.isPlaying ? 0.08 : 0.035;
           ctx.beginPath();
-          ctx.moveTo(0, ch);
-          for (let i = 0; i < hillPoints.length; i++) {
-            const pt = hillPoints[i];
-            ctx.lineTo(pt.xn * cw, pt.yn * ch);
+          for (let i = 0; i < windMotes.length; i++) {
+            const m = windMotes[i];
+            m.x += m.speed * dt * windSpeedCur;
+            m.y += Math.sin(windTime * 1.2 + m.phase) * 0.00035;
+            if (m.x > 1.05) m.x = -0.05;
+            const mx = m.x * cw;
+            const my = m.y * ch;
+            const sLen = m.len * (0.4 + effAmp * 0.85);
+            ctx.moveTo(mx, my);
+            ctx.lineTo(mx + sLen, my - sLen * 0.12);
           }
-          ctx.lineTo(cw, ch);
-          ctx.closePath();
-          ctx.globalAlpha = 0.88;
-          ctx.fillStyle = pal.deep;
-          ctx.fill();
+          ctx.stroke();
+
+          for (let i = 0; i < treesFore.length; i++) {
+            drawBranchingTree(ctx, treesFore[i], windTime, effAmp, pal);
+          }
+          for (let i = 0; i < standingCrosses.length; i++) {
+            const sc = standingCrosses[i];
+            if (sc.layer !== 2) continue;
+            const swayTilt = sc.tiltBase + Math.sin(windTime * 1.15 - sc.xNorm * 4.5 + sc.phase) * 0.05 * effAmp;
+            const shimmer = 0.5 + 0.5 * Math.sin(windTime * 2.0 + sc.shimmerPhase);
+            drawDarkChromeCross(ctx, sc.xNorm * cw, ch * 0.97, sc.hNorm * ch * 1.1, swayTilt, 0.52, pal, shimmer);
+          }
+
+          if (veilGrad) {
+            ctx.globalAlpha = 1;
+            ctx.fillStyle = veilGrad;
+            ctx.fillRect(0, 0, cw, ch);
+          }
         }
+
+        function stopVizLoop() {
+          if (vizRaf) {
+            cancelAnimationFrame(vizRaf);
+            vizRaf = 0;
+          }
+        }
+
+        function vizTick(now) {
+          vizRaf = 0;
+          const canAnimate = playerOverlay.classList.contains('open') && !document.hidden && state.isPlaying && cw > 1 && ch > 1;
+          if (!canAnimate) return;
+
+          if (lastFrameAt && (now - lastFrameAt) < TARGET_FRAME_MS) {
+            vizRaf = requestAnimationFrame(vizTick);
+            return;
+          }
+          const dt = lastFrameAt ? Math.min(Math.max((now - lastFrameAt) / 1000, 0.016), 0.08) : 0.041;
+          lastFrameAt = now;
+          renderForestFrame(dt);
+          vizRaf = requestAnimationFrame(vizTick);
+        }
+
+        syncVizLoopState = () => {
+          const isOpen = playerOverlay.classList.contains('open') && !document.hidden;
+          if (!isOpen) {
+            stopVizLoop();
+            return;
+          }
+          if (cw <= 1 || ch <= 1) resize();
+          if (state.isPlaying) {
+            if (!vizRaf) {
+              lastFrameAt = 0;
+              vizRaf = requestAnimationFrame(vizTick);
+            }
+          } else {
+            stopVizLoop();
+            renderForestFrame(0.016);
+          }
+        };
+
+        rebuildVizStaticLayer = () => {
+          if (cw > 1 && ch > 1) {
+            bakeStaticForestLayer();
+            if (playerOverlay.classList.contains('open') && !document.hidden) {
+              renderForestFrame(0.016);
+            }
+          }
+        };
 
         function resize() {
           const rect = playerOverlay.getBoundingClientRect();
-          dpr = Math.min(window.devicePixelRatio || 1, 1.5);
-          cw = canvas.width = Math.max(1, Math.round(rect.width * dpr));
-          ch = canvas.height = Math.max(1, Math.round(rect.height * dpr));
-          buildChromeForestScene();
+          const nextW = Math.max(1, Math.round(rect.width));
+          const nextH = Math.max(1, Math.round(rect.height));
+          if (nextW === cw && nextH === ch && treesMid.length) return;
+          cw = canvas.width = nextW;
+          ch = canvas.height = nextH;
+          if (!treesMid.length) buildChromeForestScene();
+          bakeStaticForestLayer();
+          if (playerOverlay.classList.contains('open') && !document.hidden) {
+            renderForestFrame(0.016);
+          }
         }
         resize();
         window.addEventListener('resize', resize);
-
-        function tick(now) {
-          const dtRaw = lastTickTime ? (now - lastTickTime) / 1000 : 0.016;
-          const dt = Math.min(Math.max(dtRaw, 0.001), 0.05);
-
-          if (state.isPlaying && state.currentTrack) {
-            const track = state.currentTrack;
-            if (currentAudioMode === 'stream') {
-              if (htmlAudio.src && htmlAudio.src !== SILENT_WAV_URI) {
-                state.currentTime = htmlAudio.currentTime || 0;
-                if (isFinite(htmlAudio.duration) && htmlAudio.duration > 1 && Math.abs(track.duration - htmlAudio.duration) > 1) {
-                  track.duration = htmlAudio.duration;
-                  $('totTime').textContent = fmtTime(track.duration);
-                  $('playerScrubber').max = track.duration;
-                }
-                if (htmlAudio.ended) {
-                  if (state.repeat) { seekTo(0); htmlAudio.play().catch(() => {}); }
-                  else nextTrack();
-                }
-              }
-            } else {
-              if (dt > 0 && dt < 0.5) state.currentTime += dt;
-              if (state.currentTime >= track.duration) {
-                if (state.repeat) { state.currentTime = 0; startSynthLoop(track); }
-                else nextTrack();
-              }
-            }
-            syncTimeAndLyrics(false);
-          }
-          lastTickTime = now;
-
-          if (playerOverlay.classList.contains('open') && !document.hidden && cw > 1 && ch > 1) {
-            const pal = activeVizPalette;
-
-            // Smooth wind speed: natural swaying wind when playing, ultra-slow breathing drift when paused
-            const targetSpeed = state.isPlaying ? 1.38 : 0.14;
-            const targetAmp = state.isPlaying ? 1.0 : 0.18;
-            const easeRate = Math.min(1, dt * 3.0);
-            windSpeedCur += (targetSpeed - windSpeedCur) * easeRate;
-            windAmpCur += (targetAmp - windAmpCur) * easeRate;
-            windTime += dt * windSpeedCur;
-
-            let beatBoost = 0;
-            if (state.isPlaying) {
-              if (analyser && currentAudioMode === 'synth') {
-                const bins = new Uint8Array(analyser.frequencyBinCount);
-                analyser.getByteFrequencyData(bins);
-                beatBoost = ((bins[1] + bins[2] + bins[3]) / (3 * 255)) * 0.28;
-              } else {
-                beatBoost = 0.11 * Math.abs(Math.sin(windTime * 1.7));
-              }
-            }
-            pulseCur += (beatBoost - pulseCur) * Math.min(1, dt * 5.5);
-            const effAmp = windAmpCur + pulseCur;
-
-            ctx.clearRect(0, 0, cw, ch);
-
-            // 1) Dim smoky overcast fog glow behind the bare trees (low-contrast, dark-toned)
-            const fogGlow = ctx.createRadialGradient(cw * 0.58, ch * 0.54, cw * 0.05, cw * 0.55, ch * 0.56, cw * 0.78);
-            fogGlow.addColorStop(0, pal.glow);
-            fogGlow.addColorStop(0.5, pal.mist);
-            fogGlow.addColorStop(1, 'rgba(0,0,0,0)');
-            ctx.globalAlpha = 1;
-            ctx.fillStyle = fogGlow;
-            ctx.fillRect(0, 0, cw, ch);
-
-            // 2) Subtle drifting dark-chrome crosses high in the mist
-            for (let i = 0; i < driftingCrosses.length; i++) {
-              const dc = driftingCrosses[i];
-              dc.x += dc.speedX * dt * windSpeedCur;
-              dc.y += dc.speedY * dt * (0.35 + windSpeedCur * 0.45) + Math.sin(windTime + dc.phase) * 0.0002;
-              if (dc.x > 1.06) { dc.x = -0.06; dc.y = 0.16 + ((i * 0.19) % 0.55); }
-              if (dc.y < 0.08) dc.y = 0.68;
-              const tilt = dc.rot + Math.sin(windTime * 0.8 + dc.phase) * 0.14 * effAmp;
-              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 1.9 + dc.phase);
-              drawDarkChromeCross(dc.x * cw, dc.y * ch, dc.size * dpr, tilt, dc.alpha, pal, shimmer);
-            }
-
-            // 3) Back distant bare trees in heavy mist
-            for (let i = 0; i < treesBack.length; i++) {
-              drawBranchingTree(treesBack[i], windTime, effAmp, pal);
-            }
-
-            // Soft fog veil separating back & mid treeline
-            const midFog = ctx.createLinearGradient(0, ch * 0.52, 0, ch);
-            midFog.addColorStop(0, 'rgba(0,0,0,0)');
-            midFog.addColorStop(0.58, pal.mist);
-            midFog.addColorStop(1, 'rgba(3,4,6,0.72)');
-            ctx.globalAlpha = 0.85;
-            ctx.fillStyle = midFog;
-            ctx.fillRect(0, ch * 0.50, cw, ch * 0.50);
-
-            // 4) Mid-ground bare branching trees + mid standing dark-chrome crosses
-            for (let i = 0; i < treesMid.length; i++) {
-              drawBranchingTree(treesMid[i], windTime, effAmp, pal);
-            }
-            for (let i = 0; i < standingCrosses.length; i++) {
-              const sc = standingCrosses[i];
-              if (sc.layer !== 1) continue;
-              const swayTilt = sc.tiltBase + Math.sin(windTime * 1.05 - sc.xNorm * 4 + sc.phase) * 0.04 * effAmp;
-              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 1.8 + sc.shimmerPhase);
-              drawDarkChromeCross(sc.xNorm * cw, ch * 0.94, sc.hNorm * ch, swayTilt, 0.42, pal, shimmer);
-            }
-
-            // 5) Whisper-thin mist wind streaks
-            ctx.strokeStyle = pal.hi;
-            ctx.lineWidth = Math.max(0.7, 0.8 * dpr);
-            for (let i = 0; i < windMotes.length; i++) {
-              const m = windMotes[i];
-              m.x += m.speed * dt * windSpeedCur;
-              m.y += Math.sin(windTime * 1.2 + m.phase) * 0.00035;
-              if (m.x > 1.05) m.x = -0.05;
-              const mx = m.x * cw;
-              const my = m.y * ch;
-              const sLen = m.len * dpr * (0.4 + effAmp * 0.85);
-              ctx.globalAlpha = m.alpha * (state.isPlaying ? 0.85 : 0.35);
-              ctx.beginPath();
-              ctx.moveTo(mx, my);
-              ctx.lineTo(mx + sLen, my - sLen * 0.12);
-              ctx.stroke();
-            }
-
-            // 6) Foreground dark hillside, gnarled framing branches & dark-chrome crosses
-            drawHillSilhouette(pal);
-            for (let i = 0; i < treesFore.length; i++) {
-              drawBranchingTree(treesFore[i], windTime, effAmp, pal);
-            }
-            for (let i = 0; i < standingCrosses.length; i++) {
-              const sc = standingCrosses[i];
-              if (sc.layer !== 2) continue;
-              const swayTilt = sc.tiltBase + Math.sin(windTime * 1.15 - sc.xNorm * 4.5 + sc.phase) * 0.05 * effAmp;
-              const shimmer = 0.5 + 0.5 * Math.sin(windTime * 2.0 + sc.shimmerPhase);
-              drawDarkChromeCross(sc.xNorm * cw, ch * 0.97, sc.hNorm * ch * 1.1, swayTilt, 0.52, pal, shimmer);
-            }
-
-            // 7) Dark atmospheric vignette veil so the forest stays shadowed and never distracts from lyrics/controls
-            const veil = ctx.createLinearGradient(0, 0, 0, ch);
-            veil.addColorStop(0, 'rgba(3, 4, 7, 0.52)');
-            veil.addColorStop(0.45, 'rgba(3, 4, 7, 0.28)');
-            veil.addColorStop(0.84, 'rgba(3, 4, 7, 0.48)');
-            veil.addColorStop(1, 'rgba(2, 3, 5, 0.84)');
-            ctx.globalAlpha = 1;
-            ctx.fillStyle = veil;
-            ctx.fillRect(0, 0, cw, ch);
-          }
-
-          requestAnimationFrame(tick);
-        }
-        requestAnimationFrame(tick);
       }
 
       // ================= PROFILE, TELEGRAM ACCOUNT, AVATAR & CLOUD SYNC (v37) =================
@@ -3224,10 +3532,30 @@
       }
 
       // mode: 'login_merge' (first sign-in: combine guest local + cloud) | 'pull' (authoritative refresh from cloud/bot)
+      function applyPublicSocialStateFromCloud(cloudState) {
+        if (!cloudState || typeof cloudState !== 'object') return false;
+        let changed = false;
+        if (cloudState.publishedMap && typeof cloudState.publishedMap === 'object') {
+          state.publishedMap = { ...cloudState.publishedMap };
+          store.set('publishedMap', state.publishedMap);
+          changed = true;
+        }
+        if (Array.isArray(cloudState.subscribedPlaylists)) {
+          state.subscribedPlaylists = cloudState.subscribedPlaylists.map(normalizePublicPlaylist).filter(Boolean);
+          store.set('subscribedPlaylists', state.subscribedPlaylists);
+          changed = true;
+        }
+        return changed;
+      }
+
       function applyCloudState(cloudState, mode = 'pull') {
         if (!cloudState || typeof cloudState !== 'object') return;
+        const socialChanged = applyPublicSocialStateFromCloud(cloudState);
         const cloudTs = Number(cloudState.updatedAt || 0);
-        if (mode === 'pull' && cloudTs > 0 && cloudTs <= lastCloudUpdatedAt) return;
+        if (mode === 'pull' && cloudTs > 0 && cloudTs <= lastCloudUpdatedAt) {
+          if (socialChanged) renderLibrary();
+          return;
+        }
 
         isApplyingCloudState = true;
         try {
@@ -3532,6 +3860,11 @@
         const oldToken = state.tgToken;
         stopAuthPolling();
         lastCloudUpdatedAt = 0;
+        state.publishedMap = {};
+        state.subscribedPlaylists = [];
+        state.selectedSubPlaylistId = null;
+        store.set('publishedMap', {});
+        store.set('subscribedPlaylists', []);
         persistAuthSession('', null);
         renderProfile();
         updateLibraryAuthGate();
@@ -3800,8 +4133,19 @@
       });
 
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && state.tgToken) {
-          refreshCloudAccountState(false);
+        document.body.classList.toggle('app-hidden', document.hidden);
+        syncVizLoopState();
+        if (document.hidden) {
+          splashParticlesActive = false;
+          if (splashParticlesRaf) {
+            cancelAnimationFrame(splashParticlesRaf);
+            splashParticlesRaf = 0;
+          }
+          suspendAudioCtxIfIdle();
+        } else {
+          if (!splashScreen.classList.contains('hidden')) startSplashParticles();
+          if (state.currentTrack) syncTimeAndLyrics(true);
+          if (state.tgToken) refreshCloudAccountState(false);
         }
       });
 
@@ -4019,6 +4363,721 @@
         if (e.changedTouches[0].clientY - pStartY > 45) closePlayerOverlay();
       }, { passive: true });
 
+
+      // ================= DESKTOP FULLSCREEN & KEYBOARD SHORTCUTS (v43) =================
+      function initDesktopFullscreenAndHotkeys() {
+        const fsSupported = Boolean(
+          document.fullscreenEnabled || document.webkitFullscreenEnabled
+        );
+        if (fsSupported) {
+          document.body.classList.add('fs-supported');
+        }
+
+        const enterIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`;
+        const exitIcon = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>`;
+
+        function isDocFullscreen() {
+          return Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+        }
+
+        function syncFullscreenBtns() {
+          const active = isDocFullscreen();
+          ['topFullscreenBtn', 'playerFullscreenBtn'].forEach(id => {
+            const btn = $(id);
+            if (!btn) return;
+            btn.classList.toggle('active', active);
+            btn.innerHTML = active ? exitIcon : enterIcon;
+            btn.title = active ? 'Выйти из полноэкранного режима (F)' : 'На весь экран (F)';
+          });
+          setTimeout(() => { window.dispatchEvent(new Event('resize')); }, 80);
+        }
+
+        function toggleBrowserFullscreen() {
+          if (!fsSupported) return;
+          try {
+            if (isDocFullscreen()) {
+              if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+              else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+            } else {
+              const root = document.documentElement;
+              if (root.requestFullscreen) root.requestFullscreen().catch(() => {});
+              else if (root.webkitRequestFullscreen) root.webkitRequestFullscreen();
+            }
+          } catch (e) {}
+        }
+
+        ['topFullscreenBtn', 'playerFullscreenBtn'].forEach(id => {
+          const btn = $(id);
+          if (btn) btn.addEventListener('click', toggleBrowserFullscreen);
+        });
+        document.addEventListener('fullscreenchange', syncFullscreenBtns);
+        document.addEventListener('webkitfullscreenchange', syncFullscreenBtns);
+
+        document.addEventListener('keydown', (e) => {
+          const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
+          if (tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable)) {
+            if (e.key === 'Escape') e.target.blur();
+            return;
+          }
+
+          // Unlock splash screen with Enter or Space on PC
+          if (splashScreen && !splashScreen.classList.contains('hidden')) {
+            if (e.code === 'Space' || e.key === 'Enter') {
+              e.preventDefault();
+              unlockFromSplash();
+            }
+            return;
+          }
+
+          if (e.key === 'Escape') {
+            if (publicPlModal && publicPlModal.classList.contains('open')) {
+              closePublicPlaylistModal();
+              return;
+            }
+            if (playlistModal.classList.contains('open')) {
+              closePlaylistModal();
+              return;
+            }
+            if (playerOverlay.classList.contains('open')) {
+              closePlayerOverlay();
+              return;
+            }
+          }
+
+          if (e.code === 'Space') {
+            e.preventDefault();
+            togglePlayPause();
+          } else if (e.key === 'ArrowRight' && state.currentTrack) {
+            e.preventDefault();
+            seekTo((state.currentTime || 0) + 5);
+          } else if (e.key === 'ArrowLeft' && state.currentTrack) {
+            e.preventDefault();
+            seekTo((state.currentTime || 0) - 5);
+          } else if (e.key === 'ArrowUp' && playerOverlay.classList.contains('open')) {
+            e.preventDefault();
+            applyAudioVolume(Math.min(1, (state.volume || 0) + 0.05), true);
+          } else if (e.key === 'ArrowDown' && playerOverlay.classList.contains('open')) {
+            e.preventDefault();
+            applyAudioVolume(Math.max(0, (state.volume || 0) - 0.05), true);
+          } else if ((e.code === 'KeyF') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            e.preventDefault();
+            toggleBrowserFullscreen();
+          }
+        });
+      }
+
+
+      // ================= PUBLIC USER PLAYLISTS, LIKES & LIVE SUBSCRIPTIONS (v45) =================
+      let publicSearchSeq = 0;
+
+      function normalizePublicPlaylist(raw) {
+        if (!raw || !raw.id) return null;
+        const authorRaw = raw.author || {};
+        let authorPhoto = authorRaw.photoUrl || '';
+        if (authorPhoto && authorPhoto.startsWith('/')) authorPhoto = tgApiUrl(authorPhoto);
+        const covers = Array.isArray(raw.covers)
+          ? raw.covers.filter(Boolean).map(u => (String(u).startsWith('/') ? tgApiUrl(u) : String(u))).slice(0, 4)
+          : [];
+        const tracks = Array.isArray(raw.tracks)
+          ? raw.tracks.map(normalizeCloudTrack).filter(Boolean)
+          : null;
+        return {
+          id: String(raw.id),
+          sourcePlId: String(raw.sourcePlId || ''),
+          name: String(raw.name || 'Плейлист'),
+          ownerTgId: Number(raw.ownerTgId || 0),
+          author: {
+            tgId: Number(authorRaw.tgId || 0),
+            displayName: String(authorRaw.displayName || 'Пользователь'),
+            username: String(authorRaw.username || ''),
+            photoUrl: authorPhoto
+          },
+          trackCount: tracks ? tracks.length : Number(raw.trackCount || 0),
+          covers,
+          likesCount: Number(raw.likesCount || 0),
+          subsCount: Number(raw.subsCount || 0),
+          isLiked: Boolean(raw.isLiked),
+          isSubscribed: Boolean(raw.isSubscribed),
+          isOwner: Boolean(raw.isOwner),
+          createdAt: Number(raw.createdAt || 0),
+          updatedAt: Number(raw.updatedAt || 0),
+          tracks
+        };
+      }
+
+      function buildCoverCollageHtml(covers) {
+        const list = Array.isArray(covers) ? covers.filter(Boolean).slice(0, 4) : [];
+        if (list.length >= 4) {
+          return list.map(u => `<img src="${escapeHtml(u)}" alt="" loading="lazy" />`).join('');
+        }
+        if (list.length >= 1) {
+          return `<img src="${escapeHtml(list[0])}" alt="" loading="lazy" style="grid-column:1/-1;grid-row:1/-1;" />`;
+        }
+        return `<div class="pub-collage-empty">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 2L13.4 8.6L20 10L13.4 11.4L12 22L10.6 11.4L4 10L10.6 8.6L12 2Z"/>
+          </svg>
+        </div>`;
+      }
+
+      function buildAuthorRowHtml(author) {
+        const a = author || {};
+        const name = a.username ? ('@' + a.username) : (a.displayName || 'Пользователь');
+        const initials = (a.displayName || a.username || 'U').slice(0, 2).toUpperCase();
+        const avHtml = a.photoUrl
+          ? `<span class="pub-author-av"><img src="${escapeHtml(a.photoUrl)}" alt="" loading="lazy" /></span>`
+          : `<span class="pub-author-av">${escapeHtml(initials)}</span>`;
+        return `${avHtml}<span class="pub-pl-author-name">${escapeHtml(name)}</span>`;
+      }
+
+      function setSearchMode(mode) {
+        const nextMode = (mode === 'playlists') ? 'playlists' : 'tracks';
+        state.searchMode = nextMode;
+        const isPl = nextMode === 'playlists';
+
+        const swEl = $('searchModeSwitch');
+        if (swEl) {
+          swEl.querySelectorAll('.search-mode-btn').forEach(b => {
+            b.classList.toggle('active', b.dataset.searchMode === nextMode);
+          });
+        }
+        searchInput.placeholder = isPl
+          ? 'Поиск плейлистов по названию или автору...'
+          : 'Поиск через Telegram-бота...';
+        if ($('quickTags')) $('quickTags').style.display = isPl ? 'none' : '';
+        if ($('searchSourcesBar')) $('searchSourcesBar').style.display = isPl ? 'none' : '';
+        if ($('tgRefreshBtn')) $('tgRefreshBtn').style.display = isPl ? 'none' : '';
+        if ($('pubPlSortBar')) $('pubPlSortBar').style.display = isPl ? 'inline-flex' : 'none';
+        if (searchTrackList) searchTrackList.style.display = isPl ? 'none' : '';
+        if ($('publicPlaylistsList')) $('publicPlaylistsList').style.display = isPl ? 'grid' : 'none';
+
+        performSearch(false);
+      }
+
+      async function fetchPublicPlaylists(query = '', sort = 'popular') {
+        const listEl = $('publicPlaylistsList');
+        if (!listEl) return;
+        const seq = ++publicSearchSeq;
+
+        if (isOfflineEffective()) {
+          searchLoader.classList.remove('show');
+          $('searchResultTitle').textContent = 'Публичные плейлисты';
+          $('searchCount').textContent = '0';
+          listEl.innerHTML = `<div style="text-align:center;padding:28px 14px;color:var(--text-dim);font-size:13px;">Для поиска публичных плейлистов нужен интернет.</div>`;
+          return;
+        }
+
+        searchLoader.classList.add('show');
+        $('searchLoaderText').textContent = query ? `Ищем плейлисты «${query}»...` : 'Загрузка плейлистов пользователей...';
+        $('searchResultTitle').textContent = query ? `Плейлисты: «${query}»` : (sort === 'new' ? 'Новые плейлисты' : 'Популярные плейлисты');
+
+        const params = new URLSearchParams({ sort: sort || 'popular', limit: '40' });
+        if (query) params.set('q', query);
+        const headers = {};
+        if (state.tgToken) headers['Authorization'] = 'Bearer ' + state.tgToken;
+
+        try {
+          const resp = await fetchWithTimeout(`${tgApiUrl('/api/playlists/public')}?${params.toString()}`, { headers }, 9000);
+          if (seq !== publicSearchSeq) return;
+          const data = resp.ok ? await resp.json().catch(() => null) : null;
+          searchLoader.classList.remove('show');
+          if (data && data.ok && Array.isArray(data.playlists)) {
+            state.publicPlaylists = data.playlists.map(normalizePublicPlaylist).filter(Boolean);
+            renderPublicPlaylistsList();
+          } else {
+            state.publicPlaylists = [];
+            renderPublicPlaylistsList(true);
+          }
+        } catch (e) {
+          if (seq !== publicSearchSeq) return;
+          searchLoader.classList.remove('show');
+          state.publicPlaylists = [];
+          renderPublicPlaylistsList(true);
+        }
+      }
+
+      function renderPublicPlaylistsList(hasError = false) {
+        const listEl = $('publicPlaylistsList');
+        if (!listEl) return;
+        $('searchCount').textContent = String(state.publicPlaylists.length);
+        listEl.innerHTML = '';
+
+        if (!state.publicPlaylists.length) {
+          const q = searchInput.value.trim();
+          const msg = hasError
+            ? 'Не удалось загрузить плейлисты. Проверьте соединение с ботом.'
+            : (q
+              ? `Плейлисты по запросу «${escapeHtml(q)}» не найдены.`
+              : 'Пока никто не опубликовал плейлист.<br/>Откройте свой плейлист в <b>«Ваши треки»</b> (от 3 треков) и нажмите <b>«Опубликовать»</b>!');
+          listEl.innerHTML = `<div style="text-align:center;padding:30px 14px;color:var(--text-dim);font-size:13px;line-height:1.55;">${msg}</div>`;
+          return;
+        }
+
+        state.publicPlaylists.forEach(pl => {
+          const card = document.createElement('button');
+          card.type = 'button';
+          card.className = 'pub-pl-card';
+          card.innerHTML = `
+            <div class="pub-collage">${buildCoverCollageHtml(pl.covers)}</div>
+            <div class="pub-pl-body">
+              <div class="pub-pl-name">${escapeHtml(pl.name)}</div>
+              <div class="pub-pl-author">${buildAuthorRowHtml(pl.author)}</div>
+              <div class="pub-pl-stats">
+                <span class="pub-stat-pill">${pl.trackCount} трек.</span>
+                <span class="pub-stat-pill ${pl.isLiked ? 'liked' : ''}">${pl.isLiked ? '♥' : '♡'} ${pl.likesCount}</span>
+                <span class="pub-stat-pill ${pl.isSubscribed ? 'subbed' : ''}">+${pl.subsCount} подп.</span>
+              </div>
+            </div>
+          `;
+          card.querySelectorAll('img').forEach(img => img.addEventListener('error', () => img.remove()));
+          card.addEventListener('click', () => openPublicPlaylistModal(pl.id, pl));
+          listEl.appendChild(card);
+        });
+      }
+
+      function closePublicPlaylistModal() {
+        if (!publicPlModal) return;
+        publicPlModal.classList.remove('open');
+        state.activePublicModalPl = null;
+      }
+
+      function renderPublicPlaylistModal(pl) {
+        if (!pl) return;
+        state.activePublicModalPl = pl;
+
+        const covEl = $('pubModalCover');
+        covEl.innerHTML = buildCoverCollageHtml(pl.covers);
+        covEl.querySelectorAll('img').forEach(img => img.addEventListener('error', () => img.remove()));
+
+        $('pubModalTitle').textContent = pl.name;
+        const authEl = $('pubModalAuthor');
+        authEl.innerHTML = buildAuthorRowHtml(pl.author);
+        authEl.querySelectorAll('img').forEach(img => img.addEventListener('error', () => img.remove()));
+
+        const trCount = Array.isArray(pl.tracks) ? pl.tracks.length : (pl.trackCount || 0);
+        $('pubModalMeta').textContent = `${trCount} трек. · ♥ ${pl.likesCount} · Подписчиков: ${pl.subsCount}`;
+
+        const likeBtn = $('pubModalLikeBtn');
+        likeBtn.textContent = `${pl.isLiked ? '♥' : '♡'} ${pl.likesCount}`;
+        likeBtn.classList.toggle('is-liked', Boolean(pl.isLiked));
+
+        const subBtn = $('pubModalSubBtn');
+        if (pl.isOwner) {
+          subBtn.style.display = 'none';
+        } else {
+          subBtn.style.display = 'inline-flex';
+          subBtn.textContent = pl.isSubscribed ? '✓ Вы подписаны' : 'Подписаться';
+          subBtn.classList.toggle('is-subbed', Boolean(pl.isSubscribed));
+        }
+
+        const copyBtn = $('pubModalCopyBtn');
+        copyBtn.style.display = pl.isOwner ? 'none' : 'inline-flex';
+
+        const tracksEl = $('pubModalTrackList');
+        tracksEl.innerHTML = '';
+        if (Array.isArray(pl.tracks)) {
+          if (!pl.tracks.length) {
+            tracksEl.innerHTML = `<div style="text-align:center;padding:24px 10px;color:var(--text-dim);font-size:12.5px;">В этом плейлисте пока нет треков.</div>`;
+          } else {
+            pl.tracks.forEach(t => tracksEl.appendChild(buildTrackRow(t, 'public')));
+          }
+        }
+      }
+
+      async function openPublicPlaylistModal(pubId, previewObj = null) {
+        if (!pubId || !publicPlModal) return;
+        if (previewObj) {
+          renderPublicPlaylistModal(previewObj);
+        } else {
+          $('pubModalTitle').textContent = 'Загрузка...';
+          $('pubModalAuthor').innerHTML = '';
+          $('pubModalMeta').textContent = '';
+          $('pubModalTrackList').innerHTML = '';
+        }
+        $('pubModalLoader').classList.add('show');
+        publicPlModal.classList.add('open');
+
+        const headers = {};
+        if (state.tgToken) headers['Authorization'] = 'Bearer ' + state.tgToken;
+        try {
+          const resp = await fetchWithTimeout(`${tgApiUrl('/api/playlists/public/' + encodeURIComponent(pubId))}`, { headers }, 9000);
+          const data = resp.ok ? await resp.json().catch(() => null) : null;
+          $('pubModalLoader').classList.remove('show');
+          if (data && data.ok && data.playlist) {
+            const fullPl = normalizePublicPlaylist(data.playlist);
+            if (fullPl) renderPublicPlaylistModal(fullPl);
+          } else {
+            showToast('Плейлист не найден или скрыт автором');
+            closePublicPlaylistModal();
+          }
+        } catch (e) {
+          $('pubModalLoader').classList.remove('show');
+          showToast('Не удалось загрузить плейлист');
+        }
+      }
+
+      async function sharePublicPlaylist(pubId, name = 'Плейлист APATHY') {
+        if (!pubId) return;
+        const shareUrl = `${location.origin}/?pl=${encodeURIComponent(pubId)}`;
+        try {
+          if (navigator.share) {
+            await navigator.share({ title: `${name} — APATHY`, text: `Слушай плейлист «${name}» в APATHY`, url: shareUrl });
+            return;
+          }
+        } catch (e) {
+          if (e && e.name === 'AbortError') return;
+        }
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(shareUrl);
+            showToast('Ссылка на плейлист скопирована!');
+            return;
+          }
+        } catch (e) {}
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = shareUrl;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          ta.remove();
+          showToast('Ссылка на плейлист скопирована!');
+        } catch (e) {
+          showToast(shareUrl);
+        }
+      }
+
+      async function unpublishPlaylistBySourceId(sourcePlId, silent = false) {
+        if (!sourcePlId || !state.tgToken) return false;
+        try {
+          const resp = await fetchWithTimeout(`${tgApiUrl('/api/playlists/unpublish')}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + state.tgToken
+            },
+            body: JSON.stringify({ sourcePlId })
+          }, 9000);
+          const data = resp.ok ? await resp.json().catch(() => null) : null;
+          if (data && data.ok) {
+            if (data.publishedMap && typeof data.publishedMap === 'object') {
+              state.publishedMap = { ...data.publishedMap };
+            } else {
+              delete state.publishedMap[sourcePlId];
+            }
+            store.set('publishedMap', state.publishedMap);
+            renderLibrary();
+            if (!silent) showToast('Плейлист скрыт из публичного поиска');
+            return true;
+          }
+        } catch (e) {}
+        if (!silent) showToast('Не удалось скрыть плейлист');
+        return false;
+      }
+
+      async function togglePublishActivePlaylist() {
+        if (!state.selectedPlaylistId) return;
+        if (!isUserAuthenticated()) {
+          showToast('Войдите через Telegram, чтобы публиковать плейлисты');
+          switchTab('viewProfile');
+          return;
+        }
+        if (isOfflineEffective()) {
+          showToast('Для публикации нужен интернет');
+          return;
+        }
+        const pl = state.playlists.find(p => p.id === state.selectedPlaylistId);
+        if (!pl) return;
+
+        const existingPubId = state.publishedMap && state.publishedMap[pl.id];
+        const btn = $('publishActivePlBtn');
+        btn.disabled = true;
+
+        try {
+          if (existingPubId) {
+            await unpublishPlaylistBySourceId(pl.id, false);
+            return;
+          }
+
+          const resolvedTracks = pl.trackIds
+            .map(id => state.libraryTracks.find(t => t.id === id))
+            .filter(t => t && !t.isLocal);
+
+          if (resolvedTracks.length < 3) {
+            showToast('Добавьте минимум 3 трека из поиска, чтобы опубликовать');
+            return;
+          }
+
+          const payloadTracks = resolvedTracks.slice(0, 200).map(t => ({
+            id: t.id,
+            tgTrackId: t.tgTrackId || '',
+            title: t.title || 'Без названия',
+            artist: t.artist || 'Исполнитель',
+            album: t.album || 'Telegram Бот',
+            duration: Number(t.duration || 180) || 180,
+            artwork: t.artwork || '',
+            coverGrad: t.coverGrad || '',
+            source: t.source || 'Telegram',
+            inTelegram: !!t.inTelegram
+          }));
+
+          const resp = await fetchWithTimeout(`${tgApiUrl('/api/playlists/publish')}`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + state.tgToken
+            },
+            body: JSON.stringify({
+              sourcePlId: pl.id,
+              name: pl.name,
+              tracks: payloadTracks
+            })
+          }, 11000);
+          const data = await resp.json().catch(() => null);
+          if (resp.ok && data && data.ok && data.playlist) {
+            if (data.publishedMap && typeof data.publishedMap === 'object') {
+              state.publishedMap = { ...data.publishedMap };
+            } else {
+              state.publishedMap[pl.id] = data.playlist.id;
+            }
+            store.set('publishedMap', state.publishedMap);
+            renderLibrary();
+            showToast(`Плейлист «${pl.name}» опубликован в Поиске!`);
+          } else {
+            const err = data && data.error ? data.error : '';
+            if (err === 'min_tracks_required') showToast('Нужно минимум 3 трека из поиска для публикации');
+            else if (err === 'max_public_playlists_reached') showToast('Лимит: максимум 10 публичных плейлистов');
+            else showToast('Не удалось опубликовать плейлист');
+          }
+        } catch (e) {
+          showToast('Ошибка сети при публикации');
+        } finally {
+          btn.disabled = false;
+        }
+      }
+
+      async function togglePublicPlaylistLike(pubId) {
+        if (!pubId) return;
+        if (!isUserAuthenticated()) {
+          showToast('Войдите через Telegram, чтобы ставить лайки');
+          return;
+        }
+        if (isOfflineEffective()) {
+          showToast('Нет интернета');
+          return;
+        }
+        try {
+          const resp = await fetchWithTimeout(`${tgApiUrl('/api/playlists/public/' + encodeURIComponent(pubId) + '/like')}`, {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + state.tgToken }
+          }, 8000);
+          const data = resp.ok ? await resp.json().catch(() => null) : null;
+          if (!data || !data.ok) return;
+
+          const updateObj = (obj) => {
+            if (!obj || obj.id !== pubId) return;
+            obj.isLiked = Boolean(data.isLiked);
+            obj.likesCount = Number(data.likesCount || 0);
+          };
+          state.publicPlaylists.forEach(updateObj);
+          state.subscribedPlaylists.forEach(updateObj);
+          store.set('subscribedPlaylists', state.subscribedPlaylists);
+          if (state.activePublicModalPl && state.activePublicModalPl.id === pubId) {
+            updateObj(state.activePublicModalPl);
+            renderPublicPlaylistModal(state.activePublicModalPl);
+          }
+          if (state.searchMode === 'playlists') renderPublicPlaylistsList();
+          renderLibrary();
+        } catch (e) {}
+      }
+
+      async function togglePublicPlaylistSubscribe(pubId) {
+        if (!pubId) return;
+        if (!isUserAuthenticated()) {
+          showToast('Войдите через Telegram, чтобы подписаться');
+          closePublicPlaylistModal();
+          switchTab('viewProfile');
+          return;
+        }
+        if (isOfflineEffective()) {
+          showToast('Для подписки нужен интернет');
+          return;
+        }
+        try {
+          const resp = await fetchWithTimeout(`${tgApiUrl('/api/playlists/public/' + encodeURIComponent(pubId) + '/subscribe')}`, {
+            method: 'POST',
+            headers: { 'Authorization': 'Bearer ' + state.tgToken }
+          }, 9000);
+          const data = await resp.json().catch(() => null);
+          if (!resp.ok || !data || !data.ok) {
+            if (data && data.error === 'own_playlist') showToast('Это ваш собственный плейлист');
+            else showToast('Не удалось изменить подписку');
+            return;
+          }
+
+          const isSub = Boolean(data.isSubscribed);
+          const subsCount = Number(data.subsCount || 0);
+          const fullPl = data.playlist ? normalizePublicPlaylist(data.playlist) : null;
+
+          state.publicPlaylists.forEach(p => {
+            if (p && p.id === pubId) {
+              p.isSubscribed = isSub;
+              p.subsCount = subsCount;
+            }
+          });
+
+          if (isSub && fullPl) {
+            state.subscribedPlaylists = [
+              fullPl,
+              ...state.subscribedPlaylists.filter(p => p && p.id !== pubId)
+            ];
+            showToast(`Вы подписались на «${fullPl.name}»`);
+          } else {
+            state.subscribedPlaylists = state.subscribedPlaylists.filter(p => p && p.id !== pubId);
+            if (state.selectedSubPlaylistId === pubId) state.selectedSubPlaylistId = null;
+            showToast('Подписка отменена');
+          }
+          store.set('subscribedPlaylists', state.subscribedPlaylists);
+
+          if (state.activePublicModalPl && state.activePublicModalPl.id === pubId) {
+            state.activePublicModalPl.isSubscribed = isSub;
+            state.activePublicModalPl.subsCount = subsCount;
+            renderPublicPlaylistModal(state.activePublicModalPl);
+          }
+          if (state.searchMode === 'playlists') renderPublicPlaylistsList();
+          renderLibrary();
+        } catch (e) {
+          showToast('Ошибка сети при подписке');
+        }
+      }
+
+      function copyPublicPlaylistToMine(pl) {
+        if (!pl || !Array.isArray(pl.tracks) || !pl.tracks.length) {
+          showToast('Плейлист пуст');
+          return;
+        }
+        if (!isUserAuthenticated()) {
+          showToast('Войдите через Telegram, чтобы скопировать к себе');
+          closePublicPlaylistModal();
+          switchTab('viewProfile');
+          return;
+        }
+        const ids = [];
+        pl.tracks.forEach(t => {
+          ensureTrackInLibrary(t);
+          if (!ids.includes(t.id)) ids.push(t.id);
+        });
+        const newPl = {
+          id: 'pl_' + Date.now(),
+          name: pl.name.slice(0, 56),
+          trackIds: ids
+        };
+        state.playlists.unshift(newPl);
+        persistSavedCatalogTracks();
+        persistPlaylists(true);
+        renderLibrary();
+        renderProfile();
+        showToast(`Скопировано в «Ваши треки»: ${newPl.name}`);
+      }
+
+      function initPublicPlaylistsEvents() {
+        const swEl = $('searchModeSwitch');
+        if (swEl) {
+          swEl.addEventListener('click', (e) => {
+            const btn = e.target.closest('.search-mode-btn');
+            if (!btn || !btn.dataset.searchMode) return;
+            setSearchMode(btn.dataset.searchMode);
+          });
+        }
+
+        const sortBar = $('pubPlSortBar');
+        if (sortBar) {
+          sortBar.addEventListener('click', (e) => {
+            const btn = e.target.closest('.pub-sort-btn');
+            if (!btn || !btn.dataset.plSort) return;
+            state.publicPlSort = btn.dataset.plSort;
+            sortBar.querySelectorAll('.pub-sort-btn').forEach(b => b.classList.toggle('active', b === btn));
+            fetchPublicPlaylists(searchInput.value.trim(), state.publicPlSort);
+          });
+        }
+
+        if ($('publishActivePlBtn')) {
+          $('publishActivePlBtn').addEventListener('click', togglePublishActivePlaylist);
+        }
+        if ($('shareActivePlBtn')) {
+          $('shareActivePlBtn').addEventListener('click', () => {
+            if (state.selectedSubPlaylistId) {
+              const sub = state.subscribedPlaylists.find(p => p && p.id === state.selectedSubPlaylistId);
+              if (sub) sharePublicPlaylist(sub.id, sub.name);
+            } else if (state.selectedPlaylistId) {
+              const pl = state.playlists.find(p => p.id === state.selectedPlaylistId);
+              const pubId = state.publishedMap && state.publishedMap[state.selectedPlaylistId];
+              if (pl && pubId) sharePublicPlaylist(pubId, pl.name);
+            }
+          });
+        }
+        if ($('likeSubPlBtn')) {
+          $('likeSubPlBtn').addEventListener('click', () => {
+            if (state.selectedSubPlaylistId) togglePublicPlaylistLike(state.selectedSubPlaylistId);
+          });
+        }
+        if ($('unsubActivePlBtn')) {
+          $('unsubActivePlBtn').addEventListener('click', () => {
+            if (state.selectedSubPlaylistId) togglePublicPlaylistSubscribe(state.selectedSubPlaylistId);
+          });
+        }
+
+        if ($('closePubModalBtn')) $('closePubModalBtn').addEventListener('click', closePublicPlaylistModal);
+        if (publicPlModal) {
+          publicPlModal.addEventListener('click', (e) => {
+            if (e.target === publicPlModal) closePublicPlaylistModal();
+          });
+        }
+        if ($('pubModalPlayBtn')) {
+          $('pubModalPlayBtn').addEventListener('click', () => {
+            const pl = state.activePublicModalPl;
+            if (!pl || !Array.isArray(pl.tracks) || !pl.tracks.length) { showToast('Плейлист пуст'); return; }
+            state.activeQueue = [...pl.tracks];
+            playTrack(pl.tracks[0], true);
+          });
+        }
+        if ($('pubModalLikeBtn')) {
+          $('pubModalLikeBtn').addEventListener('click', () => {
+            if (state.activePublicModalPl) togglePublicPlaylistLike(state.activePublicModalPl.id);
+          });
+        }
+        if ($('pubModalSubBtn')) {
+          $('pubModalSubBtn').addEventListener('click', () => {
+            if (state.activePublicModalPl) togglePublicPlaylistSubscribe(state.activePublicModalPl.id);
+          });
+        }
+        if ($('pubModalCopyBtn')) {
+          $('pubModalCopyBtn').addEventListener('click', () => {
+            if (state.activePublicModalPl) copyPublicPlaylistToMine(state.activePublicModalPl);
+          });
+        }
+        if ($('pubModalShareBtn')) {
+          $('pubModalShareBtn').addEventListener('click', () => {
+            if (state.activePublicModalPl) sharePublicPlaylist(state.activePublicModalPl.id, state.activePublicModalPl.name);
+          });
+        }
+      }
+
+      function handleInitialDeepLinkPlaylist() {
+        try {
+          const sp = new URLSearchParams(location.search);
+          const plId = (sp.get('pl') || '').trim();
+          if (plId) {
+            if (splashScreen && !splashScreen.classList.contains('hidden')) {
+              unlockFromSplash();
+            }
+            openPublicPlaylistModal(plId, null);
+          }
+        } catch (e) {}
+      }
+
       // ================= INIT =================
       applyTheme(state.theme, false);
       applyAudioVolume(state.volume, false);
@@ -4028,6 +5087,8 @@
       initSplashParticles();
       initCrossSwipe();
       initPlayerLoopAndVisualizer();
+      initDesktopFullscreenAndHotkeys();
+      initPublicPlaylistsEvents();
       initTelegramMiniApp();
       initOfflineStorage().then(async () => {
         updateOfflineUI();
@@ -4036,5 +5097,6 @@
           checkTgBotStatus();
         }
         performSearch();
+        handleInitialDeepLinkPlaylist();
       });
     })();
