@@ -869,23 +869,280 @@
         bar.innerHTML = sources.map(s => `<span class="src-pill ready"><span class="src-pill-dot"></span>${escapeHtml(s)}</span>`).join('');
       }
 
-      async function performSearch() {
+      // ================= FAVORITE ARTISTS RECOMMENDATIONS (v36) =================
+      const DEFAULT_QUICK_TAGS = [
+        'onda andar', 'Pharaoh', 'Miyagi', 'Скриптонит', 'kai angel',
+        'madk1d', 'Баста', 'Король и Шут', 'The Weeknd', 'тёмный принц'
+      ];
+      const IGNORED_ARTIST_KEYS = new Set([
+        'telegram', 'телеграм', 'ваш файл', 'неизвестный', 'исполнитель',
+        'аудио', 'audio', 'soundcloud', 'hitmo', 'muzofond', 'mp3party',
+        'lightaudio', 'youtube', 'бот', 'файл', 'local', 'unknown', 'apathy'
+      ]);
+
+      let favRecsDirty = false;
+      let favRecsLastSig = '';
+      let favRecsRotateOffset = 0;
+
+      function normalizeArtistKey(s) {
+        return String(s || '')
+          .toLowerCase()
+          .replace(/ё/g, 'е')
+          .replace(/[\(\[][^\)\]]*[\)\]]/g, ' ')
+          .replace(/[^a-zа-я0-9]+/g, ' ')
+          .trim();
+      }
+
+      function extractIndividualArtists(rawArtist) {
+        const cleaned = String(rawArtist || '')
+          .replace(/[\(\[]\s*(prod\.?|feat\.?|ft\.?).*?[\)\]]/gi, ' ')
+          .replace(/\s+-\s+Topic$/i, '')
+          .trim();
+        if (!cleaned || cleaned.startsWith('@')) return [];
+        const parts = cleaned
+          .split(/\s*(?:,|&|\bfeat\.?\b|\bft\.?\b|\bпри уч\.?\b|\bwith\b|\bx\b|×|\/)\s*/i)
+          .map(p => p.trim())
+          .filter(Boolean);
+        const out = [];
+        for (const part of parts) {
+          const k = normalizeArtistKey(part);
+          if (!k || k.length < 2 || IGNORED_ARTIST_KEYS.has(k)) continue;
+          out.push({ key: k, name: part });
+        }
+        return out;
+      }
+
+      function getFavoriteArtistsList(maxCount = 12) {
+        if (!state.likedIds || !state.likedIds.size) return [];
+        const counts = new Map();
+        const libById = new Map();
+        for (const t of state.libraryTracks) {
+          if (t && t.id) libById.set(t.id, t);
+        }
+        let orderIdx = 0;
+        for (const lid of state.likedIds) {
+          const track = libById.get(lid);
+          if (!track || !track.artist) continue;
+          const artists = extractIndividualArtists(track.artist);
+          for (const a of artists) {
+            const cur = counts.get(a.key);
+            if (cur) {
+              cur.count += 1;
+              cur.lastOrder = orderIdx;
+            } else {
+              counts.set(a.key, { key: a.key, name: a.name, count: 1, lastOrder: orderIdx });
+            }
+          }
+          orderIdx++;
+        }
+        return Array.from(counts.values())
+          .sort((a, b) => (b.count - a.count) || (b.lastOrder - a.lastOrder))
+          .slice(0, maxCount);
+      }
+
+      function getFavoriteArtistsSignature() {
+        return getFavoriteArtistsList(6).map(a => a.key).join('|');
+      }
+
+      function renderQuickTags() {
+        const container = $('quickTags');
+        if (!container) return;
+        const favs = getFavoriteArtistsList(5);
+        const usedKeys = new Set();
+        const items = [];
+        for (const f of favs) {
+          usedKeys.add(f.key);
+          items.push({ label: f.name, q: f.name, isFav: true });
+        }
+        for (const def of DEFAULT_QUICK_TAGS) {
+          const k = normalizeArtistKey(def);
+          if (usedKeys.has(k)) continue;
+          usedKeys.add(k);
+          items.push({ label: def, q: def, isFav: false });
+          if (items.length >= 10) break;
+        }
+        container.innerHTML = items.map(it =>
+          `<button type="button" class="quick-tag${it.isFav ? ' fav-artist' : ''}" data-q="${escapeHtml(it.q)}">${it.isFav ? '<span class="fav-heart">♥</span>' : ''}${escapeHtml(it.label)}</button>`
+        ).join('');
+      }
+
+      function pickArtistsForFeed(favArtists, maxPick = 3) {
+        if (favArtists.length <= maxPick) return favArtists.slice();
+        const chosen = [];
+        const offset = favRecsRotateOffset % favArtists.length;
+        for (let i = 0; i < maxPick; i++) {
+          chosen.push(favArtists[(offset + i) % favArtists.length]);
+        }
+        return chosen;
+      }
+
+      function matchesAnyFavArtist(track, chosenArtists) {
+        if (!track) return false;
+        const hayArtist = normalizeArtistKey(track.artist || '');
+        const hayTitle = normalizeArtistKey(track.title || '');
+        for (const a of chosenArtists) {
+          if (hayArtist.includes(a.key) || a.key.includes(hayArtist) && hayArtist.length >= 3) return true;
+          if (hayTitle.includes(a.key)) return true;
+        }
+        return false;
+      }
+
+      async function loadFavoriteArtistRecommendations(favArtists, forceFresh = false) {
+        const chosen = pickArtistsForFeed(favArtists, 3);
+        const namesLabel = chosen.map(a => a.name).join(', ');
+
+        if (forceFresh) {
+          chosen.forEach(a => tgSearchCache.delete(a.name.toLowerCase()));
+        }
+
+        const batches = await Promise.all(
+          chosen.map(a => searchViaTgBotOnly(a.name).catch(() => ({ ok: false, tracks: [], sources: [] })))
+        );
+
+        const anyOk = batches.some(b => b && b.ok);
+        if (!anyOk) return { ok: false, tracks: [], sources: [], namesLabel };
+
+        const allSources = new Set(['По избранному']);
+        const perArtistBuckets = [];
+
+        batches.forEach((b, idx) => {
+          if (!b || !b.ok || !Array.isArray(b.tracks)) return;
+          (b.sources || []).forEach(s => allSources.add(s));
+          const targetArtist = [chosen[idx]];
+          const unseenMatching = [];
+          const likedMatching = [];
+          const unseenOther = [];
+          for (const tr of b.tracks) {
+            if (!tr || !tr.id) continue;
+            const isLiked = state.likedIds.has(tr.id);
+            const isMatch = matchesAnyFavArtist(tr, targetArtist);
+            if (isMatch && !isLiked) unseenMatching.push(tr);
+            else if (isMatch && isLiked) likedMatching.push(tr);
+            else if (!isLiked) unseenOther.push(tr);
+          }
+          // Prefer NEW tracks by the favorite artist first, then remaining tracks by them
+          const ordered = [...unseenMatching, ...likedMatching, ...unseenOther];
+          if (ordered.length) perArtistBuckets.push(ordered);
+        });
+
+        // Round-robin interleave across favorite artists so the feed feels balanced & fresh
+        const merged = [];
+        const seenIds = new Set();
+        const seenKeys = new Set();
+        let round = 0;
+        let addedInRound = true;
+        while (merged.length < 24 && addedInRound) {
+          addedInRound = false;
+          for (const bucket of perArtistBuckets) {
+            if (round < bucket.length) {
+              const tr = bucket[round];
+              const dk = normalizeArtistKey(`${tr.artist} ${tr.title}`);
+              if (!seenIds.has(tr.id) && (!dk || !seenKeys.has(dk))) {
+                seenIds.add(tr.id);
+                if (dk) seenKeys.add(dk);
+                merged.push(tr);
+                addedInRound = true;
+                if (merged.length >= 24) break;
+              }
+            }
+          }
+          round++;
+        }
+
+        return {
+          ok: true,
+          tracks: merged,
+          sources: Array.from(allSources).slice(0, 5),
+          namesLabel
+        };
+      }
+
+      async function performSearch(forceFresh = false) {
         const q = searchInput.value.trim();
         searchClear.classList.toggle('show', q.length > 0);
         viewSearch.classList.toggle('has-results', q.length > 0);
 
         const seq = ++searchSeq;
+        const favArtists = !q ? getFavoriteArtistsList(10) : [];
+        const favSig = favArtists.slice(0, 6).map(a => a.key).join('|');
 
-        // Offline Mode: instant local search across all downloaded / auto-cached tracks!
+        // Offline Mode: instant local search across all downloaded / auto-cached tracks (favorite artists first!)
         if (isOfflineEffective()) {
           searchLoader.classList.remove('show');
-          const localHits = searchOfflineTracksLocal(q);
+          let localHits = searchOfflineTracksLocal(q);
+          if (!q && favArtists.length && localHits.length > 1) {
+            localHits = [...localHits].sort((a, b) => {
+              const am = matchesAnyFavArtist(a, favArtists) ? 1 : 0;
+              const bm = matchesAnyFavArtist(b, favArtists) ? 1 : 0;
+              return bm - am;
+            });
+          }
           renderSourcesLiveBar(['Оффлайн-кэш']);
-          $('searchResultTitle').textContent = q ? `Оффлайн поиск: «${q}»` : 'Загруженные оффлайн-треки';
+          $('searchResultTitle').textContent = q
+            ? `Оффлайн поиск: «${q}»`
+            : (favArtists.length ? 'Оффлайн · По избранному' : 'Загруженные оффлайн-треки');
           state.searchResults = localHits;
           renderSearchResultsList(false, true);
           return;
         }
+
+        // Personalized Recommendations Mode when Search input is EMPTY and user has liked artists!
+        if (!q && favArtists.length > 0) {
+          favRecsDirty = false;
+          favRecsLastSig = favSig;
+          const previewNames = pickArtistsForFeed(favArtists, 3).map(a => a.name).join(', ');
+          const shortTitle = previewNames.length > 32 ? previewNames.slice(0, 29) + '...' : previewNames;
+
+          searchLoader.classList.add('show');
+          $('searchLoaderText').textContent = `Подбираем треки: ${shortTitle}...`;
+          $('searchResultTitle').textContent = `Для вас · ${shortTitle}`;
+          renderSourcesLiveBar(['По избранному']);
+
+          const rBtn = $('tgRefreshBtn');
+          if (rBtn) {
+            rBtn.textContent = '↻ Обновить';
+            rBtn.classList.add('show');
+          }
+
+          // Instant cached recommendation preview while refreshing from Telegram bot
+          if (!forceFresh) {
+            const cachedRecs = store.get('lastFavRecsV36', null);
+            if (cachedRecs && cachedRecs.sig === favSig && Array.isArray(cachedRecs.tracks) && cachedRecs.tracks.length) {
+              state.searchResults = cachedRecs.tracks;
+              renderSearchResultsList(false, false);
+            }
+          }
+
+          const recRes = await loadFavoriteArtistRecommendations(favArtists, forceFresh);
+          if (seq !== searchSeq) return;
+          searchLoader.classList.remove('show');
+
+          if (recRes.ok && recRes.tracks.length) {
+            const lbl = recRes.namesLabel.length > 32 ? recRes.namesLabel.slice(0, 29) + '...' : recRes.namesLabel;
+            renderSourcesLiveBar(recRes.sources);
+            $('searchResultTitle').textContent = `Для вас · ${lbl}`;
+            state.searchResults = recRes.tracks;
+            store.set('lastFavRecsV36', { sig: favSig, tracks: recRes.tracks.slice(0, 24), sources: recRes.sources, ts: Date.now() });
+            renderSearchResultsList(false, false);
+            return;
+          }
+
+          // If bot unreachable, gracefully fall back to offline tracks
+          if (!recRes.ok) {
+            const offlineFallback = searchOfflineTracksLocal('');
+            if (offlineFallback.length) {
+              renderSourcesLiveBar(['Оффлайн-кэш']);
+              $('searchResultTitle').textContent = 'Доступно оффлайн';
+              state.searchResults = offlineFallback;
+              renderSearchResultsList(false, true);
+              return;
+            }
+          }
+          // Otherwise fall through to general bot library below
+        }
+
+        const rBtnDefault = $('tgRefreshBtn');
+        if (rBtnDefault && !favArtists.length) rBtnDefault.textContent = '↻ Из бота';
 
         searchLoader.classList.add('show');
         $('searchLoaderText').textContent = q
@@ -908,7 +1165,6 @@
         searchLoader.classList.remove('show');
 
         if (!res.ok) {
-          // Network/bot unreachable -> fall back cleanly to offline cached tracks if any!
           const offlineFallback = searchOfflineTracksLocal(q);
           if (offlineFallback.length) {
             renderSourcesLiveBar(['Оффлайн-кэш']);
@@ -1473,6 +1729,9 @@
         state.activeTab = tabId;
         document.querySelectorAll('.tab-view').forEach(v => v.classList.toggle('active', v.id === tabId));
         document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
+        if (tabId === 'viewSearch' && !searchInput.value.trim() && (favRecsDirty || getFavoriteArtistsSignature() !== favRecsLastSig)) {
+          performSearch(false);
+        }
         if (tabId === 'viewTracks') { renderLibrary(); refreshCloudAccountState(false); }
         if (tabId === 'viewProfile') renderProfile();
       }
@@ -1876,6 +2135,8 @@
         else { state.likedIds.add(track.id); showToast('Добавлено в избранное'); }
         store.set('liked', Array.from(state.likedIds));
         scheduleCloudSync();
+        favRecsDirty = true;
+        renderQuickTags();
         renderSearchResultsList();
         renderLibrary();
         updatePlayerLikeUI();
@@ -2976,6 +3237,11 @@
           isApplyingCloudState = false;
         }
 
+        renderQuickTags();
+        if (!searchInput.value.trim() && getFavoriteArtistsSignature() !== favRecsLastSig) {
+          performSearch(false);
+        }
+
         if (mode === 'login_merge') {
           pushCloudSyncNow(false);
         }
@@ -3384,9 +3650,13 @@
       });
 
       $('tgRefreshBtn').addEventListener('click', () => {
+        const hasFavs = !searchInput.value.trim() && getFavoriteArtistsList(10).length > 0;
+        if (hasFavs) {
+          favRecsRotateOffset += 1;
+        }
         tgSearchCache.clear();
-        performSearch();
-        showToast('Список треков из Telegram-бота обновлён');
+        performSearch(true);
+        showToast(hasFavs ? 'Рекомендации по избранному обновлены' : 'Список треков из Telegram-бота обновлён');
       });
 
       $('offlineModeToggleBtn').addEventListener('click', () => {
@@ -3517,6 +3787,7 @@
       // ================= INIT =================
       applyTheme(state.theme, false);
       applyAudioVolume(state.volume, false);
+      renderQuickTags();
       renderLibrary();
       renderProfile();
       initSplashParticles();

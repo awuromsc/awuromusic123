@@ -1829,3 +1829,16 @@
       padding: 8px 0;
       border-top: 1px solid var(--border);
     }
+
+
+    /* v36 Favorite Artist Quick Tags & Recommendation Pills */
+    .quick-tag.fav-artist {
+      border-color: var(--border-strong);
+      background: var(--accent-soft);
+      color: var(--text-main);
+    }
+    .quick-tag .fav-heart {
+      color: var(--accent);
+      margin-right: 4px;
+      font-size: 9.5px;
+    }
